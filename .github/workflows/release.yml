@@ -13,14 +13,18 @@ on:
         description: 'Release architectures'
         type: choice
         options: [x86_64, all]
-        default: x86_64
+        default: all
       release_tag:
-        description: 'Existing tag at this commit for a stable release; empty creates nightly'
+        description: 'Existing upstream-style tag plus -polaris at this commit; empty creates nightly-polaris'
         type: string
         default: ''
 
 permissions:
   contents: write
+
+concurrency:
+  group: smartdns-release-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   validate:
@@ -42,9 +46,9 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
             # Fetch the nightly tag from origin
-            git fetch origin refs/tags/nightly:refs/tags/nightly || true
-            if git rev-parse refs/tags/nightly >/dev/null 2>&1; then
-              NIGHTLY_SHA=$(git rev-parse refs/tags/nightly)
+            git fetch origin refs/tags/nightly-polaris:refs/tags/nightly-polaris || true
+            if git rev-parse refs/tags/nightly-polaris >/dev/null 2>&1; then
+              NIGHTLY_SHA=$(git rev-parse refs/tags/nightly-polaris)
               CURRENT_SHA=$(git rev-parse HEAD)
               if [ "$NIGHTLY_SHA" = "$CURRENT_SHA" ]; then
                 echo "Current commit ($CURRENT_SHA) is the same as the existing nightly tag. Skipping scheduled build."
@@ -76,12 +80,12 @@ jobs:
           fetch-depth: 0
 
       - name: Verify stable release identity
-        if: inputs.release_tag != ''
+        if: github.event_name == 'release' || inputs.release_tag != ''
         env:
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
         run: |
-          [[ "$RELEASE_TAG" =~ ^Release[0-9]+\.[0-9]+\.[0-9]+-polaris\.[0-9]+$ ]]
-          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$GITHUB_SHA"
+          python3 .github/scripts/prepare-release-assets.py --check-tag "$RELEASE_TAG"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$GITHUB_SHA"
 
       # 2. Setup Node.js (needed for webui compilation)
       - name: Setup Node.js
@@ -260,7 +264,9 @@ jobs:
               x86_64) ssl_target=linux-x86_64 ;;
               i686) ssl_target=linux-elf ;;
             esac
-            build_openssl "/opt/toolchain/$arch-unknown-linux-musl/bin/$arch-unknown-linux-musl-gcc" "$ssl_target"
+            toolchain="$arch-unknown-linux-musl"
+            if [ "$arch" = arm ]; then toolchain=arm-unknown-linux-musleabi; fi
+            build_openssl "/opt/toolchain/$toolchain/bin/$toolchain-gcc" "$ssl_target"
           done
 
       # 9. Run the build script
@@ -413,13 +419,10 @@ jobs:
           mv *.deb release-assets/ 2>/dev/null || true
           mv *.tar.gz release-assets/ 2>/dev/null || true
 
-          # Rename only distribution files. Package contents and executable paths stay smartdns.
-          for asset in release-assets/smartdns*; do
-            [ -f "$asset" ] || continue
-            name=$(basename "$asset")
-            mv "$asset" "release-assets/smartdns-polaris${name#smartdns}"
-          done
-          (cd release-assets && sha256sum * > SHA256SUMS)
+          # Enforce the upstream asset set, then suffix only public filenames.
+          # Package bytes, metadata, versions and installed paths are unchanged.
+          python3 .github/scripts/prepare-release-assets.py \
+            --directory release-assets --version "$RELEASE_VERSION" --target "$BUILD_TARGET"
           
           echo "=== List of all files in release-assets ==="
           ls -la release-assets/
@@ -432,6 +435,15 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
           retention-days: 7
+
+      - name: Recheck stable remote tag before publication
+        if: github.event_name == 'release' || inputs.release_tag != ''
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/scripts/prepare-release-assets.py \
+            --verify-tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --commit "$GITHUB_SHA"
 
       # 10. Upload all packages and binaries individually to the GitHub Release (only on release event)
       - name: Upload Release Assets
@@ -446,9 +458,9 @@ jobs:
           body: |
             Polaris SmartDNS, built from `${{ github.sha }}` on `${{ github.ref_name }}`.
             Native system/QUIC suites, ASan/UBSan and offline comparison must pass before packaging.
-            Distribution filenames use smartdns-polaris; installed binaries and package identity remain smartdns.
-          prerelease: false
-          make_latest: true
+            Distribution filenames add -polaris before their extension; package contents and identities remain upstream-compatible.
+          prerelease: ${{ github.event_name == 'release' && github.event.release.prerelease || false }}
+          make_latest: ${{ !(github.event_name == 'release' && github.event.release.prerelease) }}
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -457,7 +469,8 @@ jobs:
       - name: Clean up Nightly Release
         if: github.event_name != 'release' && inputs.release_tag == ''
         run: |
-          gh release delete nightly --cleanup-tag --yes || true
+          python3 .github/scripts/prepare-release-assets.py \
+            --clean-nightly --repository "$GITHUB_REPOSITORY"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -466,10 +479,11 @@ jobs:
         uses: softprops/action-gh-release@v3
         if: github.event_name != 'release' && inputs.release_tag == ''
         with:
-          tag_name: nightly
-          name: "SmartDNS Nightly Build"
+          tag_name: nightly-polaris
+          target_commitish: ${{ github.sha }}
+          name: "SmartDNS Nightly Build - polaris"
           body: |
-            This release contains the latest automated Nightly build of SmartDNS.
+            This release contains the latest validated Nightly build of Polaris SmartDNS.
 
             - **Commit**: ${{ github.sha }}
             - **Branch**: `${{ github.ref_name }}`
@@ -477,7 +491,16 @@ jobs:
 
             These packages are automatically compiled and updated on every nightly build / manual run.
           prerelease: true
+          make_latest: false
           files: release-assets/*
           overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify published tag
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name || 'nightly-polaris' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/scripts/prepare-release-assets.py \
+            --verify-tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --commit "$GITHUB_SHA"

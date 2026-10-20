@@ -41,6 +41,7 @@ jobs:
       run: |
         python3 .github/scripts/check-native-results.py --self-test
         python3 .github/scripts/benchmark-native-offline.py --self-test
+        python3 .github/scripts/prepare-release-assets.py --self-test
     - name: Prepare distribution dependencies (network enabled)
       env:
         BASE_IMAGE: ${{ matrix.image }}
