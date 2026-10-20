@@ -328,8 +328,11 @@ struct dns_request {
 	unsigned char any_do, any_cd, any_ad, any_rd, any_unknown_context, any_unsupported_context;
 	unsigned short any_udp_size;
 	/* Set only when this request enters a compatible native upstream lookup. */
-	unsigned char cache_origin_plain;
+	unsigned int cache_origin_view;
 	struct dns_address_cache_origin *cache_origin;
+	/* Immutable bind configuration, with the same lifetime as domain rules.
+	 * Internal address children inherit policy without borrowing a connection. */
+	const struct nftset_ipset_rules *inherited_bind_sets;
 
 	struct list_head https_svcb_list;
 

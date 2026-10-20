@@ -5,6 +5,7 @@
 #include "dns_server.h"
 #include "request.h"
 #include "rules.h"
+#include "ipset_nftset.h"
 #include "smartdns/dns_any.h"
 #include "smartdns/dns_client.h"
 
@@ -25,7 +26,7 @@ struct dns_address_child_state {
 	pthread_mutex_t lock;
 	dns_address_child_callback callback;
 	void *arg;
-	int reported, policy, evidence_overflow, upstream_seen, cache_positive, plain, local_result, rebased;
+	int reported, policy, evidence_overflow, upstream_seen, cache_positive, local_result, rebased;
 	enum dns_address_child_result result;
 	int evidence_count;
 	struct dns_address_evidence evidence[ADDRESS_EVIDENCE_MAX];
@@ -39,6 +40,94 @@ struct dns_address_cache_origin {
 	int invalid, seen, count;
 	unsigned char addresses[DNS_ANY_MAX_RECORDS][DNS_RR_AAAA_LEN];
 };
+
+/* The native cache already keys the domain, family, rule-group name and bind
+ * flags. Domain rules are immutable within a configuration lifetime and are
+ * resolved from that domain and effective rule group. Attest the additional
+ * effective group object and selected upstream route, without a lossy hash or
+ * client-address key that fragments identical policies. Client rules resolve
+ * into the group and bind flags before this hook. Config reload is a restart;
+ * disk-loaded cache entries deliberately have no process-local attestation.
+ * Registry exhaustion only disables reuse. IDs are never recycled. */
+#define ADDRESS_CACHE_MAX_VIEWS 1024
+static struct {
+	const struct dns_conf_group *conf;
+	const struct nftset_ipset_rules *bind_sets;
+	unsigned int flags;
+	unsigned int token;
+	char route[DNS_GROUP_NAME_LEN];
+} cache_views[ADDRESS_CACHE_MAX_VIEWS];
+static unsigned int cache_view_count;
+static unsigned int cache_view_sequence;
+static pthread_mutex_t cache_view_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void _dns_server_address_cache_views_reset(void)
+{
+	/* Called before a new server lifetime, never during live resolution.
+	 * Discard borrowed configuration identities, without recycling tokens. */
+	pthread_mutex_lock(&cache_view_lock);
+	cache_view_count = 0;
+	pthread_mutex_unlock(&cache_view_lock);
+}
+
+static int same_name(const char *a, const char *b)
+{
+	return a == b || (a && b && !strcmp(a, b));
+}
+
+static int same_ipsets(const struct dns_ipset_rule *a, const struct dns_ipset_rule *b)
+{
+	while (a && b) {
+		if (!same_name(a->ipsetname, b->ipsetname)) return 0;
+		a = a->next; b = b->next;
+	}
+	return a == b;
+}
+
+static int same_nftsets(const struct dns_nftset_rule *a, const struct dns_nftset_rule *b)
+{
+	while (a && b) {
+		if (!same_name(a->familyname,b->familyname) || !same_name(a->nfttablename,b->nfttablename) ||
+			!same_name(a->nftsetname,b->nftsetname)) return 0;
+		a = a->next; b = b->next;
+	}
+	return a == b;
+}
+
+static int same_bind_sets(const struct nftset_ipset_rules *a, const struct nftset_ipset_rules *b)
+{
+	return a == b || (a && b && same_ipsets(a->ipset,b->ipset) &&
+		same_ipsets(a->ipset_ip,b->ipset_ip) && same_ipsets(a->ipset_ip6,b->ipset_ip6) &&
+		same_nftsets(a->nftset_ip,b->nftset_ip) && same_nftsets(a->nftset_ip6,b->nftset_ip6));
+}
+
+unsigned int _dns_server_address_cache_view(struct dns_request *request, const char *route)
+{
+	if (request->conf->any.aggregate != DNS_ANY_ADDRESS || dns_conf.cachesize <= 0 ||
+		(request->qtype != DNS_T_A && request->qtype != DNS_T_AAAA) ||
+		request->no_cache || (request->server_flags & BIND_FLAG_NO_CACHE) ||
+		request->parent_request || request->domain_rule.rules[DOMAIN_RULE_CNAME] ||
+		!_dns_server_native_address_context(request, route)) return 0;
+	if (!route) route = DNS_SERVER_GROUP_DEFAULT;
+	const struct nftset_ipset_rules *bind_sets = _dns_server_get_bind_ipset_context(request);
+	unsigned int i, view = 0;
+	pthread_mutex_lock(&cache_view_lock);
+	for (i = 0; i < cache_view_count; i++)
+		if (cache_views[i].conf == request->conf && same_bind_sets(cache_views[i].bind_sets,bind_sets) &&
+			cache_views[i].flags == request->server_flags &&
+			!strcmp(cache_views[i].route, route)) break;
+	if (i == cache_view_count && i < ADDRESS_CACHE_MAX_VIEWS && cache_view_sequence < (UINT_MAX >> 2)) {
+		cache_views[i].conf = request->conf;
+		cache_views[i].bind_sets = bind_sets;
+		cache_views[i].flags = request->server_flags;
+		cache_views[i].token = (++cache_view_sequence << 2) | DNS_CACHE_ORIGIN_NATIVE_VIEW;
+		safe_strncpy(cache_views[i].route, route, sizeof(cache_views[i].route));
+		cache_view_count++;
+	}
+	if (i < cache_view_count) view = cache_views[i].token;
+	pthread_mutex_unlock(&cache_view_lock);
+	return view;
+}
 
 static uint32_t age_seconds(unsigned long received)
 {
@@ -84,12 +173,24 @@ static int normalize_one(struct dns_request *request, const unsigned char *wire,
 static int cache_origin_addresses(struct dns_request *request, const unsigned char *wire, int len,
 								  unsigned char addresses[DNS_ANY_MAX_RECORDS][DNS_RR_AAAA_LEN])
 {
-	return dns_any_plain_addresses(request->domain, request->qtype, wire, len, addresses);
+	if (len < 12 || (wire[3] & 0x10)) return -1;
+	int direct = dns_any_plain_addresses(request->domain, request->qtype, wire, len, addresses);
+	if (direct > 0) return direct;
+	unsigned char normalized[DNS_IN_PACKSIZE];
+	enum dns_address_child_result result;
+	int size = normalize_one(request, wire, len, normalized, &result);
+	if (size < 0 || result != DNS_ADDRESS_CHILD_POSITIVE) return -1;
+	if (request->conf->dns_force_no_cname)
+		size = _dns_server_any_flatten_addresses(request->domain, request->qtype, normalized, size);
+	if (size < 0) return -1;
+	/* A visible native CNAME shortcut has no retained complete chain. Keep
+	 * resolving that family independently instead of guessing provenance. */
+	return dns_any_plain_addresses(request->domain, request->qtype, normalized, size, addresses);
 }
 
 void _dns_server_address_cache_prepare(struct dns_request *request)
 {
-	if (!request->cache_origin_plain || request->cache_origin || dns_conf.cachesize <= 0) return;
+	if (!request->cache_origin_view || request->cache_origin || dns_conf.cachesize <= 0) return;
 	request->cache_origin = calloc(1, sizeof(*request->cache_origin));
 	if (request->cache_origin && pthread_mutex_init(&request->cache_origin->lock, NULL)) {
 		free(request->cache_origin);
@@ -106,7 +207,8 @@ void _dns_server_address_cache_upstream(struct dns_request *request, const unsig
 	int count = cache_origin_addresses(request, wire, len, addresses);
 	pthread_mutex_lock(&origin->lock);
 	origin->seen = 1;
-	if (count < 1) origin->invalid = 1;
+	/* A failed/truncated peer does not discredit a different complete source.
+	 * Every finalized selected address must still occur in a complete proof. */
 	for (int i = 0; !origin->invalid && i < count; i++) {
 		int found = 0;
 		for (int j = 0; j < origin->count; j++)
@@ -158,6 +260,7 @@ static void copy_context(struct dns_request *child, const struct dns_request *pa
 	child->no_cache = parent->no_cache;
 	child->no_ipalias = parent->no_ipalias;
 	child->no_serve_expired = parent->no_serve_expired;
+	child->inherited_bind_sets = _dns_server_get_bind_ipset_context(parent);
 	child->has_ecs = parent->has_ecs;
 	child->ecs = parent->ecs;
 	child->edns0_do = parent->edns0_do;
@@ -224,7 +327,7 @@ int _dns_server_address_child_check_context(struct dns_request *request, const c
 {
 	struct dns_address_child_state *state = request->address_child;
 	if (!state) return 0;
-	state->plain = _dns_server_any_plain_context(request, route);
+	request->cache_origin_view = _dns_server_address_cache_view(request, route);
 	if (!_dns_server_any_address_context(request, route)) {
 		state->policy = 1;
 		return -1;
@@ -234,7 +337,7 @@ int _dns_server_address_child_check_context(struct dns_request *request, const c
 
 int _dns_server_address_child_cache_allowed(struct dns_request *request)
 {
-	return request->address_child && request->address_child->plain;
+	return request->address_child && request->cache_origin_view && !request->no_cache;
 }
 
 /* Called only at native local-address / explicit SOA policy decisions, never

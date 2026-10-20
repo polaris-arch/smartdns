@@ -27,6 +27,7 @@
 #include "server.h"
 #include "smartdns/dns.h"
 #include "smartdns/dns_cache.h"
+#include "dns_server/prefetch.h"
 
 namespace {
 using Wire = std::vector<unsigned char>;
@@ -313,6 +314,8 @@ enum class Gate { None, BothFamilies, BothFamiliesAndMarker };
 struct Family {
 	Outcome outcome = Outcome::Positive;
 	std::vector<std::string> aliases;
+	std::vector<std::string> extra_addresses;
+	Wire response_options;
 	unsigned int soa_serial = 7;
 	bool add_slower_address = false;
 };
@@ -407,6 +410,12 @@ private:
 					dns_add_AAAA(packet, DNS_RRS_AN, owner.c_str(), 60, address);
 				if (rc) return {};
 			}
+			for (const auto &value : family.extra_addresses) {
+				if (inet_pton(type == DNS_T_A ? AF_INET : AF_INET6, value.c_str(), address) != 1) return {};
+				int rc = type == DNS_T_A ? dns_add_A(packet, DNS_RRS_AN, owner.c_str(), 60, address) :
+					dns_add_AAAA(packet, DNS_RRS_AN, owner.c_str(), 60, address);
+				if (rc) return {};
+			}
 			if (inet_pton(type == DNS_T_A ? AF_INET : AF_INET6, type == DNS_T_A ? kIPv4 : kIPv6, address) != 1)
 				return {};
 			const auto section = family.outcome == Outcome::AdditionalPositive ? DNS_RRS_NR : DNS_RRS_AN;
@@ -426,6 +435,13 @@ private:
 		int length = dns_encode(encoded, sizeof(encoded), packet);
 		if (length <= 0) return {};
 		Wire wire(encoded, encoded + length);
+		if ((type == DNS_T_A || type == DNS_T_AAAA) && !family.response_options.empty()) {
+			wire[10] = 0; wire[11] = 1;
+			wire.insert(wire.end(), {0, 0, 41, 16, 0, 0, 0, 0, 0,
+				static_cast<unsigned char>(family.response_options.size() >> 8),
+				static_cast<unsigned char>(family.response_options.size())});
+			wire.insert(wire.end(), family.response_options.begin(), family.response_options.end());
+		}
 		if (type == DNS_T_ANY) {
 			/* An accidental ANY probe gets a real RFC 8482 minimal answer,
 			 * so it cannot pass by being refused and subsequently expanded. */
@@ -599,6 +615,14 @@ TEST(AnyAddress, DoAndCdFailClosedWithoutAnyProbe)
 		EXPECT_TRUE(response_is(query(DNS_T_ANY, tcp, kClientPort, true, false), DNS_RC_SERVFAIL, {}));
 		EXPECT_TRUE(response_is(query(DNS_T_ANY, tcp, kClientPort, false, true), DNS_RC_SERVFAIL, {}));
 		EXPECT_TRUE(response_is(query(DNS_T_ANY, tcp, kClientPort, true, true), DNS_RC_SERVFAIL, {}));
+		LocalConnection nonrecursive(tcp);
+		Wire wire = query_wire(DNS_T_ANY, kQueryId, kDomain);
+		wire[2] &= ~1;
+		ASSERT_TRUE(nonrecursive.send_wire(wire));
+		Wire rejected = nonrecursive.receive();
+		ASSERT_GE(rejected.size(), 12u);
+		EXPECT_EQ(u16(rejected, 2) & 15, DNS_RC_SERVFAIL);
+		EXPECT_EQ(u16(rejected, 6), 0);
 	}
 	expect_workload(upstream, 0, 0);
 }
@@ -824,6 +848,111 @@ TEST(AnyAddress, FreshOrdinaryAAndAaaaCacheEntriesAvoidAllAddressUpstreamSends)
 	expect_workload(upstream, 1, 1);
 }
 
+TEST(AnyAddress, ProductionPolicyWarmCachePreservesFourAAndTwoAaaaAcrossAdAndTransport)
+{
+	AddressUpstream upstream;
+	upstream.ipv4.aliases = {"ipv4.address-mode.test"};
+	upstream.ipv6.aliases = {"ipv6.address-mode.test"};
+	upstream.ipv4.extra_addresses = {"192.0.2.18", "192.0.2.19", "192.0.2.20"};
+	upstream.ipv6.extra_addresses = {"2001:db8::18"};
+	upstream.ipv4.response_options = upstream.ipv6.response_options = {0, 12, 0, 4, 0, 0, 0, 0};
+	std::vector<std::string> a{address_rr(DNS_T_A), std::string(kDomain)+" A 192.0.2.18",
+		std::string(kDomain)+" A 192.0.2.19", std::string(kDomain)+" A 192.0.2.20"};
+	std::vector<std::string> aaaa{address_rr(DNS_T_AAAA), std::string(kDomain)+" AAAA 2001:db8::18"};
+	auto both = a; both.insert(both.end(), aaaa.begin(), aaaa.end());
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("force-no-CNAME yes\n"
+		"domain-rules /address-mode.test/ -dualstack-ip-selection no -speed-check-mode none\n")));
+	ASSERT_TRUE(response_is(query(DNS_T_A, false, kClientPort, false, false, false, true),
+		DNS_RC_NOERROR, a, 0, kQueryId, DNS_T_A));
+	ASSERT_TRUE(response_is(query(DNS_T_AAAA), DNS_RC_NOERROR, aaaa, 0, kQueryId, DNS_T_AAAA));
+	expect_workload(upstream, 1, 1);
+	for (bool tcp : {false, true}) for (bool ad : {false, true}) {
+		EXPECT_TRUE(response_is(query(DNS_T_ANY, tcp, kClientPort, false, false, false, ad),
+			DNS_RC_NOERROR, both, 0, kQueryId, DNS_T_ANY, kDomain, 1, 600));
+		expect_workload(upstream, 1, 1);
+	}
+}
+
+TEST(AnyAddress, NativePolicyCachesRemainIsolatedAcrossInheritedRuleGroups)
+{
+	AddressUpstream upstream;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("force-no-CNAME yes\n"
+		"bind 127.0.0.1:60056 -g separate\ngroup-begin separate\ngroup-end\n")));
+	ASSERT_TRUE(response_is(query(DNS_T_A), DNS_RC_NOERROR, {address_rr(DNS_T_A)}, 0, kQueryId, DNS_T_A));
+	ASSERT_TRUE(response_is(query(DNS_T_AAAA), DNS_RC_NOERROR, {address_rr(DNS_T_AAAA)}, 0, kQueryId, DNS_T_AAAA));
+	expect_workload(upstream, 1, 1);
+	EXPECT_TRUE(response_is(query(DNS_T_ANY, false, 60056), DNS_RC_NOERROR,
+		{address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream, 2, 2);
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream, 2, 2);
+}
+
+TEST(AnyAddress, PaddedUpstreamColdAnswersPreserveIndependentValidatedFamilies)
+{
+	AddressUpstream upstream;
+	upstream.ipv4.aliases = {"ipv4.address-mode.test"};
+	upstream.ipv6.aliases = {"ipv6.address-mode.test"};
+	upstream.ipv4.response_options = {0,12,0,44}; upstream.ipv4.response_options.resize(48,0);
+	upstream.ipv6.response_options = {0,12,1,20}; upstream.ipv6.response_options.resize(280,0);
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("cache-size 0\nforce-no-CNAME yes\n")));
+	for (bool tcp : {false,true})
+		EXPECT_TRUE(response_is(query(DNS_T_ANY,tcp),DNS_RC_NOERROR,
+			{address_rr(DNS_T_A),address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream,2,2);
+}
+
+TEST(AnyAddress, ListenerRoutingSetPoliciesAreInheritedAndIsolateNativeCacheViews)
+{
+	AddressUpstream upstream;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	std::string cfg = config("force-no-CNAME yes\n"
+		"bind 127.0.0.1:60056 -nftset #4:inet#vscope#b4,#6:inet#vscope#b6\n");
+	for (const std::string &prefix : {std::string("bind "),std::string("bind-tcp ")}) {
+		std::string original = prefix+"127.0.0.1:"+std::to_string(kClientPort);
+		cfg.replace(cfg.find(original),original.size(),
+			original+" -nftset #4:inet#vscope#a4,#6:inet#vscope#a6");
+	}
+	ASSERT_TRUE(server.Start(cfg));
+	ASSERT_TRUE(response_is(query(DNS_T_A),DNS_RC_NOERROR,{address_rr(DNS_T_A)},0,kQueryId,DNS_T_A));
+	ASSERT_TRUE(response_is(query(DNS_T_AAAA),DNS_RC_NOERROR,{address_rr(DNS_T_AAAA)},0,kQueryId,DNS_T_AAAA));
+	expect_workload(upstream,1,1);
+	/* Identical UDP/TCP policy is compared by content, not allocation address. */
+	EXPECT_TRUE(response_is(query(DNS_T_ANY,true),DNS_RC_NOERROR,{address_rr(DNS_T_A),address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream,1,1);
+	for (int i=0;i<2;i++) {
+		EXPECT_TRUE(response_is(query(DNS_T_ANY,false,60056),DNS_RC_NOERROR,
+			{address_rr(DNS_T_A),address_rr(DNS_T_AAAA)}));
+		expect_workload(upstream,2,2);
+	}
+	EXPECT_TRUE(response_is(query(),DNS_RC_NOERROR,{address_rr(DNS_T_A),address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream,3,3);
+}
+
+TEST(AnyAddress, UnsupportedResponseOptionsCannotBecomePositiveCompletion)
+{
+	for (Wire option : {Wire{0,8,0,0}, Wire{0,12,0,4,0}, Wire{0xfd,0xe9,0,0}}) {
+		AddressUpstream upstream;
+		upstream.ipv4.response_options = option;
+		smartdns::Server server;
+		ASSERT_TRUE(upstream.start());
+		ASSERT_TRUE(server.Start(config("cache-size 0\nforce-no-CNAME yes\nany-aggregate-max-attempts 4\n")));
+		EXPECT_TRUE(response_is(query(),DNS_RC_SERVFAIL,{}));
+		/* Malformed DNS can trigger native retries, still bounded by the
+		 * one operation budget. No unsupported family becomes a positive. */
+		EXPECT_GE(upstream.a.load(),1); EXPECT_GE(upstream.aaaa.load(),1);
+		EXPECT_LE(upstream.a.load()+upstream.aaaa.load(),4);
+		EXPECT_EQ(upstream.any.load(),0); EXPECT_EQ(upstream.other.load(),0);
+	}
+}
+
 TEST(AnyAddress, OrdinaryNegativeCacheIsRevalidatedWhileFreshPositiveCacheIsReused)
 {
 	AddressUpstream upstream;
@@ -871,7 +1000,7 @@ TEST(AnyAddress, DoOriginCacheCannotSupplyPlainAddressCompletion)
 	expect_workload(upstream, 2, 1);
 }
 
-TEST(AnyAddress, CdAndAdOriginsCannotSupplyPlainAddressCompletion)
+TEST(AnyAddress, CdOriginIsRevalidatedAndAdCapabilityReusesCompatibleCache)
 {
 	for (bool ad : {false, true}) {
 		SCOPED_TRACE(ad ? "AD origin" : "CD origin");
@@ -883,7 +1012,7 @@ TEST(AnyAddress, CdAndAdOriginsCannotSupplyPlainAddressCompletion)
 			DNS_RC_NOERROR, {address_rr(DNS_T_A)}, 0, kQueryId, DNS_T_A));
 		expect_workload(upstream, 1, 0);
 		EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
-		expect_workload(upstream, 2, 1);
+		expect_workload(upstream, ad ? 1 : 2, 1);
 	}
 }
 
@@ -905,9 +1034,14 @@ static void legacy_and_metadata_cache_replacement_case()
 	CacheRef entry(dns_cache_lookup(&key), dns_cache_release);
 	ASSERT_NE(entry.get(), nullptr);
 	dns_cache_info info{};
-	DataRef snapshot(dns_cache_get_data_with_origin(entry.get(), DNS_CACHE_ORIGIN_PLAIN, &info),
+	DataRef snapshot(dns_cache_get_data_with_origin(entry.get(), DNS_CACHE_ORIGIN_NATIVE_VIEW, &info),
 		dns_cache_data_put);
 	ASSERT_NE(snapshot.get(), nullptr);
+	/* Flag-only subsets are not opaque policy IDs. */
+	DataRef wrong_view(dns_cache_get_data_with_view(entry.get(), DNS_CACHE_ORIGIN_NATIVE_VIEW, &info),
+		dns_cache_data_put);
+	ASSERT_EQ(wrong_view.get(), nullptr);
+
 	std::cout << "Cache-origin fixture: native snapshot retained; replacing packet" << std::endl;
 	const auto old_size = snapshot->head.size;
 	const Wire old_packet(snapshot->data, snapshot->data + old_size);
@@ -921,7 +1055,7 @@ static void legacy_and_metadata_cache_replacement_case()
 	ASSERT_EQ(dns_cache_replace(&key, DNS_RC_NOERROR, 60, old_speed + 17, 60, 1,
 		replacement.get()), 0);
 	replacement.release();
-	DataRef unsafe(dns_cache_get_data_with_origin(entry.get(), DNS_CACHE_ORIGIN_PLAIN, &info),
+	DataRef unsafe(dns_cache_get_data_with_origin(entry.get(), DNS_CACHE_ORIGIN_NATIVE_VIEW, &info),
 		dns_cache_data_put);
 	EXPECT_EQ(unsafe.get(), nullptr);
 	EXPECT_EQ(snapshot->head.size, old_size);
@@ -935,7 +1069,7 @@ static void legacy_and_metadata_cache_replacement_case()
 	/* Metadata-only replacement must also revoke the flag rather than lend
 	 * a fresh lifetime to provenance that has no replacement packet. */
 	ASSERT_EQ(dns_cache_replace_with_origin(&key, DNS_RC_NOERROR, 60, -1, 60, 1,
-		nullptr, DNS_CACHE_ORIGIN_PLAIN), 0);
+		nullptr, DNS_CACHE_ORIGIN_NATIVE_VIEW), 0);
 	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
 	expect_workload(upstream, 3, 1);
 	std::cout << "Cache-origin fixture: metadata replacement verified; releasing fixture" << std::endl;
@@ -951,6 +1085,73 @@ TEST(AnyAddress, LegacyAndMetadataOnlyReplacementRevokeCacheOrigin)
 		legacy_and_metadata_cache_replacement_case();
 		_exit(::testing::Test::HasFailure() ? 1 : 0);
 	}, ::testing::ExitedWithCode(0), "");
+}
+
+static void prefetch_retains_native_view_case(bool routing_policy, bool native_api = false)
+{
+	SCOPED_TRACE(routing_policy);
+	AddressUpstream upstream;
+	upstream.ipv4.aliases = upstream.ipv6.aliases = {"target.address-mode.test"};
+	smartdns::Server server(smartdns::Server::CREATE_MODE_THREAD);
+	ASSERT_TRUE(upstream.start());
+	std::string cfg=config("force-no-CNAME yes\n");
+	if (routing_policy) cfg += "domain-rules /address-mode.test/ -nftset #4:inet#vscope#a4,#6:inet#vscope#a6\n";
+	ASSERT_TRUE(server.Start(cfg));
+	using CacheRef = std::unique_ptr<dns_cache, decltype(&dns_cache_release)>;
+	using DataRef = std::unique_ptr<dns_cache_data, decltype(&dns_cache_data_put)>;
+	for (auto type : {DNS_T_A, DNS_T_AAAA}) {
+		dns_cache_key key{kDomain, type, "", 0};
+		if (native_api) {
+			/* API lookups share construction with internal family probes. */
+			ASSERT_EQ(dns_server_query(kDomain, type, nullptr, nullptr, nullptr), 0);
+		} else {
+			ASSERT_TRUE(response_is(query(type), DNS_RC_NOERROR, {address_rr(type)}, 0, kQueryId, type));
+		}
+		CacheRef entry(nullptr, dns_cache_release);
+		auto ready = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+		do {
+			entry.reset(dns_cache_lookup(&key));
+			if (entry) break;
+			poll(nullptr, 0, 5);
+		} while (std::chrono::steady_clock::now() < ready);
+		ASSERT_NE(entry.get(), nullptr);
+		dns_cache_info info{};
+		DataRef before(dns_cache_get_data_with_origin(entry.get(), DNS_CACHE_ORIGIN_NATIVE_VIEW, &info),
+			dns_cache_data_put);
+		ASSERT_NE(before.get(), nullptr);
+		/* Exercise the real timer-prefetch entry point, including its inherited
+		 * domain routing policy, after a cache hit makes the entry active. */
+		ASSERT_TRUE(response_is(query(type),DNS_RC_NOERROR,{address_rr(type)},0,kQueryId,type));
+		/* Publishing an API cache entry can precede completion of its native
+		 * pending lookup. Exercise timer refresh in separate completed-wire
+		 * scenarios, rather than race its legitimate pending-query coalescing. */
+		if (native_api) continue;
+		ASSERT_EQ(_dns_server_prefetch_domain(dns_server_get_default_rule_group(),entry.get()),
+			DNS_CACHE_TMOUT_ACTION_OK);
+		/* Observe the asynchronous replacement, retaining the old blob to
+		 * exclude allocator-address reuse. This does not retry DNS queries. */
+		auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+		DataRef after(nullptr, dns_cache_data_put);
+		do {
+			after.reset(dns_cache_get_data(entry.get()));
+			if (after.get() != before.get()) break;
+			poll(nullptr, 0, 5);
+		} while (std::chrono::steady_clock::now() < until);
+		ASSERT_NE(after.get(), before.get());
+		DataRef proven(dns_cache_get_data_with_origin(entry.get(), DNS_CACHE_ORIGIN_NATIVE_VIEW, &info),
+			dns_cache_data_put);
+		ASSERT_NE(proven.get(), nullptr);
+	}
+	expect_workload(upstream, native_api ? 1 : 2, native_api ? 1 : 2);
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream, native_api ? 1 : 2, native_api ? 1 : 2);
+}
+
+TEST(AnyAddress, BackgroundPrefetchPreservesCompatibleTypedCacheProvenance)
+{
+	ASSERT_EXIT({ prefetch_retains_native_view_case(false); prefetch_retains_native_view_case(true);
+		prefetch_retains_native_view_case(false, true); std::cout.flush();
+		_exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
 }
 
 static void incomplete_native_cache_case(Outcome incomplete)
@@ -1130,7 +1331,7 @@ TEST(AnyAddress, CookieAndPaddingDoNotSelectAnUnprovenDnsView)
 				std::vector<std::string>{address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
 		}
 	}
-	expect_workload(upstream, 6, 6);
+	expect_workload(upstream, 1, 1);
 }
 
 TEST(AnyAddress, GlobalCnameSuppressionPreservesBothFamiliesAfterAliasValidation)
@@ -1143,7 +1344,7 @@ TEST(AnyAddress, GlobalCnameSuppressionPreservesBothFamiliesAfterAliasValidation
 	for (bool tcp : {false, true})
 		EXPECT_TRUE(response_is(query(DNS_T_ANY, tcp), DNS_RC_NOERROR,
 			{address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
-	expect_workload(upstream, 2, 2);
+	expect_workload(upstream, 1, 1);
 }
 
 TEST(AnyAddress, CnameSuppressionComposesIndependentValidatedNativeAliases)

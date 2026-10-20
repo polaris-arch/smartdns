@@ -381,9 +381,7 @@ int _dns_server_do_query(struct dns_request *request, int skip_notify_event)
 	}
 
 	// Get reference for DNS query
-	request->cache_origin_plain = request->conf->any.aggregate == DNS_ANY_ADDRESS && dns_conf.cachesize > 0 &&
-		(request->qtype == DNS_T_A || request->qtype == DNS_T_AAAA) &&
-		_dns_server_any_plain_context(request, server_group_name);
+	request->cache_origin_view = _dns_server_address_cache_view(request, server_group_name);
 	_dns_server_address_cache_prepare(request);
 	request->request_wait++;
 	_dns_server_request_get(request);
@@ -914,6 +912,7 @@ int dns_server_init(void)
 	if (server.epoll_fd > 0) {
 		return -1;
 	}
+	_dns_server_address_cache_views_reset();
 
 	if (_dns_server_audit_init() != 0) {
 		tlog(TLOG_ERROR, "init audit failed.");

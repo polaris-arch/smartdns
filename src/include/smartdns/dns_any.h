@@ -15,6 +15,9 @@ struct dns_any_input {
 	uint32_t age;
 };
 int dns_any_type_from_name(const char *name);
+/* Validate hop-only OPT RDATA before discarding it. Responses require a
+ * server cookie and a two-byte keepalive; view-changing/unknown options fail. */
+int dns_any_hop_options(const unsigned char *data, int len, int response);
 /* Validates a full packet, ages each ordinary TTL independently, leaves OPT unchanged.
  * age=0 preserves wire TTLs. minimum excludes OPT and is zero for uncacheable packets. */
 int dns_any_wire_age(unsigned char *data, int len, uint32_t age, uint32_t *minimum);

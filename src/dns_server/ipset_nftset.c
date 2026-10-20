@@ -61,27 +61,30 @@ void _dns_server_add_ipset_nftset(struct dns_request *request, struct dns_ipset_
 	}
 }
 
+const struct nftset_ipset_rules *_dns_server_get_bind_ipset_context(const struct dns_request *request)
+{
+	const struct nftset_ipset_rules *rules = request->inherited_bind_sets;
+	if (!rules && request->conn) rules = request->conn->ipset_nftset_rule;
+	return rules && (rules->ipset || rules->ipset_ip || rules->ipset_ip6 ||
+		rules->nftset_ip || rules->nftset_ip6) ? rules : NULL;
+}
+
 void *_dns_server_get_bind_ipset_nftset_rule(struct dns_request *request, enum domain_rule type)
 {
-	if (request->conn == NULL) {
-		return NULL;
-	}
-
-	if (request->conn->ipset_nftset_rule == NULL) {
-		return NULL;
-	}
+	const struct nftset_ipset_rules *rules = _dns_server_get_bind_ipset_context(request);
+	if (!rules) return NULL;
 
 	switch (type) {
 	case DOMAIN_RULE_IPSET:
-		return request->conn->ipset_nftset_rule->ipset;
+		return rules->ipset;
 	case DOMAIN_RULE_IPSET_IPV4:
-		return request->conn->ipset_nftset_rule->ipset_ip;
+		return rules->ipset_ip;
 	case DOMAIN_RULE_IPSET_IPV6:
-		return request->conn->ipset_nftset_rule->ipset_ip6;
+		return rules->ipset_ip6;
 	case DOMAIN_RULE_NFTSET_IP:
-		return request->conn->ipset_nftset_rule->nftset_ip;
+		return rules->nftset_ip;
 	case DOMAIN_RULE_NFTSET_IP6:
-		return request->conn->ipset_nftset_rule->nftset_ip6;
+		return rules->nftset_ip6;
 	default:
 		break;
 	}

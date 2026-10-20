@@ -156,12 +156,13 @@ int _dns_server_request_update_cache(struct dns_request *request, int speed, dns
 	 * Recheck mutable CNAME state before attesting the finalized blob. The
 	 * route/ECS predicate was captured before entering client callbacks; do
 	 * not acquire the client's server-list lock again from a receive path. */
-	if ((qtype == DNS_T_A || qtype == DNS_T_AAAA) && request->cache_origin_plain &&
+	if ((qtype == DNS_T_A || qtype == DNS_T_AAAA) && request->cache_origin_view &&
 		request->rcode == DNS_RC_NOERROR && !request->is_cache_reply &&
-		!request->has_cname && !request->parent_request && !request->is_mdns_lookup &&
+		(!request->has_cname || request->conf->dns_force_no_cname) &&
+		!request->parent_request && !request->is_mdns_lookup &&
 		cache_data && cache_data->head.size > 0 && cache_data->head.size <= DNS_IN_PACKSIZE &&
 		_dns_server_address_cache_proven(request, cache_data->data, cache_data->head.size))
-		origin_flags = DNS_CACHE_ORIGIN_PLAIN;
+		origin_flags = request->cache_origin_view;
 
 	if (request->prefetch) {
 		/* no prefetch for mdns request */
@@ -277,14 +278,14 @@ static int _dns_server_process_cache_packet(struct dns_request *request, struct 
 	}
 
 	if (request->address_child) {
-		/* Reuse an entry only when this request is also a plain context.
-		 * A plain-origin entry cannot attest a different client's policy. */
+		/* Native key (domain/type/group/bind flags) plus the exact effective
+		 * policy view must match. Shared-operation admission stays separate. */
 		if (!_dns_server_address_child_cache_allowed(request)) goto out;
 		/* Snapshot the provenance, packet and its age/TTL under one cache
 		 * lock. A concurrent replacement cannot authenticate a new unsafe
 		 * packet with an old flag or extend an old packet with new metadata. */
-		cache_packet = (struct dns_cache_packet *)dns_cache_get_data_with_origin(
-			dns_cache, DNS_CACHE_ORIGIN_PLAIN, &origin_info);
+		cache_packet = (struct dns_cache_packet *)dns_cache_get_data_with_view(
+			dns_cache, request->cache_origin_view, &origin_info);
 		time_t now = time(NULL);
 		time_t age = now > origin_info.insert_time ? now - origin_info.insert_time : 0;
 		if (age < origin_info.ttl) origin_ttl = origin_info.ttl - age;

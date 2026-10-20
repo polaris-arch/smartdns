@@ -54,29 +54,52 @@ The existing `any-aggregate-max-attempts` (default 16, range 1–64) and
 including both families and nested work. Each child does not receive a new
 budget. Rule-group inheritance and explicit group overrides apply to all modes.
 
-Address requests use bounded equivalent-request coalescing and validated fresh
-positive entries from the ordinary A/AAAA cache whose in-memory origin was
-recorded as a compatible plain upstream lookup. Legacy/persisted entries and
-entries from ECS, DNSSEC/CD or unsupported policy contexts are refetched; packet
-flags alone do not prove their original context. They do not reuse ordinary
-pending-query leaders with unrelated budgets. Negative/expired native cache
-entries are not proof of upstream absence and are not reused for completion.
-The provenance flag is set only by an actual compatible upstream lookup;
-packet, origin and TTL metadata are acquired together. Legacy and metadata-only
-replacements revoke the flag. This does not change ordinary cache behavior.
-Original upstream packets must also validate as complete positive Answers, and
-every selected address in the cache packet must be a subset of those proven
-Answers. A native reconstruction of truncated or Additional-only data cannot
-gain trusted provenance. The proof set is bounded to 64 addresses per compatible
-live request; overflow or allocation failure disables this reuse.
-Proof is collected only for native requests in an address-enabled group with
-caching enabled, including ordinary A/AAAA warmers in that group. The narrow
-allocation-free validator accepts direct positive Answers without CNAME or
-authority, with at most one empty root OPT. Positive packets with authority or
-glue are refetched for address completion; ordinary resolution is unchanged.
-The retained proof is at most 64 × 16 address bytes plus counters and a mutex;
-validation uses a 64-address stack scratch set and bounded name storage, not
-the general merger's temporary heap buffers.
+Address requests keep conservative equivalent-request coalescing separate from
+native typed-cache reuse. Fresh positive A/AAAA entries can be reused only with
+an exact process-local policy view, in addition to the native domain, family,
+rule-group and bind-flag key. The view records the immutable effective rule-group
+object, upstream route and bind routing-set contents; identical UDP/TCP target
+lists match by value, while different targets cannot share a cache view. Client
+rules have already resolved into that group
+and those flags. AD capability hints and benign hop annotations do not create
+different answer policies. ECS, DNSSEC/CD, DNS64 and unsupported wire contexts
+remain ineligible. View IDs use exact equality, never a bitmask subset or a lossy
+hash. At most 1024 views are retained without recycling; exhaustion disables reuse.
+
+Only actual compatible upstream work can attest the finalized native selected
+addresses. Ordinary A/AAAA queries and trusted internal background prefetches
+use the same eligibility and source validation. Background prefetches resolve the same domain/group policy; listener routing-set
+bindings keep the native no-prefetch flag. Prefetch DO/ECS options still
+exclude attestation. Legacy/persisted entries have no process-local attestation;
+legacy packet replacement and metadata-only replacement revoke it. Packet,
+provenance and TTL metadata are snapshotted under one cache lock, and each RR is
+aged only in a private copy. Negative and expired entries cannot prove upstream
+absence. Ordinary pending leaders with unrelated budgets are never joined.
+
+Complete upstream Answers are normalized before collecting a bounded proof set
+of 64 addresses per compatible live request. Under force-no-CNAME, coherent
+upstream alias paths are validated before flattening them. Every finalized
+selected address must occur in a complete positive proof, including selections
+combined from different upstreams. A truncated or Additional-only source cannot
+attest its reconstructed addresses; an unrelated failed peer does not invalidate
+addresses proven by another complete source. Overflow or allocation failure
+only disables this reuse. Native speed selection and its finalized TTL policy
+remain authoritative: warm multi-record entries retain every selected record,
+while cold first-ping completion still does not wait for all upstreams.
+
+Request and response OPT options share a bounded length validator. Well-formed
+padding, cookies and keepalive are hop metadata and are stripped before merging;
+response cookies must include a server cookie. A single root OPT is allowed only
+in Additional, with supported version/flags. Malformed lengths, duplicate OPT,
+ECS, DNSSEC and unknown extensions do not establish completion evidence. This
+also accepts padded HTTPS DoH responses without weakening policy-view checks.
+
+Internal typed children inherit immutable bind ipset/nftset configuration without
+borrowing a client connection. Native routing-set effects therefore apply both
+to domain/group rules and listener rules. Bind-set requests remain outside
+conservative operation coalescing; compatible native cache reuse is independent.
+The view dictionary is cleared before each resolver lifetime and its opaque token
+sequence is never recycled, preventing references to retired bind configuration.
 Cached CNAME packets are also refetched because the legacy cache may retain a
 collapsed alias chain without the original complete-chain provenance.
 There is no separate combined address-result cache. `cache-size 0` disables
@@ -88,8 +111,8 @@ their existing behavior.
 Native policy admission is separate from conservative cache/coalescing
 eligibility. CNAME suppression, domain speed/dualstack flags, local addresses,
 IPv4/IPv6 suppression, route groups, ipset/nftset and no-cache binds pass through
-the ordinary typed pipeline. Non-plain requests neither join a plain operation
-nor import its native cache entries. The native typed finalization retains
+the ordinary typed pipeline. Non-plain requests do not join a plain operation; they may reuse a fresh native
+entry only when the exact effective policy view matches. The native typed finalization retains
 routing-set effects; the parent does not repeat them. Alias evidence is rebased
 for configured local CNAMEs. Visible CNAME answers retain a coherent selected
 path across both families. Explicit force-no-CNAME instead combines independently

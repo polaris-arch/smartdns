@@ -233,6 +233,7 @@ class LimitedHTTP2DoHUpstream
 	}
 
 	int RequestCount() const { return request_count_.load(); }
+	void FirstHttpError(int status) { first_http_error_ = status; }
 	const std::string &LastError() const { return last_error_; }
 
   private:
@@ -419,6 +420,14 @@ class LimitedHTTP2DoHUpstream
 
 		std::vector<uint8_t> response;
 		std::string error;
+		int first_error = first_http_error_.exchange(0);
+		if (first_error) {
+			struct http2_header_pair headers[] = {{"retry-after", "0"}, {"content-length", "0"}};
+			if (http2_stream_set_response(stream, first_error, headers, 2) ||
+				http2_stream_write_body(stream, nullptr, 0, 1) < 0) return false;
+			request_count_++;
+			return true;
+		}
 		if (!BuildDnsAResponse(*body, response_ip_.c_str(), &response, &error, zero_window_)) {
 			return false;
 		}
@@ -551,6 +560,7 @@ class LimitedHTTP2DoHUpstream
 	std::vector<std::thread> client_threads_;
 	std::atomic<bool> run_{false};
 	std::atomic<int> request_count_{0};
+	std::atomic<int> first_http_error_{0};
 	bool zero_window_ = false;
 	std::atomic<bool> wire_failed_{false};
 	std::atomic<bool> zero_window_requested_{false};
@@ -2624,6 +2634,29 @@ TEST(AnyOffline, UpstreamZeroWindowCancelThenUpdatePreservesCompleteSiblingDns)
 	client.ClosePending(&pending);
 }
 
+
+TEST(HTTP2, Upstream429And503RecoverWithoutPermanentProhibition)
+{
+	Defer { unlink(HTTP2_TEST_CERT_FILE); unlink(HTTP2_TEST_KEY_FILE); };
+	for (int status : {429, 503}) {
+		SCOPED_TRACE(status);
+		LimitedHTTP2DoHUpstream upstream;
+		smartdns::Server server;
+		upstream.FirstHttpError(status);
+		ASSERT_TRUE(upstream.Start(63054, 8, "192.0.2.29")) << upstream.LastError();
+		ASSERT_TRUE(server.Start("bind 127.0.0.1:63053\n"
+			"server https://127.0.0.1:63054/dns-query -no-check-certificate -alpn h2\n"
+			"cache-size 0\nspeed-check-mode none\ndualstack-ip-selection no\nlog-level debug\n"));
+		std::string error;
+		auto start = std::chrono::steady_clock::now();
+		ASSERT_TRUE(UdpQueryHasA("limited.example.com", 63053, 0x8a01, "192.0.2.29", &error)) << error;
+		EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now()-start).count(), 80);
+		EXPECT_EQ(upstream.RequestCount(), 2) << "one transient error followed by one successful retry";
+		ASSERT_TRUE(UdpQueryHasA("after-limited.example.com", 63053, 0x8a02, "192.0.2.29", &error)) << error;
+		EXPECT_EQ(upstream.RequestCount(), 3) << "endpoint remains usable after recovery";
+	}
+}
 
 TEST(HTTP2, ScopedTlsIoPreservesBrokenPipeErrorAndSignalMask)
 {

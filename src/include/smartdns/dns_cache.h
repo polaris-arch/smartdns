@@ -182,6 +182,11 @@ struct dns_cache_data *dns_cache_get_data(struct dns_cache *dns_cache);
 struct dns_cache_data *dns_cache_get_data_with_origin(struct dns_cache *dns_cache, unsigned int required_origin,
 													struct dns_cache_info *info);
 
+/* Opaque process-local policy view: equality, never a subset bitmask. */
+#define DNS_CACHE_ORIGIN_NATIVE_VIEW 2u
+struct dns_cache_data *dns_cache_get_data_with_view(struct dns_cache *dns_cache, unsigned int view,
+												 struct dns_cache_info *info);
+
 void dns_cache_data_get(struct dns_cache_data *cache_data);
 
 void dns_cache_data_put(struct dns_cache_data *cache_data);

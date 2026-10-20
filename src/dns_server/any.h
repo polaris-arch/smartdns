@@ -6,9 +6,10 @@ extern "C" {
 #endif
 /* 0: handled; -1: context is not eligible, retain transparent normal path. */
 int _dns_server_process_any(struct dns_request *request, const char *group_name);
-/* Conservative context predicate also used to attest ordinary cache origins. */
+/* Conservative admission for sharing ANY operations; native cache views are separate. */
 int _dns_server_any_plain_context(struct dns_request *request, const char *group_name);
 int _dns_server_any_address_context(struct dns_request *request, const char *group_name);
+int _dns_server_native_address_context(struct dns_request *request, const char *group_name);
 int _dns_server_any_flatten_addresses(const char *domain, int qtype, unsigned char *wire, int len);
 void _dns_server_any_wire_context(struct dns_request *request, const unsigned char *wire, int len);
 void _dns_server_any_period(void);

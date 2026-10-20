@@ -511,6 +511,10 @@ struct dns_request *_dns_server_new_request(void)
 	request->rcode = DNS_RC_SERVFAIL;
 	request->conn = NULL;
 	request->qclass = DNS_C_IN;
+	/* Internally generated lookups (API, family probes and prefetch) use
+	 * recursive native queries. Network requests overwrite this from their
+	 * original header, including RD=0 and all unsupported context markers. */
+	request->any_rd = 1;
 	request->any_udp_size = DNS_DEFAULT_PACKET_SIZE;
 	request->result_callback = NULL;
 	request->conf = dns_server_get_default_rule_group();

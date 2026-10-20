@@ -52,6 +52,51 @@ TEST(AnyBounded, NamedTypeDoesNotChangeAllSentinel)
 		EXPECT_EQ(dns_any_type_from_name(s), -1);
 }
 
+TEST(AnyBounded, ResponseHopMetadataIsStrippedWithoutChangingAnswers)
+{
+	std::vector<Wire> options{{}, {0,12,0,0}, {0,12,0,4,1,2,3,4}, {0,11,0,2,0,30}};
+	for (int size : {16,40}) {
+		Wire cookie{0,10,0,static_cast<unsigned char>(size)};
+		cookie.resize(size+4,7); options.push_back(cookie);
+		cookie.insert(cookie.end(), {0,12,0,0}); options.push_back(cookie);
+	}
+	for (const auto &option : options) {
+		Wire a = response(DNS_T_A, 1, 0, 1), aaaa = response(DNS_T_AAAA, 1);
+		rr(a, "unit.test", DNS_T_A, 60, {1,2,3,4});
+		rr(a, "", DNS_T_OPT, 0, option, 4096);
+		rr(aaaa, "unit.test", DNS_T_AAAA, 60, Wire(16,7));
+		Wire output;
+		ASSERT_GT(merge(a,DNS_T_A,aaaa,DNS_T_AAAA,0,&output),0);
+		EXPECT_EQ(output[7],2); EXPECT_EQ(output[10],0); EXPECT_EQ(output[11],0);
+	}
+}
+
+TEST(AnyBounded, MalformedOrViewChangingResponseOptionsCannotEstablishEvidence)
+{
+	Wire aaaa = response(DNS_T_AAAA, 1);
+	rr(aaaa, "unit.test", DNS_T_AAAA, 60, Wire(16,7));
+	std::vector<Wire> options{{0}, {0,12,0}, {0,12,0,4,0}, {0,8,0,0},
+		{0,15,0,2,0,0}, {0xfd,0xe9,0,0}, {0,11,0,0}};
+	for (int size : {0,8,15,41}) {
+		Wire cookie{0,10,0,static_cast<unsigned char>(size)};
+		cookie.resize(size+4,7); options.push_back(cookie);
+	}
+	for (const auto &option : options) {
+		Wire a = response(DNS_T_A, 1, 0, 1);
+		rr(a,"unit.test",DNS_T_A,60,{1,2,3,4}); rr(a,"",DNS_T_OPT,0,option,4096);
+		EXPECT_LT(merge(a,DNS_T_A,aaaa,DNS_T_AAAA,0),0);
+	}
+	for (int mode = 0; mode < 7; mode++) {
+		Wire a = response(DNS_T_A,1,mode==2,mode==2?0:mode==1?2:1);
+		rr(a,"unit.test",DNS_T_A,60,{1,2,3,4});
+		rr(a,mode==0?"not-root.test":"",DNS_T_OPT,
+			mode==3?DNS_OPT_FLAG_DO:mode==4?0x10000:mode==5?0x1000000:0,{},4096);
+		if (mode==1) rr(a,"",DNS_T_OPT,0,{},4096);
+		if (mode==6) a[3] |= 0x40;
+		EXPECT_LT(merge(a,DNS_T_A,aaaa,DNS_T_AAAA,0),0) << "envelope mode " << mode;
+	}
+}
+
 TEST(AnyBounded, PlainAddressProofAcceptsOnlyCompleteDirectAnswers)
 {
 	unsigned char addresses[DNS_ANY_MAX_RECORDS][DNS_RR_AAAA_LEN];

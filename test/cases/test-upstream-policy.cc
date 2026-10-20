@@ -120,12 +120,14 @@ TEST(UpstreamPolicy, SharedRateDoesNotChargeUnrelatedEndpoint) {
     EXPECT_EQ(other.Wire(), DNS_ADMIT_OK);
 }
 TEST(UpstreamPolicy, CooldownIsScopedAndDoesNotBecomeProhibition) {
+  for (int status : {429, 503}) {
     Endpoint limited, healthy;
-    _dns_policy_http_error(&limited.server, 429, "3600");
+    _dns_policy_http_error(&limited.server, status, "3600");
     EXPECT_EQ(limited.Begin(), DNS_ADMIT_WAIT);
     EXPECT_EQ(limited.server.prohibit, 0);
     EXPECT_EQ(healthy.Begin(), DNS_ADMIT_OK);
     EXPECT_EQ(healthy.Wire(), DNS_ADMIT_OK);
+  }
 }
 TEST(UpstreamPolicy, CancellationPreventsBufferedSend) {
     Endpoint e;

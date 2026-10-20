@@ -5,6 +5,7 @@
 #include "context.h"
 #include "request.h"
 #include "server_http2.h"
+#include "ipset_nftset.h"
 #include "smartdns/dns_any.h"
 #include "smartdns/dns_client.h"
 #include <limits.h>
@@ -48,20 +49,12 @@ void _dns_server_any_wire_context(struct dns_request *request, const unsigned ch
 		return;
 	}
 	if (additional != 1 || pos + 11 > len || wire[pos] || wire_u16(wire + pos + 1) != DNS_T_OPT ||
-		wire[pos + 5] || wire[pos + 6]) goto unsupported;
+		wire[pos + 5] || wire[pos + 6] || (wire[pos + 7] & 0x7f) || wire[pos + 8]) goto unsupported;
 	int end = pos + 11 + wire_u16(wire + pos + 9);
 	pos += 11;
 	if (end != len) goto unsupported;
-	while (pos < end) {
-		if (pos + 4 > end) goto unsupported;
-		unsigned int option = wire_u16(wire + pos), size = wire_u16(wire + pos + 2);
-		pos += 4;
-		if (size > (unsigned int)(end - pos)) goto unsupported;
-		request->any_unknown_context = 1;
-		if (option != DNS_OPT_T_COOKIE && option != DNS_OPT_T_PADDING && option != DNS_OPT_T_TCP_KEEPALIVE)
-			goto unsupported;
-		pos += size;
-	}
+	if (pos < end) request->any_unknown_context = 1;
+	if (dns_any_hop_options(wire + pos, end - pos, 0)) goto unsupported;
 	return;
 unsupported:
 	request->any_unknown_context = request->any_unsupported_context = 1;
@@ -195,6 +188,7 @@ int _dns_server_any_plain_context(struct dns_request *request, const char *route
 	struct dns_conf_ipset_nftset no_ipset = {0};
 	if (!route) route = DNS_SERVER_GROUP_DEFAULT;
 	if (memcmp(&request->conf->ipset_nftset, &no_ipset, sizeof(no_ipset))) return 0;
+	if (_dns_server_get_bind_ipset_context(request)) return 0;
 	/* Address-mode completeness cannot be replaced by a policy-generated
 	 * negative for the parent ANY question before either family is observed. */
 	if (request->qtype == DNS_T_ANY && request->conf->any.aggregate == DNS_ANY_ADDRESS && request->conf->soa_table &&
@@ -219,14 +213,19 @@ int _dns_server_any_plain_context(struct dns_request *request, const char *route
 /* Resolving through native policy is distinct from proving that a legacy
  * cache entry or another client's operation is safe to reuse. AD on a query
  * only advertises client capability; synthesized replies still clear AD. */
-int _dns_server_any_address_context(struct dns_request *request, const char *route)
+int _dns_server_native_address_context(struct dns_request *request, const char *route)
 {
 	return request->qclass == DNS_C_IN && request->any_rd &&
 		!request->edns0_do && !request->any_do && !request->any_cd &&
 		!request->any_unsupported_context && !request->has_ecs && !request->is_mdns_lookup &&
-		!request->prefetch && !request->conf->dns_dns64.prefix_len &&
+		!request->conf->dns_dns64.prefix_len &&
 		!request->conf->ipv4_ecs.enable && !request->conf->ipv6_ecs.enable &&
 		!dns_client_group_has_ecs(route ? route : DNS_SERVER_GROUP_DEFAULT);
+}
+
+int _dns_server_any_address_context(struct dns_request *request, const char *route)
+{
+	return !request->prefetch && _dns_server_native_address_context(request, route);
 }
 
 /* Validate aliases before suppressing them. Suppression must not hide a

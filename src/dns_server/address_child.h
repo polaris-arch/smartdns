@@ -47,6 +47,8 @@ int _dns_server_address_child_cache_positive(struct dns_request *request, unsign
 /* Separate from child custody: ordinary A/AAAA warmers retain their behavior.
  * Only the eligibility of a native cache packet for address reuse changes. */
 void _dns_server_address_cache_prepare(struct dns_request *request);
+unsigned int _dns_server_address_cache_view(struct dns_request *request, const char *route);
+void _dns_server_address_cache_views_reset(void);
 void _dns_server_address_cache_upstream(struct dns_request *request, const unsigned char *wire, int len);
 int _dns_server_address_cache_proven(struct dns_request *request, const unsigned char *wire, int len);
 

@@ -74,11 +74,33 @@ static int write_name(unsigned char *out, int cap, const char *name)
 static int question(const unsigned char *data, int len, const char *domain, int qtype, int *off)
 {
 	char name[DNS_MAX_CNAME_LEN];
-	if (len < 12 || len > DNS_IN_PACKSIZE || get16(data + 4) != 1 || (data[2] & 0xf8) != 0x80) return -1;
+	if (len < 12 || len > DNS_IN_PACKSIZE || get16(data + 4) != 1 ||
+		(data[2] & 0xf8) != 0x80 || (data[3] & 0x40)) return -1;
 	*off = 12;
 	if (read_name(data, len, off, name) != 0 || *off + 4 > len) return -1;
 	if (strcasecmp(name, domain) || get16(data + *off) != (unsigned)qtype || get16(data + *off + 2) != DNS_C_IN) return -1;
 	*off += 4;
+	return 0;
+}
+
+/* RFC 7830 padding, RFC 7873 cookies and RFC 7828 keepalive describe this
+ * transaction/transport, not the selected DNS view. Never copy them into the
+ * synthesized answer. Keep ECS, DNSSEC and unknown extension semantics closed. */
+int dns_any_hop_options(const unsigned char *data, int len, int response)
+{
+	if (len < 0 || len > DNS_IN_PACKSIZE || (!data && len)) return -1;
+	for (int off = 0; off < len;) {
+		if (len - off < 4) return -1;
+		unsigned int code = get16(data + off), size = get16(data + off + 2);
+		off += 4;
+		if (size > (unsigned int)(len - off)) return -1;
+		if (code == DNS_OPT_T_COOKIE) {
+			if ((size != 8 || response) && (size < 16 || size > 40)) return -1;
+		} else if (code == DNS_OPT_T_TCP_KEEPALIVE) {
+			if (size != 2 && (size != 0 || response)) return -1;
+		} else if (code != DNS_OPT_T_PADDING) return -1;
+		off += size;
+	}
 	return 0;
 }
 
@@ -322,7 +344,7 @@ int dns_any_merge(const char *domain, const struct dns_any_input *input, int cou
 	if (!merged || !child || count < 1 || count > 8 || capacity > DNS_IN_PACKSIZE) goto out;
 	for (int i = 0; i < count; i++) {
 		const struct dns_any_input *in = &input[i];
-		int off, has_soa = 0, positive = 0, depth = 0, invalid = 0;
+		int off, has_soa = 0, positive = 0, depth = 0, invalid = 0, opt_seen = 0;
 		struct any_rr child_soa = {0};
 		char chain[DNS_ANY_MAX_ALIAS + 1][DNS_MAX_CNAME_LEN] = {{0}};
 		child->count = 0;
@@ -339,11 +361,13 @@ int dns_any_merge(const char *domain, const struct dns_any_input *input, int cou
 		if (invalid) { failures++; continue; }
 		for (int j = 0; j < authority + extra; j++) {
 			int start = off;
-			if (read_name(in->data, in->len, &off, NULL) || off + 10 > in->len) { invalid = 1; break; }
+			char owner[DNS_MAX_CNAME_LEN];
+			if (read_name(in->data, in->len, &off, owner) || off + 10 > in->len) { invalid = 1; break; }
 			int type = get16(in->data + off), size = get16(in->data + off + 8);
 			if (off + 10 + size > in->len) { invalid = 1; break; }
-			/* Do not synthesize across an unexpected ECS/DNSSEC/EDNS view. */
-			if (type == DNS_T_OPT && (size != 0 || get32(in->data + off + 4) != 0)) { invalid = 1; break; }
+			if (type == DNS_T_OPT && (j < authority || opt_seen++ || owner[0] ||
+				get32(in->data + off + 4) != 0 ||
+				dns_any_hop_options(in->data + off + 10, size, 1))) { invalid = 1; break; }
 			if (j < authority && type == DNS_T_SOA) {
 				off = start;
 				if (has_soa || parse_rr(in->data, in->len, &off, in->age, &child_soa)) { invalid = 1; break; }

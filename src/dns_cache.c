@@ -622,6 +622,20 @@ struct dns_cache_data *dns_cache_get_data_with_origin(struct dns_cache *dns_cach
 	return data;
 }
 
+struct dns_cache_data *dns_cache_get_data_with_view(struct dns_cache *dns_cache, unsigned int view,
+												 struct dns_cache_info *info)
+{
+	struct dns_cache_data *data = NULL;
+	pthread_mutex_lock(&dns_cache_head.lock);
+	if (view && dns_cache->origin_flags == view && dns_cache->cache_data) {
+		data = dns_cache->cache_data;
+		dns_cache_data_get(data);
+		*info = dns_cache->info;
+	}
+	pthread_mutex_unlock(&dns_cache_head.lock);
+	return data;
+}
+
 void dns_cache_data_get(struct dns_cache_data *cache_data)
 {
 	if (atomic_inc_return(&cache_data->head.ref) == 1) {

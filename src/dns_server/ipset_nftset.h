@@ -30,6 +30,7 @@ void _dns_server_add_ipset_nftset(struct dns_request *request, struct dns_ipset_
 								  int ipset_timeout_value, int nftset_timeout_value);
 
 void *_dns_server_get_bind_ipset_nftset_rule(struct dns_request *request, enum domain_rule type);
+const struct nftset_ipset_rules *_dns_server_get_bind_ipset_context(const struct dns_request *request);
 #ifdef __cplusplus
 }
 #endif /*__cplusplus */
