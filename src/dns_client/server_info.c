@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 
 #include "server_info.h"
+#include "upstream_policy.h"
 #include "client_socket.h"
 #include "client_tls.h"
 #include "conn_stream.h"
@@ -153,6 +154,7 @@ static void _dns_client_server_free(struct dns_server_info *server_info)
 
 	list_del_init(&server_info->check_list);
 	_dns_client_server_close(server_info);
+	_dns_policy_detach(server_info);
 	pthread_mutex_destroy(&server_info->lock);
 	free(server_info);
 }
@@ -441,6 +443,7 @@ int _dns_client_server_add(const char *server_ip, const char *server_host, int p
 	pthread_mutexattr_destroy(&attr);
 
 	memcpy(&server_info->flags, flags, sizeof(server_info->flags));
+	if (_dns_policy_attach(server_info) != 0) goto errout;
 	INIT_LIST_HEAD(&server_info->list);
 	INIT_LIST_HEAD(&server_info->conn_stream_list);
 
@@ -524,6 +527,7 @@ errout:
 			fast_ping_stop(server_info->ping_host);
 		}
 
+		_dns_policy_detach(server_info);
 		pthread_mutex_destroy(&server_info->lock);
 		free(server_info);
 	}

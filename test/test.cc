@@ -17,9 +17,16 @@
  */
 
 #include "gtest/gtest.h"
+#include "server.h"
+#include <cstring>
 
 int main(int argc, char **argv)
 {
+	if (argc > 1 && strcmp(argv[1], "--smartdns-fixture-child") == 0) {
+		int result = smartdns::Server::RunFixtureChild(argc, argv);
+		// Preserve the existing fixture-child exit semantics and leak-scan boundary.
+		_exit(result < 0 ? 1 : result);
+	}
 	if (WEXITSTATUS(system("which dig >/dev/null 2>&1")) != 0) {
 		std::cerr << "dig not found, please install it first." << std::endl;
 		return 1;

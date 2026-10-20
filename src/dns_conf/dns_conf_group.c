@@ -259,6 +259,10 @@ static int _config_rule_group_setup_value(struct dns_conf_group_info *group_info
 	}
 
 	memcpy(&group_rule->check_orders, &dns_conf.default_check_orders, sizeof(group_rule->check_orders));
+	group_rule->any.concurrency = 2;
+	group_rule->any.max_attempts = 16;
+	group_rule->any.timeout_ms = 950;
+	group_rule->any.partial = 1;
 	group_rule->dualstack_ip_selection = 1;
 	group_rule->dns_dualstack_ip_selection_threshold = 10;
 	group_rule->dns_rr_ttl_min = 600;

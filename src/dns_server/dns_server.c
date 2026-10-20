@@ -22,6 +22,7 @@
 
 #include "dns_server.h"
 #include "address.h"
+#include "any.h"
 #include "answer.h"
 #include "audit.h"
 #include "cache.h"
@@ -70,7 +71,7 @@
 static int is_server_init;
 struct dns_server server;
 
-static void _dns_server_wakeup_thread(void)
+void _dns_server_wakeup_thread(void)
 {
 	uint64_t u = 1;
 	int unused __attribute__((unused));
@@ -319,6 +320,11 @@ int _dns_server_do_query(struct dns_request *request, int skip_notify_event)
 
 	/* process ptr */
 	if (_dns_server_process_ptr_query(request) == 0) {
+		goto clean_exit;
+	}
+
+	/* QTYPE255 has its own conservative context key and independent TTL aging. */
+	if (request->qtype == DNS_T_ANY && _dns_server_process_any(request, server_group_name) == 0) {
 		goto clean_exit;
 	}
 
@@ -697,6 +703,7 @@ static void _dns_server_period_run(unsigned int msec)
 	}
 
 	unsigned long now = get_tick_count();
+	_dns_server_any_period();
 
 	pthread_mutex_lock(&server.request_list_lock);
 	list_for_each_entry_safe(request, tmp, &server.request_list, list)
@@ -759,8 +766,9 @@ int dns_server_run(void)
 			pthread_mutex_lock(&server.request_list_lock);
 			if (list_empty(&server.request_list)) {
 				if (msec % 10 != 0) {
-					msec = ((msec / 10) + 1) * 10;
-					expect_time = start_time + msec * sleep;
+					/* Only defer the deadline, not the elapsed-period counter:
+					 * a later wake may restore the active cadence before it. */
+					expect_time = start_time + ((msec / 10) + 1) * 10 * sleep;
 				}
 			}
 			pthread_mutex_unlock(&server.request_list_lock);
@@ -788,6 +796,13 @@ int dns_server_run(void)
 				uint64_t value;
 				int unused __attribute__((unused));
 				unused = read(server.event_fd, &value, sizeof(uint64_t));
+				/* Client callbacks only notify: run bounded ANY continuation work
+				 * here, outside transport locks, on the existing server thread. */
+				_dns_server_any_period();
+				/* A request can arrive after the idle one-second timer was armed.
+				 * Restore the existing active cadence for deadline processing. */
+				unsigned long active_tick = get_tick_count() + sleep;
+				if (expect_time > active_tick) expect_time = active_tick;
 				continue;
 			}
 
@@ -986,6 +1001,7 @@ void dns_server_exit(void)
 	_dns_server_local_addr_cache_destroy();
 	_dns_server_neighbor_cache_remove_all();
 	_dns_server_cache_save(0);
+	_dns_server_any_destroy();
 	_dns_server_request_remove_all();
 	pthread_mutex_destroy(&server.request_list_lock);
 	dns_cache_destroy();

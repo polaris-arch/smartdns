@@ -70,6 +70,12 @@ int http_head_set_method(struct http_head *http_head, HTTP_METHOD method);
 
 int http_head_set_data(struct http_head *http_head, const void *data, int len);
 
+/* Typed HTTP/3 parse failures. -1 remains incomplete, -2 message-local,
+ * -3 bounded resource failure. Connection-scoped errors must not be downgraded. */
+#define HTTP3_PARSE_FRAME_UNEXPECTED (-4)
+#define HTTP3_PARSE_QPACK_ERROR (-5)
+#define HTTP3_PARSE_PUSH_FORBIDDEN (-6)
+
 HTTP_HEAD_TYPE http_head_get_head_type(struct http_head *http_head);
 
 HTTP_METHOD http_head_get_method(struct http_head *http_head);

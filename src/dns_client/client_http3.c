@@ -19,6 +19,9 @@
 #define _GNU_SOURCE
 
 #include "client_http3.h"
+#include "upstream_policy.h"
+#include "client_http3_control.h"
+#include "client_socket.h"
 #include "client_quic.h"
 #include "conn_stream.h"
 
@@ -92,13 +95,22 @@ int _dns_client_process_recv_http3(struct dns_server_info *server_info, struct d
 	int pkg_len = 0;
 	int has_content_length = 0;
 
+parse_next_section:
 	http_head = http_head_init(4096, HTTP_VERSION_3_0);
 	if (http_head == NULL) {
 		goto errout;
 	}
 
 	ret = http_head_parse(http_head, conn_stream->recv_buff.data, conn_stream->recv_buff.len);
-	if (ret < 0) {
+    if (ret < 0) {
+        uint64_t fatal = ret == HTTP3_PARSE_FRAME_UNEXPECTED ? 0x105 :
+                         ret == HTTP3_PARSE_PUSH_FORBIDDEN ? 0x108 :
+                         ret == HTTP3_PARSE_QPACK_ERROR ? 0x200 : 0;
+        if (fatal) {
+            _dns_http3_connection_error(server_info, fatal);
+            _dns_client_close_socket(server_info); /* existing poll guard defers teardown */
+            goto errout;
+        }
 		if (ret == -1) {
 			errno = EAGAIN;
 			ret = 1;
@@ -114,16 +126,30 @@ int _dns_client_process_recv_http3(struct dns_server_info *server_info, struct d
 		goto errout;
 	}
 
+    int code = http_head_get_httpcode(http_head);
+    if (code >= 100 && code < 200) {
+        if (ret <= 0 || ret > conn_stream->recv_buff.len) goto errout;
+        conn_stream->recv_buff.len -= ret;
+        memmove(conn_stream->recv_buff.data, conn_stream->recv_buff.data + ret, conn_stream->recv_buff.len);
+        http_head_destroy(http_head); http_head = NULL;
+        if (conn_stream->recv_buff.len) goto parse_next_section;
+        if (!conn_stream->recv_done) { errno = EAGAIN; return 1; }
+        return -1;
+    }
 	if (http_head_get_httpcode(http_head) == 0) {
-		/* invalid http3 response */
-		server_info->prohibit = 1;
+		/* Malformed response is stream-local H3_MESSAGE_ERROR. */
 		goto errout;
 	}
 
 	if (http_head_get_httpcode(http_head) != 200) {
-		tlog(TLOG_WARN, "http3 server query from %s:%d failed, server return http code : %d, %s", server_info->ip,
+		tlog(TLOG_DEBUG, "http3 server query from %s:%d failed, server return http code : %d, %s", server_info->ip,
 			 server_info->port, http_head_get_httpcode(http_head), http_head_get_httpcode_msg(http_head));
-		server_info->prohibit = 1;
+		int status = http_head_get_httpcode(http_head);
+		if (status == 429 || status == 503) {
+			_dns_policy_http_error(server_info, status, http_head_get_fields_value(http_head, "retry-after"));
+		} else {
+			server_info->prohibit = 1;
+		}
 		goto errout;
 	}
 
@@ -139,6 +165,8 @@ int _dns_client_process_recv_http3(struct dns_server_info *server_info, struct d
 		goto errout;
 	}
 
+    if (!conn_stream->recv_done) { errno = EAGAIN; ret = 1; goto out; }
+    if (_dns_http_age(pkg_data, pkg_len, http_head_get_fields_value(http_head, "age")) < 0) goto errout;
 	if (_dns_client_recv(server_info, pkg_data, pkg_len, &server_info->addr, server_info->ai_addrlen) != 0) {
 		if (has_content_length == 0 && conn_stream->recv_done == 0) {
 			errno = EAGAIN;
@@ -153,7 +181,11 @@ out:
 	http_head_destroy(http_head);
 	return ret;
 errout:
-
+    if (!_dns_http3_error(server_info) && conn_stream->quic_stream) {
+        SSL_STREAM_RESET_ARGS reset = {0};
+        reset.quic_error_code = 0x10e; /* H3_MESSAGE_ERROR is stream-local */
+        SSL_stream_reset(conn_stream->quic_stream, &reset, sizeof(reset));
+    }
 	if (http_head) {
 		http_head_destroy(http_head);
 	}

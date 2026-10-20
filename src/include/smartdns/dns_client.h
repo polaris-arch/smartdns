@@ -73,6 +73,20 @@ typedef enum dns_server_security_status {
 #define DNS_QUEY_OPTION_ECS_DNS (1 << 0)
 #define DNS_QUEY_OPTION_ECS_IP (1 << 1)
 #define DNS_QUEY_OPTION_EDNS0_DO (1 << 2)
+#define DNS_QUEY_OPTION_BUDGET (1 << 3)
+#define DNS_QUEY_OPTION_SINGLE_UPSTREAM (1 << 4)
+#define DNS_QUEY_OPTION_CD (1 << 5)
+
+struct dns_query_budget;
+struct dns_query_budget *dns_query_budget_new(unsigned int max_attempts, unsigned int timeout_ms);
+/* Snapshot ordinary selected/fallback fanout and the ordinary absolute lifetime. */
+struct dns_query_budget *dns_client_query_budget_new(const char *group_name);
+void dns_query_budget_get(struct dns_query_budget *budget);
+void dns_query_budget_put(struct dns_query_budget *budget);
+void dns_query_budget_cancel(struct dns_query_budget *budget);
+int dns_query_budget_exhausted(struct dns_query_budget *budget);
+unsigned int dns_query_budget_remaining_ms(struct dns_query_budget *budget);
+int dns_client_group_has_ecs(const char *group_name);
 
 int dns_client_init(void);
 
@@ -121,6 +135,8 @@ struct dns_query_options {
 	struct dns_opt_ecs ecs_dns;
 	struct dns_query_ecs_ip ecs_ip;
 	const char *conf_group_name;
+	/* Read only when DNS_QUEY_OPTION_BUDGET is set. */
+	struct dns_query_budget *budget;
 };
 
 /* query domain */
@@ -170,6 +186,10 @@ struct client_dns_server_flags {
 	unsigned int result_flag;
 	long long set_mark;
 	int tcp_keepalive;
+	unsigned int max_query_rate;
+	unsigned int query_burst;
+	unsigned int max_concurrent_queries;
+	char quota_group[DNS_MAX_CNAME_LEN];
 	int drop_packet_latency_ms;
 	int fallback;
 

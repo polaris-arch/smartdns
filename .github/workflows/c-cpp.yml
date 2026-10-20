@@ -1,26 +1,91 @@
 name: C/C++ CI
 
 on:
+  workflow_dispatch:
+    inputs:
+      release_validation:
+        description: 'Run full ASan/UBSan suites and bounded offline baseline comparison'
+        required: false
+        default: false
+        type: boolean
   push:
-    branches: [ master ]
+    branches: [ master, polaris-main, dots/upstream-backpressure-any-20261019 ]
   pull_request:
-    branches: [ master ]
+    branches: [ master, polaris-main ]
+
+permissions:
+  contents: read
 
 jobs:
   build:
-
+    name: ${{ inputs.release_validation && 'release validation' || 'native' }} (${{ matrix.profile }})
     runs-on: ubuntu-latest
-
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: system
+            image: ubuntu:24.04
+          - profile: quic
+            image: debian:trixie
     steps:
-    - uses: actions/checkout@v2
-    - name: prepare
+    - uses: actions/checkout@v4
+    - name: Check result-gate and measurement source fixtures
       run: |
-        sudo apt update
-        sudo apt install libgtest-dev dnsperf
-    - name: make
+        python3 .github/scripts/check-native-results.py --self-test
+        python3 .github/scripts/benchmark-native-offline.py --self-test
+    - name: Prepare distribution dependencies (network enabled)
+      env:
+        BASE_IMAGE: ${{ matrix.image }}
       run: |
-        make all -j4
-        make clean
-    - name: test
+        mkdir -p ci-results
+        git rev-parse HEAD | tee ci-results/source-sha.txt
+        docker build --build-arg BASE_IMAGE="$BASE_IMAGE" -t smartdns-native-ci - <<'DOCKERFILE'
+        ARG BASE_IMAGE
+        FROM ${BASE_IMAGE}
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+            build-essential git libssl-dev libgtest-dev dnsperf dnsutils curl openssl \
+            pkg-config ca-certificates python3 zlib1g-dev && rm -rf /var/lib/apt/lists/*
+        WORKDIR /source
+        DOCKERFILE
+        docker image inspect smartdns-native-ci > ci-results/image.json
+    - name: Prepare pinned benchmark source archives
+      if: inputs.release_validation && matrix.profile == 'quic'
       run: |
-        make -C test test -j8
+        # Source retrieval only; all compilation and workloads remain offline.
+        baseline=dfc9ef4bd947891178924c06070fbccc3ea370ba
+        git fetch --no-tags --depth=1 origin "$baseline"
+        test "$(git rev-parse "$baseline^{commit}")" = "$baseline"
+        git archive "$baseline" > .ci-baseline.tar
+        git archive HEAD > .ci-candidate.tar
+        printf '%s\n' "$baseline" > ci-results/benchmark-baseline-sha.txt
+    - name: Build and run complete existing suite (network disabled)
+      env:
+        PROFILE: ${{ matrix.profile }}
+        SANITIZERS: ${{ inputs.release_validation && '1' || '0' }}
+      run: |
+        set -o pipefail
+        docker run --rm --network none \
+          -v "$GITHUB_WORKSPACE:/source" -w /source \
+          -e CI_NATIVE_PROFILE="$PROFILE" -e CI_NATIVE_SANITIZERS="$SANITIZERS" smartdns-native-ci \
+          bash .github/scripts/run-native-offline.sh 2>&1 | tee ci-results/native.log
+    - name: Verify required cases actually executed
+      if: always()
+      env:
+        PROFILE: ${{ matrix.profile }}
+      run: python3 .github/scripts/check-native-results.py --profile "$PROFILE" ci-results/results.xml
+    - name: Compare pinned upstream and candidate (network disabled)
+      if: ${{ !cancelled() && inputs.release_validation && matrix.profile == 'quic' }}
+      run: |
+        set -o pipefail
+        # No benchmark privileges needed; runner ownership keeps private-mode logs uploadable.
+        docker run --rm --network none --user "$(id -u):$(id -g)" \
+          -v "$GITHUB_WORKSPACE:/source" -w /source smartdns-native-ci \
+          bash .github/scripts/run-comparative-offline.sh 2>&1 | tee ci-results/comparison-build.log
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: ${{ inputs.release_validation && 'release' || 'native' }}-${{ matrix.profile }}-${{ github.sha }}
+        path: ci-results/
+        if-no-files-found: error

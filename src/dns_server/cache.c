@@ -328,6 +328,8 @@ out:
 
 int _dns_server_process_cache(struct dns_request *request)
 {
+	/* Legacy packet keys lack the full ANY validation/ECS/policy context. */
+	if (request->qtype == DNS_T_ANY) return -1;
 	struct dns_cache *dns_cache = NULL;
 	struct dns_cache *dualstack_dns_cache = NULL;
 	int ret = -1;

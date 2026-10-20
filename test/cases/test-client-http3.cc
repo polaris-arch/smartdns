@@ -22,6 +22,7 @@
 #include <cstring>
 #include <openssl/ssl.h>
 #include <vector>
+#include <utility>
 
 #include "dns_client/conn_stream.h"
 #include "dns_client/client_http3.h"
@@ -342,6 +343,8 @@ TEST_F(ClientHTTP3, incomplete_response_keeps_stream_pending)
 
 	struct dns_conn_stream conn_stream;
 	memset(&conn_stream, 0, sizeof(conn_stream));
+    unsigned char receive_storage[DNS_TCP_BUFFER] = {};
+    conn_stream.recv_buff.data = receive_storage;
 	memcpy(conn_stream.recv_buff.data, response, partial_len);
 	conn_stream.recv_buff.len = partial_len;
 
@@ -388,6 +391,8 @@ TEST_F(ClientHTTP3, split_data_frame_with_content_length_keeps_stream_pending)
 
 	struct dns_conn_stream conn_stream;
 	memset(&conn_stream, 0, sizeof(conn_stream));
+    unsigned char receive_storage[DNS_TCP_BUFFER] = {};
+    conn_stream.recv_buff.data = receive_storage;
 	memcpy(conn_stream.recv_buff.data, first_fragment.data(), first_fragment.size());
 	conn_stream.recv_buff.len = first_fragment.size();
 
@@ -434,6 +439,8 @@ TEST_F(ClientHTTP3, header_only_with_content_length_keeps_stream_pending)
 
 	struct dns_conn_stream conn_stream;
 	memset(&conn_stream, 0, sizeof(conn_stream));
+    unsigned char receive_storage[DNS_TCP_BUFFER] = {};
+    conn_stream.recv_buff.data = receive_storage;
 	memcpy(conn_stream.recv_buff.data, header_fragment.data(), header_fragment.size());
 	conn_stream.recv_buff.len = header_fragment.size();
 
@@ -464,6 +471,8 @@ TEST_F(ClientHTTP3, header_only_without_content_length_keeps_stream_pending)
 
 	struct dns_conn_stream conn_stream;
 	memset(&conn_stream, 0, sizeof(conn_stream));
+    unsigned char receive_storage[DNS_TCP_BUFFER] = {};
+    conn_stream.recv_buff.data = receive_storage;
 	memcpy(conn_stream.recv_buff.data, header_fragment.data(), header_fragment.size());
 	conn_stream.recv_buff.len = header_fragment.size();
 	conn_stream.recv_done = 0;
@@ -497,9 +506,11 @@ TEST_F(ClientHTTP3, response_without_content_length_accepts_complete_dns_message
 
 	struct dns_conn_stream conn_stream;
 	memset(&conn_stream, 0, sizeof(conn_stream));
+    unsigned char receive_storage[DNS_TCP_BUFFER] = {};
+    conn_stream.recv_buff.data = receive_storage;
 	memcpy(conn_stream.recv_buff.data, response.data(), response.size());
 	conn_stream.recv_buff.len = response.size();
-	conn_stream.recv_done = 0;
+	conn_stream.recv_done = 1;
 
 	errno = 0;
 	EXPECT_EQ(_dns_client_process_recv_http3(&server_info, &conn_stream), 0);
@@ -529,6 +540,8 @@ TEST_F(ClientHTTP3, response_without_content_length_incomplete_dns_body_waits_fo
 
 	struct dns_conn_stream conn_stream;
 	memset(&conn_stream, 0, sizeof(conn_stream));
+    unsigned char receive_storage[DNS_TCP_BUFFER] = {};
+    conn_stream.recv_buff.data = receive_storage;
 	memcpy(conn_stream.recv_buff.data, response.data(), response.size());
 	conn_stream.recv_buff.len = response.size();
 	conn_stream.recv_done = 0;
@@ -564,7 +577,9 @@ TEST_F(ClientHTTP3, fragmented_response_without_content_length_accepts_delayed_f
 
 	struct dns_conn_stream conn_stream;
 	memset(&conn_stream, 0, sizeof(conn_stream));
-	ASSERT_LE(response.size(), sizeof(conn_stream.recv_buff.data));
+    unsigned char receive_storage[DNS_TCP_BUFFER] = {};
+    conn_stream.recv_buff.data = receive_storage;
+	ASSERT_LE(response.size(), DNS_TCP_BUFFER);
 
 	std::vector<unsigned char> first_fragment = http3_server.ReadFirstResponseFragment();
 	ASSERT_FALSE(first_fragment.empty());
@@ -581,7 +596,7 @@ TEST_F(ClientHTTP3, fragmented_response_without_content_length_accepts_delayed_f
 	ASSERT_FALSE(final_fragment.empty());
 	memcpy(conn_stream.recv_buff.data + conn_stream.recv_buff.len, final_fragment.data(), final_fragment.size());
 	conn_stream.recv_buff.len = response.size();
-	conn_stream.recv_done = 0;
+	conn_stream.recv_done = 1;
 
 	errno = 0;
 	EXPECT_EQ(_dns_client_process_recv_http3(&server_info, &conn_stream), 0);
@@ -615,3 +630,54 @@ TEST_F(ClientHTTP3, quic_poll_reference_keeps_stream_alive_until_poll_done)
 
 	_dns_client_conn_stream_put(stream);
 }
+
+#if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
+extern "C" {
+#include "dns_client/client_http3_control.h"
+}
+TEST_F(ClientHTTP3, RequestProtocolErrorsSelectConnectionApplicationCode)
+{
+    const std::vector<std::pair<std::vector<unsigned char>, uint64_t>> cases = {
+        {{4,0}, 0x105}, // SETTINGS belongs only on the control stream
+        {{5,0}, 0x108}, // no MAX_PUSH_ID was sent, so no push is permitted
+        {{1,2,1,0}, 0x200}, // dynamic QPACK required insert count at capacity zero
+    };
+    for (const auto &entry : cases) {
+        dns_server_info server{};
+        pthread_mutex_init(&server.lock, nullptr);
+        server.type = DNS_SERVER_HTTP3;
+        server.process_depth = 1; // production poll teardown guard
+        dns_conn_stream stream{};
+        unsigned char receive_storage[DNS_TCP_BUFFER] = {};
+        stream.recv_buff.data = receive_storage;
+        memcpy(stream.recv_buff.data, entry.first.data(), entry.first.size());
+        stream.recv_buff.len = entry.first.size();
+        EXPECT_EQ(_dns_client_process_recv_http3(&server, &stream), -1);
+        EXPECT_EQ(_dns_http3_error(&server), entry.second);
+        EXPECT_EQ(server.close_deferred, 1);
+        _dns_http3_control_free(&server);
+        pthread_mutex_destroy(&server.lock);
+    }
+}
+TEST_F(ClientHTTP3, FragmentedInformationalThenFinalHeadersRemainPendingUntilFin)
+{
+    // QPACK static :status 103 (index 24), followed by :status 200 (index 25).
+    dns_server_info server{};
+    server.type = DNS_SERVER_HTTP3;
+    dns_conn_stream stream{};
+    unsigned char receive_storage[DNS_TCP_BUFFER] = {};
+    stream.recv_buff.data = receive_storage;
+    const unsigned char interim[] = {1,3,0,0,0xd8};
+    memcpy(stream.recv_buff.data, interim, sizeof(interim)-1);
+    stream.recv_buff.len = sizeof(interim)-1;
+    EXPECT_EQ(_dns_client_process_recv_http3(&server, &stream), 1);
+    stream.recv_buff.data[stream.recv_buff.len++] = interim[sizeof(interim)-1];
+    EXPECT_EQ(_dns_client_process_recv_http3(&server, &stream), 1);
+    EXPECT_EQ(stream.recv_buff.len, 0);
+    const unsigned char final[] = {1,3,0,0,0xd9};
+    memcpy(stream.recv_buff.data, final, sizeof(final));
+    stream.recv_buff.len = sizeof(final);
+    EXPECT_EQ(_dns_client_process_recv_http3(&server, &stream), 1);
+    EXPECT_EQ(server.prohibit, 0);
+}
+#endif

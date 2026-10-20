@@ -24,6 +24,7 @@
 #include "smartdns/util.h"
 
 #include <getopt.h>
+#include <errno.h>
 
 static int _config_server(int argc, char *argv[], dns_server_type_t type, int default_port)
 {
@@ -73,6 +74,10 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		{"subnet-all-query-types", no_argument, NULL, 264}, /* send subnent for all query types.*/
 		{"fallback", no_argument, NULL, 265}, /* fallback */
 		{"alpn", required_argument, NULL, 266}, /* alpn */
+		{"max-query-rate", required_argument, NULL, 267},
+		{"query-burst", required_argument, NULL, 268},
+		{"max-concurrent-queries", required_argument, NULL, 269},
+		{"quota-group", required_argument, NULL, 270},
 		{NULL, no_argument, NULL, 0}
 	};
 	/* clang-format on */
@@ -274,6 +279,23 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 			server->fallback = 1;
 			break;
 		}
+		case 267:
+		case 268:
+		case 269: {
+            for (const char *digit = optarg; *digit; digit++) if (*digit < '0' || *digit > '9') return -1;
+			char *end = NULL;
+            errno = 0;
+			unsigned long value = strtoul(optarg, &end, 10);
+			if (errno || !*optarg || *optarg == '-' || *end || value > (opt == 267 ? 1000000UL : 65535UL) || (opt == 268 && value == 0)) return -1;
+			if (opt == 267) server->max_query_rate = value;
+			else if (opt == 268) server->query_burst = value;
+			else server->max_concurrent_queries = value;
+			break;
+		}
+		case 270:
+			if (!*optarg || strlen(optarg) >= sizeof(server->quota_group)) return -1;
+			safe_strncpy(server->quota_group, optarg, sizeof(server->quota_group));
+			break;
 		case 266: {
 			safe_strncpy(server->alpn, optarg, DNS_MAX_ALPN_LEN);
 			break;
@@ -287,6 +309,19 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		}
 
 		optind_last = optind;
+	}
+
+	if (server->query_burst && !server->max_query_rate) return -1;
+	if (server->max_query_rate && !server->query_burst) server->query_burst = 1;
+	if (server->quota_group[0]) {
+		for (int n = 0; n < index; n++) {
+			struct dns_servers *other = &dns_conf.servers[n];
+			if (strcmp(other->quota_group, server->quota_group) == 0 &&
+				(other->max_query_rate != server->max_query_rate || other->query_burst != server->query_burst)) {
+				tlog(TLOG_ERROR, "conflicting rate/burst for quota group %s", server->quota_group);
+				return -1;
+			}
+		}
 	}
 
 	if (check_is_ipaddr(server->server) != 0) {

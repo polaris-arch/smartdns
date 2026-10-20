@@ -509,6 +509,7 @@ struct dns_request *_dns_server_new_request(void)
 	request->rcode = DNS_RC_SERVFAIL;
 	request->conn = NULL;
 	request->qclass = DNS_C_IN;
+	request->any_udp_size = DNS_DEFAULT_PACKET_SIZE;
 	request->result_callback = NULL;
 	request->conf = dns_server_get_default_rule_group();
 	request->check_order_list = &dns_conf.default_check_orders;
@@ -1078,6 +1079,9 @@ int _dns_server_process_special_query(struct dns_request *request)
 	switch (request->qtype) {
 	case DNS_T_PTR:
 		break;
+	case DNS_T_ANY:
+		request->passthrough = 1;
+		break;
 	case DNS_T_SOA:
 		ret = _dns_server_process_local_SOA(request);
 		if (ret == 0) {
@@ -1222,16 +1226,17 @@ errout:
 
 int _dns_server_setup_query_option(struct dns_request *request, struct dns_query_options *options)
 {
-	options->enable_flag = 0;
+	memset(options, 0, sizeof(*options));
 
 	if (request->has_ecs) {
 		memcpy(&options->ecs_dns, &request->ecs, sizeof(options->ecs_dns));
 		options->enable_flag |= DNS_QUEY_OPTION_ECS_DNS;
 	}
 
-	if (request->edns0_do) {
+	if (request->edns0_do || (request->qtype == DNS_T_ANY && request->any_do)) {
 		options->enable_flag |= DNS_QUEY_OPTION_EDNS0_DO;
 	}
+	if (request->qtype == DNS_T_ANY && request->any_cd) options->enable_flag |= DNS_QUEY_OPTION_CD;
 	options->conf_group_name = request->dns_group_name;
 	return 0;
 }
@@ -1371,6 +1376,17 @@ int _dns_server_parser_request(struct dns_request *request, struct dns_packet *p
 	}
 
 	request->qclass = qclass;
+	if (request->qtype == DNS_T_ANY) {
+		unsigned int opts = dns_get_OPT_option(packet);
+		request->any_do = !!(opts & DNS_OPT_FLAG_DO);
+		request->any_cd = packet->head.cd;
+		request->any_ad = packet->head.ad;
+		request->any_rd = packet->head.rd;
+		request->any_unknown_context = !!(opts & ~DNS_OPT_FLAG_DO);
+		int payload = dns_get_OPT_payload_size(packet);
+		request->any_udp_size = payload < DNS_DEFAULT_PACKET_SIZE ? DNS_DEFAULT_PACKET_SIZE :
+			(payload > DNS_IN_PACKSIZE ? DNS_IN_PACKSIZE : payload);
+	}
 	if (_dns_server_check_request_supported(request, packet) != 0) {
 		goto errout;
 	}
@@ -1387,6 +1403,7 @@ int _dns_server_parser_request(struct dns_request *request, struct dns_packet *p
 	}
 
 	for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(packet, rrs)) {
+		if (request->qtype == DNS_T_ANY) request->any_unknown_context = 1;
 		switch (rrs->type) {
 		case DNS_OPT_T_TCP_KEEPALIVE: {
 			unsigned short idle_timeout = 0;

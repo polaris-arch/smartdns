@@ -19,9 +19,11 @@
 #define _GNU_SOURCE
 
 #include "smartdns/util.h"
+#include <limits.h>
 
 #include "client_http2.h"
 #include "client_http3.h"
+#include "client_http3_control.h"
 #include "client_https.h"
 #include "client_mdns.h"
 #include "client_quic.h"
@@ -37,6 +39,7 @@
 #include "pending_server.h"
 #include "proxy.h"
 #include "query.h"
+#include "upstream_policy.h"
 #include "server_info.h"
 #include "wake_event.h"
 
@@ -141,6 +144,11 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 		return 0;
 	}
 
+    if (!dns_query_budget_remaining_ms(query->budget)) {
+        _dns_client_query_remove(query);
+        _dns_client_query_release(query);
+        return 0;
+    }
 	if (has_opt == 0 && server_info->flags.result_flag & DNSSERVER_FLAG_CHECK_EDNS) {
 		_dns_client_query_release(query);
 		return 0;
@@ -152,7 +160,8 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 		return 0;
 	}
 
-	request_num = atomic_dec_return(&query->dns_request_sent);
+	_dns_attempt_retire(query, server_info, 0);
+	request_num = atomic_read(&query->dns_request_sent);
 	if (request_num < 0) {
 		_dns_client_query_release(query);
 		tlog(TLOG_ERROR, "send count is invalid, %d", request_num);
@@ -167,25 +176,19 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 		if (ret == DNS_CLIENT_ACTION_RETRY || ret == DNS_CLIENT_ACTION_DROP) {
 			/* remove this result */
 			_dns_replied_check_remove(query, server_info);
-			atomic_inc(&query->dns_request_sent);
 			if (ret == DNS_CLIENT_ACTION_RETRY) {
-				/*
-				 * retry immdiately
-				 * The socket needs to be re-created to avoid being limited, such as 1.1.1.1
-				 */
-				pthread_mutex_lock(&client.server_list_lock);
-				_dns_client_close_socket(server_info);
-				pthread_mutex_unlock(&client.server_list_lock);
+				/* A rejected DNS answer does not justify reconnecting to evade limits. */
 				_dns_client_retry_dns_query(query);
 			}
 		} else {
+            _dns_attempt_replied(query, server_info);
 			if (ret == DNS_CLIENT_ACTION_OK) {
 				query->has_result = 1;
 			} else {
 				tlog(TLOG_DEBUG, "query %s result is invalid, %d", query->domain, ret);
 			}
 
-			if (request_num == 0) {
+			if (request_num == 0 && ret != DNS_CLIENT_ACTION_MAY_RETRY) {
 				/* if all server replied, or done, stop query, release resource */
 				_dns_client_query_remove(query);
 			}
@@ -199,6 +202,7 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 
 static int _dns_client_process(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now)
 {
+    server_info->http3_control_epoch++;
 	if (server_info->proxy) {
 		int ret = _dns_proxy_handshake(server_info, event, now);
 		if (ret != 0) {
@@ -228,11 +232,11 @@ static int _dns_client_send_http(struct dns_server_info *server_info, struct dns
 {
 	/* If ALPN is negotiated and is NOT h2, use HTTP/1.1 */
 	if (server_info->alpn_selected[0] != '\0' && strncmp(server_info->alpn_selected, "h2", 2) != 0) {
-		return _dns_client_send_http1(server_info, packet_data, packet_data_len);
+		return _dns_client_send_http1(server_info, query, packet_data, packet_data_len);
 	}
 
 	/* Default to HTTP/2 buffering (stream-based).
-	   If ALPN later turns out to be H1, _dns_client_process_https_streams will handle it. */
+	   If ALPN later turns out to be H1, _dns_client_process_stream_writes will handle it. */
 	return _dns_client_send_http2(server_info, query, packet_data, packet_data_len);
 }
 
@@ -270,9 +274,7 @@ static int _dns_client_send_one_packet(struct dns_server_info *server_info, stru
 {
 	int ret = 0;
 	int send_err = 0;
-	int retry = 0;
 
-	atomic_inc(&query->dns_request_sent);
 	stats_inc(&server_info->stats.total);
 	errno = 0;
 	server_info->send_tick = get_tick_count();
@@ -286,12 +288,12 @@ static int _dns_client_send_one_packet(struct dns_server_info *server_info, stru
 			break;
 		case DNS_SERVER_TCP:
 			/* tcp query */
-			ret = _dns_client_send_tcp(server_info, packet_data, packet_data_len);
+			ret = _dns_client_send_framed(server_info, query, packet_data, packet_data_len);
 			send_err = errno;
 			break;
 		case DNS_SERVER_TLS:
 			/* tls query */
-			ret = _dns_client_send_tls(server_info, packet_data, packet_data_len);
+			ret = _dns_client_send_framed(server_info, query, packet_data, packet_data_len);
 			send_err = errno;
 			break;
 		case DNS_SERVER_HTTPS:
@@ -334,13 +336,8 @@ static int _dns_client_send_one_packet(struct dns_server_info *server_info, stru
 				tlog(TLOG_DEBUG, "send query to %s failed, %s, type: %d", server_info->ip, strerror(send_err),
 					 server_info->type);
 				_dns_client_close_socket(server_info);
-				if (retry == 0) {
-					retry = 1;
-					if (_dns_client_create_socket(server_info) == 0) {
-						continue;
-					}
-				}
-				atomic_dec(&query->dns_request_sent);
+                /* Reconnect is scheduled through the same admission path. */
+				_dns_attempt_retire(query, server_info, 0);
 				return -1;
 			}
 			default:
@@ -355,7 +352,7 @@ static int _dns_client_send_one_packet(struct dns_server_info *server_info, stru
 				server_info->prohibit = 1;
 			}
 
-			atomic_dec(&query->dns_request_sent);
+			_dns_attempt_retire(query, server_info, 0);
 			return -1;
 		}
 		break;
@@ -367,95 +364,66 @@ static int _dns_client_send_one_packet(struct dns_server_info *server_info, stru
 
 int _dns_client_send_packet(struct dns_query_struct *query, void *packet, int len)
 {
-	struct dns_server_info *server_info = NULL;
-	struct dns_server_group_member *group_member = NULL;
-	struct dns_server_group_member *tmp = NULL;
-	int ret = 0;
-	int i = 0;
-	int total_server = 0;
-	int send_count = 0;
-	void *packet_data = NULL;
-	int packet_data_len = 0;
-	unsigned char packet_data_buffer[DNS_IN_PACKSIZE];
-	int prohibit_time = 60;
-
-	query->send_tick = get_tick_count();
-
-	/* send query to all dns servers */
-	atomic_inc(&query->dns_request_sent);
-	for (i = 0; i < 2; i++) {
-		total_server = 0;
-		if (i == 1) {
-			prohibit_time = 5;
-		}
-
-		/* fallback group exists, use fallback group */
-		if (atomic_read(&query->retry_count) == 1) {
-			struct dns_server_group *fallback_server_group = _dns_client_get_group("fallback");
-			if (fallback_server_group != NULL) {
-				query->server_group = fallback_server_group;
-			}
-		}
-
-		pthread_mutex_lock(&client.server_list_lock);
-		list_for_each_entry_safe(group_member, tmp, &query->server_group->head, list)
-		{
-			server_info = group_member->server;
-
-			/* skip fallback server for first query */
-			if (server_info->flags.fallback && atomic_read(&query->retry_count) == DNS_QUERY_RETRY && i == 0) {
+	struct dns_server_group_member *member;
+	unsigned char buffer[DNS_IN_PACKSIZE];
+	int sent = 0;
+	unsigned long now = get_tick_count();
+	query->send_tick = now;
+	if (query->terminal || !dns_query_budget_remaining_ms(query->budget)) return 0;
+	/* Preserve configured group fanout. Admission only suppresses the affected endpoint. */
+	pthread_mutex_lock(&client.server_list_lock);
+	struct dns_server_group *group = query->server_group;
+	if (now - query->created_tick >= (DNS_QUERY_RETRY - 1) * DNS_QUERY_TIMEOUT) {
+		struct dns_server_group *fallback = _dns_client_get_group("fallback");
+		if (fallback) group = fallback;
+	}
+	atomic_inc(&query->dns_request_sent); /* protect against reentrant completion */
+	for (int pass = 0; pass < 2 && sent == 0; pass++) {
+		list_for_each_entry(member, &group->head, list) {
+			struct dns_server_info *server_info = member->server;
+			void *data = NULL;
+			int data_len = 0;
+			if (pass == 0 && server_info->flags.fallback && now - query->created_tick < DNS_QUERY_TIMEOUT) continue;
+			if (_dns_client_check_server_prohibit(server_info, pass == 0 ? 60 : 5)) continue;
+			/* Never create sockets or allocate a stream for admission-denied work. */
+			if (_dns_attempt_begin(query, server_info) != DNS_ADMIT_OK) continue;
+			if (server_info->fd <= 0 && _dns_client_create_socket(server_info) != 0) {
+				_dns_attempt_retire(query, server_info, 0);
+				server_info->prohibit = 1;
 				continue;
 			}
-
-			if (_dns_client_check_server_prohibit(server_info, prohibit_time)) {
-				continue;
+			if (_dns_client_setup_server_packet(server_info, query, packet, len, buffer, &data, &data_len) != 0) {
+				_dns_attempt_retire(query, server_info, 0); continue;
 			}
-
-			total_server++;
-			tlog(TLOG_DEBUG, "send query to server %s:%d, type:%d", server_info->ip, server_info->port,
-				 server_info->type);
-			if (server_info->fd <= 0) {
-				ret = _dns_client_create_socket(server_info);
-				if (ret != 0) {
-					server_info->prohibit = 1;
-					continue;
-				}
-			}
-
-			if (_dns_client_setup_server_packet(server_info, query, packet, len, packet_data_buffer, &packet_data,
-												&packet_data_len) != 0) {
-				continue;
-			}
-
-			if (_dns_client_send_one_packet(server_info, query, packet_data, packet_data_len) == 0) {
-				send_count++;
+			if (_dns_client_send_one_packet(server_info, query, data, data_len) == 0) {
+				sent++;
+				if (query->single_upstream) break;
 			}
 		}
-		pthread_mutex_unlock(&client.server_list_lock);
-
-		if (send_count > 0) {
-			break;
-		}
 	}
-
-	int num = atomic_dec_return(&query->dns_request_sent);
-	if (num == 0 && send_count > 0) {
-		_dns_client_query_remove(query);
-	}
-
-	if (send_count <= 0) {
-		static time_t lastlog = 0;
-		time_t now = 0;
-		time(&now);
-		if (now - lastlog > 120) {
-			lastlog = now;
-			tlog(TLOG_WARN, "send query %s to upstream server failed, total server number %d", query->domain,
-				 total_server);
-		}
-		return -1;
-	}
-
+	atomic_dec(&query->dns_request_sent);
+	pthread_mutex_unlock(&client.server_list_lock);
+	/* Deferred admissions remain on the existing query list, not a second queue. */
+	query->next_send_tick = now + 100;
 	return 0;
+}
+
+struct dns_query_budget *dns_client_query_budget_new(const char *group_name)
+{
+    struct dns_server_group *selected = _dns_client_get_dnsserver_group(group_name);
+    if (!selected) return NULL;
+    unsigned int members = 0;
+    pthread_mutex_lock(&client.server_list_lock);
+    struct dns_server_group *groups[2] = {selected, _dns_client_get_group("fallback")};
+    for (int i = 0; i < 2; i++) {
+        if (!groups[i] || (i && groups[i] == selected)) continue;
+        struct dns_server_group_member *member;
+        list_for_each_entry(member, &groups[i]->head, list) {
+            if (members < UINT_MAX / DNS_QUERY_RETRY) members++;
+        }
+    }
+    pthread_mutex_unlock(&client.server_list_lock);
+    return dns_query_budget_new(members ? members * DNS_QUERY_RETRY : 1, DNS_QUERY_RETRY * DNS_QUERY_TIMEOUT);
 }
 
 int dns_client_query(const char *domain, int qtype, dns_client_callback callback, void *user_ptr,
@@ -491,12 +459,25 @@ int dns_client_query(const char *domain, int qtype, dns_client_callback callback
 	query->callback = callback;
 	query->qtype = qtype;
 	query->send_tick = 0;
+	query->created_tick = get_tick_count();
+	query->next_send_tick = query->created_tick;
+	query->single_upstream = !!(options->enable_flag & DNS_QUEY_OPTION_SINGLE_UPSTREAM);
+	query->checking_disabled = !!(options->enable_flag & DNS_QUEY_OPTION_CD);
+	if (options->enable_flag & DNS_QUEY_OPTION_BUDGET) {
+		query->budget = options->budget;
+		dns_query_budget_get(query->budget);
+	}
 	query->has_result = 0;
 	query->server_group = _dns_client_get_dnsserver_group(group_name);
 	if (query->server_group == NULL) {
 		tlog(TLOG_ERROR, "get dns server group %s failed.", group_name);
 		goto errout;
 	}
+
+    if (!query->budget) {
+        query->budget = dns_client_query_budget_new(group_name);
+        if (!query->budget) goto errout;
+    }
 
 	query->conf = dns_server_get_rule_group(options->conf_group_name);
 	if (query->conf == NULL) {
@@ -545,6 +526,7 @@ errout_del_list:
 	query = NULL;
 errout:
 	if (query) {
+		dns_query_budget_put(query->budget);
 		free(query);
 	}
 	return -1;
@@ -569,7 +551,7 @@ static void _dns_client_period_run(unsigned int msec)
 	pthread_mutex_lock(&client.domain_map_lock);
 	list_for_each_entry_safe(query, tmp, &client.dns_request_list, dns_request_list)
 	{
-		if ((now - DNS_QUERY_TIMEOUT >= query->send_tick) && query->send_tick > 0) {
+		if (now >= query->next_send_tick) {
 			list_add(&query->period_list, &check_list);
 			_dns_client_query_get(query);
 		}
@@ -581,13 +563,54 @@ static void _dns_client_period_run(unsigned int msec)
 		/* free timed out query, and notify caller */
 		list_del_init(&query->period_list);
 
-		/* check udp nat after retrying. */
-		if (atomic_read(&query->retry_count) == 1) {
-			_dns_client_check_udp_nat(query);
+		_dns_attempt_expire(query, now);
+		/* Retain the existing four 500ms rounds as a finite nominal lifetime.
+		 * Deferral never grants a fresh lifetime or creates duplicate active work. */
+		if (query->terminal) {
+			/* already completed by a callback */
+		} else if (now - query->created_tick >= DNS_QUERY_RETRY * DNS_QUERY_TIMEOUT ||
+				   !dns_query_budget_remaining_ms(query->budget)) {
+			_dns_client_query_remove(query);
+		} else if (atomic_read(&query->dns_request_sent) == 0) {
+			if (query->has_result || dns_query_budget_exhausted(query->budget)) {
+				_dns_client_query_remove(query);
+			} else {
+				_dns_client_send_query(query);
+			}
 		}
-		_dns_client_retry_dns_query(query);
+		query->next_send_tick = now + 100;
 		_dns_client_query_release(query);
 	}
+
+    /* Capacity or token availability need not cause a socket readiness edge. */
+    pthread_mutex_lock(&client.server_list_lock);
+    struct dns_server_info *server;
+    list_for_each_entry(server, &client.dns_server_list, list) {
+        if (server->status != DNS_SERVER_STATUS_CONNECTED) continue;
+        server->http3_control_epoch++;
+        if (_dns_client_conn_prune(server)) { _dns_client_close_socket(server); continue; }
+        if (server->type == DNS_SERVER_HTTP3 && _dns_http3_is_draining(server) && list_empty(&server->conn_stream_list)) {
+            _dns_client_close_socket(server); continue; /* graceful drain completed */
+        }
+        /* Pruning may remove the last server-list entry while H2 still owns
+         * its canceled flow-controlled body. Pump that owner to abort/discard. */
+        if (server->type != DNS_SERVER_HTTP3 && list_empty(&server->conn_stream_list) &&
+            !server->http2_write_owner) continue;
+        if (server->type == DNS_SERVER_HTTPS) {
+            if (!strncmp(server->alpn_selected, "h2", 2)) {
+                if (_dns_client_http2_process_write(server) < 0) _dns_client_close_socket(server);
+            } else if (!server->send_buff.len && _dns_client_process_stream_writes(server) < 0) _dns_client_close_socket(server);
+        } else if (server->type == DNS_SERVER_TCP || server->type == DNS_SERVER_TLS) {
+            if (_dns_client_process_stream_writes(server) < 0) _dns_client_close_socket(server);
+#if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
+        } else if (server->type == DNS_SERVER_QUIC || server->type == DNS_SERVER_HTTP3) {
+            struct epoll_event event = {.events = EPOLLOUT};
+            event.data.ptr = server;
+            _dns_client_process_quic(server, &event, now);
+#endif
+        }
+    }
+    pthread_mutex_unlock(&client.server_list_lock);
 
 	if (msec % 10 == 0) {
 		_dns_client_period_run_second();
@@ -652,6 +675,13 @@ static void *_dns_client_work(void *arg)
 			struct dns_server_info *server_info = (struct dns_server_info *)event->data.ptr;
 			if (event->data.fd == client.fd_wakeup) {
 				_dns_client_clear_wakeup_event();
+                /* New work must leave the idle 1s cadence. Restore the existing
+                 * 100ms scan grid without resetting any query/attempt deadline. */
+                unsigned long wake_now = get_tick_count();
+                if (expect_time > wake_now + sleep) {
+                    msec = (wake_now - start_time) / sleep;
+                    expect_time = start_time + (msec + 1) * sleep;
+                }
 				continue;
 			}
 

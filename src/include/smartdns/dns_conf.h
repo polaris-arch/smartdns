@@ -421,6 +421,10 @@ struct dns_servers {
 	long long set_mark;
 	unsigned int drop_packet_latency_ms;
 	int tcp_keepalive;
+	unsigned int max_query_rate;
+	unsigned int query_burst;
+	unsigned int max_concurrent_queries;
+	char quota_group[DNS_MAX_CNAME_LEN];
 	int fallback;
 	int subnet_all_query_types;
 	char skip_check_cert;
@@ -492,6 +496,18 @@ struct dns_dns64 {
 	uint32_t prefix_len;
 };
 
+#define DNS_ANY_MAX_TYPES 8
+
+struct dns_any_config {
+	int aggregate;
+	unsigned short types[DNS_ANY_MAX_TYPES];
+	int type_count;
+	int concurrency;
+	int max_attempts;
+	int timeout_ms;
+	int partial;
+};
+
 struct dns_conf_group {
 	struct hlist_node node;
 	struct dns_conf_domain_rule domain_rule;
@@ -501,6 +517,7 @@ struct dns_conf_group {
 	char copy_data_section_begin[0];
 	struct dns_conf_ipset_nftset ipset_nftset;
 	struct dns_domain_check_orders check_orders;
+	struct dns_any_config any;
 	/* ECS */
 	struct dns_edns_client_subnet ipv4_ecs;
 	struct dns_edns_client_subnet ipv6_ecs;

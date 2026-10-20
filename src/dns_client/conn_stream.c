@@ -20,7 +20,7 @@
 
 #include "smartdns/util.h"
 
-struct dns_conn_stream *_dns_client_conn_stream_new(void)
+static struct dns_conn_stream *_dns_client_conn_stream_alloc(int receive)
 {
 	struct dns_conn_stream *stream = NULL;
 
@@ -29,6 +29,10 @@ struct dns_conn_stream *_dns_client_conn_stream_new(void)
 		tlog(TLOG_ERROR, "malloc conn stream failed");
 		return NULL;
 	}
+    if (receive) {
+        stream->recv_buff.data = malloc(DNS_TCP_BUFFER);
+        if (!stream->recv_buff.data) { free(stream); return NULL; }
+    }
 	INIT_LIST_HEAD(&stream->server_list);
 	INIT_LIST_HEAD(&stream->query_list);
 	stream->quic_stream = NULL;
@@ -38,6 +42,15 @@ struct dns_conn_stream *_dns_client_conn_stream_new(void)
 	atomic_set(&stream->refcnt, 1);
 
 	return stream;
+}
+
+struct dns_conn_stream *_dns_client_conn_stream_new(void)
+{
+    return _dns_client_conn_stream_alloc(1);
+}
+struct dns_conn_stream *_dns_client_conn_stream_new_write(void)
+{
+    return _dns_client_conn_stream_alloc(0);
 }
 
 void _dns_client_conn_stream_get(struct dns_conn_stream *stream)
@@ -65,7 +78,7 @@ void _dns_client_conn_stream_put(struct dns_conn_stream *stream)
 	if (stream->http2_stream) {
 		struct http2_stream *http2_stream = stream->http2_stream;
 		stream->http2_stream = NULL;
-		http2_stream_close(http2_stream);
+		http2_stream_abort(http2_stream);
 		stream->server_info = NULL;
 	}
 
@@ -82,6 +95,7 @@ void _dns_client_conn_stream_put(struct dns_conn_stream *stream)
 		pthread_mutex_unlock(&stream->server_info->lock);
 	}
 
+    free(stream->recv_buff.data);
 	free(stream);
 }
 
@@ -109,11 +123,32 @@ void _dns_client_conn_server_streams_free(struct dns_server_info *server_info, s
 		}
 
 		if (stream->http2_stream) {
-			http2_stream_close(stream->http2_stream);
+			http2_stream_abort(stream->http2_stream);
 			stream->http2_stream = NULL;
 		}
 
 		_dns_client_conn_stream_put(stream);
 	}
 	pthread_mutex_unlock(&server_info->lock);
+}
+/* Query destruction leaves transport owners as tombstones. Reclaim canceled
+ * multiplexed work promptly; an H1 sent tombstone requires connection close. */
+int _dns_client_conn_prune(struct dns_server_info *server)
+{
+    int close_h1 = 0;
+    pthread_mutex_lock(&server->lock);
+    struct dns_conn_stream *stream, *tmp;
+    list_for_each_entry_safe(stream, tmp, &server->conn_stream_list, server_list) {
+        if (stream->query) continue;
+        if (stream->http1_sent || (stream->write_attempted &&
+            (server->type == DNS_SERVER_TCP || server->type == DNS_SERVER_TLS ||
+             (server->type == DNS_SERVER_HTTPS && strncmp(server->alpn_selected, "h2", 2))))) {
+            close_h1 = 1; continue;
+        }
+        list_del_init(&stream->server_list);
+        stream->server_info = NULL;
+        _dns_client_conn_stream_put(stream);
+    }
+    pthread_mutex_unlock(&server->lock);
+    return close_h1;
 }

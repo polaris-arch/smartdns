@@ -320,6 +320,9 @@ struct dns_request {
 	int has_ecs;
 	struct dns_opt_ecs ecs;
 	int edns0_do;
+	/* Capture original ANY context independently of legacy AD+DO behavior. */
+	unsigned char any_do, any_cd, any_ad, any_rd, any_unknown_context;
+	unsigned short any_udp_size;
 
 	struct list_head https_svcb_list;
 
@@ -436,6 +439,7 @@ struct dns_server {
 };
 
 extern struct dns_server server;
+void _dns_server_wakeup_thread(void);
 
 int _dns_server_recv(struct dns_server_conn_head *conn, unsigned char *inpacket, int inpacket_len,
 					 struct sockaddr_storage *local, socklen_t local_len, struct sockaddr_storage *from,

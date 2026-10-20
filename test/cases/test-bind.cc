@@ -193,11 +193,13 @@ TEST(Bind, cert_explicit_path_without_auto_generate_skips_generation)
 	unlink(key);
 
 	smartdns::Server server;
-	ASSERT_TRUE(server.Start(R"""(
+	// Missing explicit credentials must fail TLS startup without generating replacements.
+	ASSERT_FALSE(server.Start(R"""(
 bind-cert-file /tmp/smartdns-bind-manual-cert.pem
 bind-cert-key-file /tmp/smartdns-bind-manual-key.pem
 bind-tls [::]:60053
 )"""));
+	EXPECT_FALSE(server.IsRunning());
 	EXPECT_NE(access(cert, F_OK), 0);
 	EXPECT_NE(access(key, F_OK), 0);
 }
@@ -337,19 +339,22 @@ TEST(Bind, malformed_packet)
 	smartdns::MockServer server_upstream;
 	smartdns::Server server;
 
-	server_upstream.Start("udp://0.0.0.0:62053", [](struct smartdns::ServerRequestContext *request) {
+	ASSERT_TRUE(server_upstream.Start("udp://0.0.0.0:62053", [](struct smartdns::ServerRequestContext *request) {
 		if (request->qtype == DNS_T_A) {
-			smartdns::MockServer::AddIP(request, request->domain.c_str(), "1.2.3.4");
+			smartdns::MockServer::AddIP(request, request->domain.c_str(), "1.2.3.4", 60);
 			return smartdns::SERVER_REQUEST_OK;
 		}
 		return smartdns::SERVER_REQUEST_SOA;
-	});
+	}));
 
-	server.Start(R"""(
+	// Keep normal speed selection, but make its probe independent of external routing.
+	server.MockPing(PING_TYPE_ICMP, "1.2.3.4", 64, 1);
+	ASSERT_TRUE(server.Start(R"""(
 bind [::]:60053@lo
 server 127.0.0.1:62053
 log-level info
-)""");
+speed-check-mode ping
+)"""));
 
 	int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 	ASSERT_NE(sockfd, -1);
@@ -381,6 +386,8 @@ log-level info
 	ASSERT_EQ(client.GetAnswerNum(), 1);
 	EXPECT_EQ(client.GetStatus(), "NOERROR");
 	EXPECT_LT(client.GetQueryTime(), 100);
+	// Cache-enabled speed-selection replies use the default serve-expired
+	// reply TTL (3), independently of the upstream/cache TTL and probe success.
 	EXPECT_EQ(client.GetAnswer()[0].GetTTL(), 3);
 	EXPECT_EQ(client.GetAnswer()[0].GetData(), "1.2.3.4");
 }
@@ -419,13 +426,13 @@ TEST(Bind, group)
 		return smartdns::SERVER_REQUEST_OK;
 	});
 
-	server.Start(R"""(bind [::]:60053
+	ASSERT_TRUE(server.Start(R"""(bind [::]:60053
 bind [::]:60153 -group g1
 bind [::]:60253 -group g2
 server 127.0.0.1:61053
 server 127.0.0.1:62053 -group g1 -exclude-default-group
 server 127.0.0.1:63053 -group g2 -exclude-default-group
-)""");
+)"""));
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("a.com", 60053));
 	std::cout << client.GetResult() << std::endl;

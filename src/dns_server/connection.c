@@ -18,6 +18,7 @@
 
 #include "connection.h"
 #include "dns_server.h"
+#include "any.h"
 #include "server_http2.h"
 
 #include "smartdns/http2.h"
@@ -171,6 +172,8 @@ int _dns_server_client_close(struct dns_server_conn_head *conn)
 	pthread_mutex_lock(&server.conn_list_lock);
 	list_del_init(&conn->list);
 	pthread_mutex_unlock(&server.conn_list_lock);
+
+	_dns_server_any_cancel_connection(conn);
 
 	if (conn->type == DNS_CONN_TYPE_TLS_CLIENT || conn->type == DNS_CONN_TYPE_HTTPS_CLIENT) {
 		struct dns_server_conn_tls_client *tls_client = (struct dns_server_conn_tls_client *)conn;

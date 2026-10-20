@@ -21,6 +21,7 @@
 #include "smartdns/util.h"
 
 #include <limits.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -161,7 +162,9 @@ static int _http_head_parse(struct http_head *http_head)
 				}
 
 				has_first_line = 1;
-			} else {
+            } else {
+                if ((!strcasecmp(key, "content-length") || !strcasecmp(key, "transfer-encoding")) &&
+                    http_head_get_fields_value(http_head, key)) return -2;
 				if (http_head_add_fields(http_head, key, value) != 0) {
 					return -2;
 				}
@@ -265,7 +268,11 @@ int http_head_parse_http1_1(struct http_head *http_head, const uint8_t *data, in
 					const char *content_len = NULL;
 					content_len = http_head_get_fields_value(http_head, "Content-Length");
 					if (content_len) {
-						http_head->expect_data_len = atol(content_len);
+						char *end;
+                        errno = 0;
+                        long value = strtol(content_len, &end, 10);
+                        if (errno || end == content_len || *end || value < 0 || value > INT_MAX) return -2;
+                        http_head->expect_data_len = value;
 					} else {
 						http_head->expect_data_len = 0;
 					}
@@ -296,12 +303,16 @@ int http_head_parse_http1_1(struct http_head *http_head, const uint8_t *data, in
 		is_chunked = 1;
 	}
 
+    if (transfer_encoding && (!is_chunked || http_head_get_fields_value(http_head, "Content-Length"))) return -2;
+    int code = http_head_get_httpcode(http_head);
+    int bodyless = code >= 100 && code < 200;
+    bodyless = bodyless || code == 204 || code == 304;
+    if (http_head_get_head_type(http_head) == HTTP_HEAD_RESPONSE && !bodyless &&
+        !transfer_encoding && !http_head_get_fields_value(http_head, "Content-Length")) return -2;
 	if (http_head->head_ok == 1) {
 		if (is_chunked == 0) {
 			int get_data_len = (http_head->expect_data_len > data_len) ? data_len : http_head->expect_data_len;
-			if (get_data_len == 0 && data_len > 0) {
-				get_data_len = data_len;
-			}
+            if (bodyless) get_data_len = 0;
 
 			if (http_head->data == NULL) {
 				http_head->data = buff_end;
@@ -327,7 +338,15 @@ int http_head_parse_http1_1(struct http_head *http_head, const uint8_t *data, in
 				data_len -= offset;
 				process_data_len += offset;
 
-				if (chunk_len == 0) {
+                if (chunk_len == 0) {
+                    /* Consume the trailer terminator before the next FIFO response. */
+                    int trailer_len = 0;
+                    if (data_len >= 2 && data[0] == '\r' && data[1] == '\n') trailer_len = 2;
+                    else for (int t = 0; t + 3 < data_len; t++) {
+                        if (!memcmp(data + t, "\r\n\r\n", 4)) { trailer_len = t + 4; break; }
+                    }
+                    if (!trailer_len) return -1;
+                    process_data_len += trailer_len;
 					http_head->data = body_data;
 					http_head->data_len = body_data_len;
 					break;

@@ -188,6 +188,12 @@ struct http2_stream *http2_stream_new(struct http2_ctx *ctx);
  * @param stream Stream to close
  */
 void http2_stream_close(struct http2_stream *stream);
+/* Discard unsent per-stream DATA/END_STREAM, then reset and consume the caller reference.
+ * Encoded connection bytes cannot be selectively removed; callers must close an
+ * ambiguous partial-frame connection instead of reusing it. */
+void http2_stream_abort(struct http2_stream *stream);
+/* Includes flow-controlled body and END_STREAM, independently of ctx want_write. */
+int http2_stream_has_pending_send(struct http2_stream *stream);
 
 /**
  * Increase reference count of stream
@@ -328,6 +334,10 @@ int http2_stream_is_end(struct http2_stream *stream);
  * @return 1 if peer sent END_STREAM or stream/connection is closed, 0 otherwise
  */
 int http2_stream_is_remote_end(struct http2_stream *stream);
+
+/* Caller holds a stream reference. True only after peer RST_STREAM; normal
+ * END_STREAM is not cancellation. Safe after detachment from the context. */
+int http2_stream_is_reset(struct http2_stream *stream);
 
 /* Stream Metadata APIs */
 

@@ -16,15 +16,20 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "server.h"
-#include "smartdns/dns_server.h"
-#include "smartdns/fast_ping.h"
-#include "include/utils.h"
-#include "smartdns/smartdns.h"
-#include "smartdns/util.h"
+// Parse standard headers before SmartDNS defines its C min/max macros.
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <fstream>
+#include <iostream>
+#include <cstdint>
+#include <cerrno>
+#include <cstring>
+#include <cmath>
+#include <iomanip>
+#include <limits>
+#include <locale>
+#include <sstream>
+#include <spawn.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -35,7 +40,15 @@
 #include <unistd.h>
 #include <vector>
 
+#include "server.h"
+#include "smartdns/dns_server.h"
+#include "smartdns/fast_ping.h"
+#include "include/utils.h"
+#include "smartdns/smartdns.h"
+#include "smartdns/util.h"
+
 extern int dns_ping_cap_force_enable;
+extern char **environ;
 
 namespace smartdns
 {
@@ -267,7 +280,7 @@ bool MockServer::Start(const std::string &url, ServerRequest callback)
 		return false;
 	}
 
-	fd = socket(addr.ss_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	fd = socket(addr.ss_family, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 	if (fd < 0) {
 		return false;
 	}
@@ -280,19 +293,21 @@ bool MockServer::Start(const std::string &url, ServerRequest callback)
 		return false;
 	}
 
-	run_ = true;
-	thread_ = std::thread(&MockServer::Run, this);
+	// Publish immutable worker state before the thread can poll or receive.
+	// A stale readiness observation must never block shutdown in recvfrom.
 	fd_ = fd;
 	callback_ = callback;
+	run_ = true;
+	thread_ = std::thread(&MockServer::Run, this);
 	return true;
 }
 
-Server::Server()
+Server::Server() : pid_(0), fd_(-1)
 {
 	mode_ = Server::CREATE_MODE_FORK;
 }
 
-Server::Server(enum Server::CREATE_MODE mode)
+Server::Server(enum Server::CREATE_MODE mode) : pid_(0), fd_(-1)
 {
 	mode_ = mode;
 }
@@ -327,11 +342,49 @@ void Server::StartPost(void *arg)
 	}
 }
 
+namespace {
+template <typename T> bool ParseFixtureNumber(const char *text, T &value)
+{
+	std::istringstream input(text);
+	input.imbue(std::locale::classic());
+	if (!(input >> value)) return false;
+	input >> std::ws;
+	return input.eof();
+}
+} // namespace
+
+int Server::RunFixtureChild(int argc, char **argv)
+{
+	if (argc < 3 || (argc - 3) % 4 != 0 || argv[2][0] == '\0') return 2;
+	Server fixture;
+	for (int i = 3; i < argc; i += 4) {
+		int type = 0, ttl = 0;
+		float time = 0;
+		if (!ParseFixtureNumber(argv[i], type) || type < PING_TYPE_ICMP || type > PING_TYPE_DNS ||
+			argv[i + 1][0] == '\0' || !ParseFixtureNumber(argv[i + 2], ttl) ||
+			!ParseFixtureNumber(argv[i + 3], time) || !std::isfinite(time)) return 2;
+		fixture.MockPing(static_cast<PING_TYPE>(type), argv[i + 1], ttl, time);
+	}
+	std::vector<std::string> args = {"smartdns", "-f", "-x", "-c", argv[2], "-p", "-"};
+	std::vector<char *> child_argv;
+	for (auto &arg : args) child_argv.push_back(const_cast<char *>(arg.c_str()));
+	child_argv.push_back(nullptr);
+	smartdns_reg_post_func(Server::StartPost, &fixture);
+	dns_ping_cap_force_enable = 1;
+	return smartdns_test_main(args.size(), child_argv.data(), 3, 0);
+}
+
 bool Server::Start(const std::string &conf, enum CONF_TYPE type)
 {
 	pid_t pid = 0;
 	int fds[2];
 	std::string conf_file;
+	auto fail_start = [](const char *stage) {
+		int saved_errno = errno;
+		std::cerr << "Server startup failed before readiness: stage=" << stage
+			<< " errno=" << saved_errno << " (" << strerror(saved_errno) << ")" << std::endl;
+		return false;
+	};
 
 	fds[0] = 0;
 	fds[1] = 0;
@@ -355,43 +408,53 @@ cache-persist no
 
 	if (type == CONF_TYPE_STRING) {
 		conf_temp_file_.SetPattern("/tmp/smartdns_conf.XXXXXX");
-		conf_temp_file_.Write(default_conf);
-		conf_temp_file_.Write(conf);
+		if (!conf_temp_file_.Write(default_conf) || !conf_temp_file_.Write(conf)) {
+			return fail_start("write temporary configuration");
+		}
 		conf_file = conf_temp_file_.GetPath();
 	} else if (type == CONF_TYPE_FILE) {
 		conf_file = conf;
 	} else {
-		return false;
+		errno = EINVAL;
+		return fail_start("configuration type");
 	}
 
 	if (access(conf_file.c_str(), F_OK) != 0) {
-		return false;
+		return fail_start("configuration access");
 	}
 
 	conf_file_ = conf_file;
 
 	if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0) {
-		return false;
+		return fail_start("readiness pipe");
 	}
 
 	if (mode_ == CREATE_MODE_FORK) {
-		pid = fork();
-		if (pid == 0) {
-			std::vector<std::string> args = {
-				"smartdns", "-f", "-x", "-c", conf_file, "-p", "-",
-			};
-			char *argv[args.size() + 1];
-			for (size_t i = 0; i < args.size(); i++) {
-				argv[i] = (char *)args[i].c_str();
-			}
-
-			smartdns_reg_post_func(Server::StartPost, this);
-			dns_ping_cap_force_enable = 1;
-			smartdns_test_main(args.size(), argv, fds[1], 0);
-			_exit(1);
-		} else if (pid < 0) {
-			return false;
+		// Build all arguments in the parent. A multithreaded test process must
+		// not run C++/OpenSSL initialization in a post-fork, pre-exec child.
+		std::vector<std::string> args = {"/proc/self/exe", "--smartdns-fixture-child", conf_file};
+		for (const auto &ping : mock_ping_ips_) {
+			std::ostringstream time;
+			time.imbue(std::locale::classic());
+			time << std::setprecision(std::numeric_limits<float>::max_digits10) << ping.time;
+			args.push_back(std::to_string(static_cast<int>(ping.type)));
+			args.push_back(ping.host);
+			args.push_back(std::to_string(ping.ttl));
+			args.push_back(time.str());
 		}
+		std::vector<char *> child_argv;
+		for (auto &arg : args) child_argv.push_back(const_cast<char *>(arg.c_str()));
+		child_argv.push_back(nullptr);
+		posix_spawn_file_actions_t actions;
+		int error = posix_spawn_file_actions_init(&actions);
+		if (error != 0) { errno = error; return fail_start("spawn file actions init"); }
+		// Close the read end before mapping fd 3: it may itself currently be 3.
+		error = posix_spawn_file_actions_addclose(&actions, fds[0]);
+		if (error == 0) error = posix_spawn_file_actions_adddup2(&actions, fds[1], 3);
+		if (error == 0 && fds[1] != 3) error = posix_spawn_file_actions_addclose(&actions, fds[1]);
+		if (error == 0) error = posix_spawn(&pid, "/proc/self/exe", &actions, nullptr, child_argv.data(), environ);
+		posix_spawn_file_actions_destroy(&actions);
+		if (error != 0) { errno = error; return fail_start("spawn fixture child"); }
 	} else if (mode_ == CREATE_MODE_THREAD) {
 		thread_ = std::thread([&]() {
 			std::vector<std::string> args = {"smartdns", "-f", "-x", "-c", conf_file_, "-p", "-", "-S"};
@@ -399,6 +462,7 @@ cache-persist no
 			for (size_t i = 0; i < args.size(); i++) {
 				argv[i] = (char *)args[i].c_str();
 			}
+			argv[args.size()] = nullptr;
 
 			smartdns_reg_post_func(Server::StartPost, this);
 			dns_ping_cap_force_enable = 1;
@@ -406,27 +470,30 @@ cache-persist no
 			smartdns_reg_post_func(nullptr, nullptr);
 		});
 	} else {
-		return false;
+		errno = EINVAL;
+		return fail_start("creation mode");
 	}
+
+	// Only the spawned child owns the write end; EOF must be distinguishable
+	// from the explicit ready(1) notification.
+	if (mode_ == CREATE_MODE_FORK) { close(fds[1]); fds[1] = -1; }
 
 	struct pollfd pfd[1];
 	pfd[0].fd = fds[0];
 	pfd[0].events = POLLIN;
 
 	int ret = poll(pfd, 1, 10000);
-	if (ret == 0) {
-		if (thread_.joinable()) {
-			thread_.join();
-		}
-
-		if (pid > 0) {
-			kill(pid, SIGKILL);
-		}
+	uint64_t notification = 0;
+	ssize_t count = ret > 0 ? read(fds[0], &notification, sizeof(notification)) : -1;
+	if (count != sizeof(notification) || notification != 1) {
+		std::cerr << "Server startup failed: pid=" << pid << " poll=" << ret
+			<< " bytes=" << count << " notification=" << notification << " errno=" << errno << std::endl;
+		if (pid > 0) { kill(pid, SIGKILL); waitpid(pid, nullptr, 0); }
+		if (thread_.joinable()) { dns_server_stop(); thread_.join(); }
 		return false;
 	}
-
 	pid_ = pid;
-	return pid > 0;
+	return mode_ == CREATE_MODE_THREAD || pid > 0;
 }
 
 void Server::Stop(bool graceful)
@@ -445,7 +512,12 @@ void Server::Stop(bool graceful)
 	}
 
 	if (pid_ > 0) {
-		waitpid(pid_, nullptr, 0);
+		int status = 0;
+		if (waitpid(pid_, &status, 0) == pid_ &&
+			((WIFEXITED(status) && WEXITSTATUS(status) != 0) ||
+			 (WIFSIGNALED(status) && WTERMSIG(status) != SIGTERM && WTERMSIG(status) != SIGKILL))) {
+			std::cerr << "Server child terminated unexpectedly: pid=" << pid_ << " wait_status=" << status << std::endl;
+		}
 	}
 
 	conf_temp_file_.Close();
@@ -459,11 +531,13 @@ bool Server::IsRunning()
 		return false;
 	}
 
-	if (waitpid(pid_, nullptr, WNOHANG) == 0) {
-		return true;
-	}
-
-	return kill(pid_, 0) == 0;
+	int status = 0;
+	pid_t waited = waitpid(pid_, &status, WNOHANG);
+	if (waited == 0) return true;
+	std::cerr << "Server is not running: pid=" << pid_ << " wait_result=" << waited
+		<< " wait_status=" << status << " errno=" << errno << std::endl;
+	if (waited == pid_ || (waited < 0 && errno == ECHILD)) pid_ = 0;
+	return false;
 }
 
 Server::~Server()

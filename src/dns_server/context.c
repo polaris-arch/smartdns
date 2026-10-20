@@ -17,6 +17,7 @@
  */
 
 #include "context.h"
+#include "smartdns/dns_any.h"
 #include "smartdns/dns_conf.h"
 #include "address.h"
 #include "audit.h"
@@ -825,6 +826,19 @@ static int _dns_request_update_id_ttl_domain(struct dns_server_post_context *con
 		}
 	}
 
+	/* Fresh/cached ANY already carries each RR's own (possibly aged) lifetime.
+	 * TTL floors/max-reply normalization must never extend a different RRset. */
+	if (request->qtype == DNS_T_ANY) {
+		ttl = -1;
+		if (request->conn && request->conn->type == DNS_CONN_TYPE_UDP_SERVER &&
+			context->inpacket_len > request->any_udp_size) {
+			int len = dns_any_empty_response(request->domain, context->packet->head.rcode, 1,
+				context->inpacket_buff, sizeof(context->inpacket_buff));
+			if (len < 0) return -1;
+			context->inpacket = context->inpacket_buff;
+			context->inpacket_len = len;
+		}
+	}
 	struct dns_update_param param;
 	param.id = request->id;
 	param.cname_ttl = ttl;
@@ -1048,6 +1062,7 @@ int _dns_cache_reply_packet(struct dns_server_post_context *context)
 {
 	struct dns_request *request = context->request;
 	int speed = -1;
+	if (request->qtype == DNS_T_ANY) return 0;
 	if (context->do_cache == 0 || request->no_cache == 1) {
 		return 0;
 	}

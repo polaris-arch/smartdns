@@ -258,8 +258,8 @@ static void _free_key(struct DNS_EVP_PKEY_CTX *ctx)
 		if (ctx->bn) {
 			BN_free(ctx->bn);
 		}
-		free(ctx);
 #endif
+		free(ctx);
 	}
 }
 

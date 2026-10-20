@@ -50,11 +50,11 @@ TEST_F(ClientRule, rule)
 	/* this ip will be discard, but is reachable */
 	server.MockPing(PING_TYPE_ICMP, "1.2.3.4", 60, 10);
 
-	server.Start(R"""(bind [::]:60053
+	ASSERT_TRUE(server.Start(R"""(bind [::]:60053
 server udp://127.0.0.1:61053 -g client -e 
 server udp://127.0.0.1:62053
 client-rules 127.0.0.1 -g client
-)""");
+)"""));
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("b.com", 60053));
 	std::cout << client.GetResult() << std::endl;
@@ -118,17 +118,15 @@ TEST_F(ClientRule, acl)
 	/* this ip will be discard, but is reachable */
 	server.MockPing(PING_TYPE_ICMP, "1.2.3.4", 60, 10);
 
-	auto ipaddr = smartdns::GetAvailableIPAddresses();
-	if (ipaddr.size() < 0) {
-		return;
-	}
+	/* Distinct loopback source identities also work in network-isolated CI.
+	 * An empty list of non-loopback interfaces must never be indexed. */
 
 	std::string confstr = R"""(bind [::]:60053
 server 127.0.0.1:61053
 acl-enable yes
 )""";
 
-	confstr += "client-rules " + ipaddr[0] + "\n";
+	confstr += "client-rules 127.0.0.2\n";
 
 	server.Start(confstr);
 	smartdns::Client client;
@@ -137,7 +135,7 @@ acl-enable yes
 	EXPECT_EQ(client.GetStatus(), "REFUSED");
 	ASSERT_EQ(client.GetAnswerNum(), 0);
 
-	ASSERT_TRUE(client.Query("b.com", 60053, ipaddr[0]));
+	ASSERT_TRUE(client.Query("b.com -b 127.0.0.2", 60053, "127.0.0.1"));
 	std::cout << client.GetResult() << std::endl;
 	ASSERT_EQ(client.GetAnswerNum(), 1);
 	EXPECT_EQ(client.GetStatus(), "NOERROR");

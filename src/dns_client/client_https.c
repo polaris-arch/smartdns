@@ -18,6 +18,8 @@
 #define _GNU_SOURCE
 
 #include "client_https.h"
+#include "conn_stream.h"
+#include "upstream_policy.h"
 #include "client_socket.h"
 #include "client_tls.h"
 #include "server_info.h"
@@ -51,46 +53,36 @@ int _dns_client_format_https_packet(struct dns_server_info *server_info, void *p
 		return -1;
 	}
 
+	if (len > outpacket_max - http_len) return -1;
 	memcpy(outpacket + http_len, packet, len);
 	http_len += len;
 
 	return http_len;
 }
 
-int _dns_client_send_http1(struct dns_server_info *server_info, void *packet, unsigned short len)
+/* Keep an owner even after cancellation: HTTP/1 responses have no stream ID. */
+int _dns_client_send_http1(struct dns_server_info *server_info, struct dns_query_struct *query,
+                           void *packet, unsigned short len)
 {
-	int send_len = 0;
-	int http_len = 0;
-	unsigned char inpacket_data[DNS_IN_PACKSIZE];
-	unsigned char *inpacket = inpacket_data;
-
-	http_len = _dns_client_format_https_packet(server_info, packet, len, inpacket, sizeof(inpacket_data));
-	if (http_len < 0) {
-		return -1;
-	}
-
-	if (server_info->status != DNS_SERVER_STATUS_CONNECTED) {
-		return _dns_client_send_data_to_buffer(server_info, inpacket, http_len);
-	}
-
-	if (server_info->ssl == NULL) {
-		errno = EINVAL;
-		return -1;
-	}
-
-	send_len = _dns_client_socket_ssl_send(server_info, inpacket, http_len);
-	if (send_len <= 0) {
-		if (errno == EAGAIN || errno == EPIPE || server_info->ssl == NULL) {
-			/* save data to buffer, and retry when EPOLLOUT is available */
-			return _dns_client_send_data_to_buffer(server_info, inpacket, http_len);
-		} else if (server_info->ssl && errno != ENOMEM) {
-			_dns_client_shutdown_socket(server_info);
-		}
-		return -1;
-	} else if (send_len < http_len) {
-		/* save remain data to buffer, and retry when EPOLLOUT is available */
-		return _dns_client_send_data_to_buffer(server_info, inpacket + send_len, http_len - send_len);
-	}
-
-	return 0;
+    if (!len || len > DNS_IN_PACKSIZE - 128) return -1;
+    struct dns_conn_stream *stream = _dns_client_conn_stream_new_write();
+    if (!stream) return -1;
+    stream->type = DNS_SERVER_HTTPS;
+    stream->attempt_generation = _dns_attempt_generation(query, server_info);
+    memcpy(stream->send_buff.data, packet, len);
+    stream->send_buff.len = len;
+    pthread_mutex_lock(&server_info->lock);
+    pthread_mutex_lock(&query->lock);
+    stream->server_info = server_info;
+    stream->query = query;
+    list_add_tail(&stream->server_list, &server_info->conn_stream_list);
+    _dns_client_conn_stream_get(stream);
+    list_add_tail(&stream->query_list, &query->conn_stream_list);
+    pthread_mutex_unlock(&query->lock);
+    pthread_mutex_unlock(&server_info->lock);
+    _dns_attempt_mark_buffered(query, server_info);
+    struct epoll_event event = {.events = EPOLLIN | EPOLLOUT};
+    event.data.ptr = server_info;
+    if (server_info->fd >= 0) epoll_ctl(client.epoll_fd, EPOLL_CTL_MOD, server_info->fd, &event);
+    return 0;
 }

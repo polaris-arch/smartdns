@@ -16,6 +16,26 @@
 #include "http_parse/hpack.h"
 #include "smartdns/http2.h"
 
+namespace {
+// Poll returns a separate reference for each non-null observation, even when
+// the test already owns the same stream through new/accept. Release every item
+// on scope exit, including a break after headers arrive or an early assertion.
+class PollItemReferences {
+ public:
+	PollItemReferences(http2_poll_item *items, int count) : items_(items), count_(count) {}
+	~PollItemReferences() {
+		for (int i = 0; i < count_; i++) {
+			if (items_[i].stream != nullptr) http2_stream_put(items_[i].stream);
+		}
+	}
+	PollItemReferences(const PollItemReferences &) = delete;
+	PollItemReferences &operator=(const PollItemReferences &) = delete;
+ private:
+	http2_poll_item *items_;
+	int count_;
+};
+} // namespace
+
 class LIBHTTP2 : public ::testing::Test
 {
   protected:
@@ -531,6 +551,7 @@ TEST_F(LIBHTTP2, Integrated)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+			PollItemReferences poll_references(items, count);
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
 					stream = http2_ctx_accept_stream(ctx);
@@ -612,6 +633,7 @@ TEST_F(LIBHTTP2, Integrated)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+			PollItemReferences poll_references(items, count);
 			if (http2_stream_get_status(stream) > 0)
 				break;
 
@@ -1604,6 +1626,7 @@ TEST_F(LIBHTTP2, MultiStream)
 		int streams_completed = 0;
 		int max_iterations = 500;
 		std::set<struct http2_stream *> processed_streams;
+		std::set<struct http2_stream *> accepted_streams;
 		while (streams_completed < NUM_STREAMS && max_iterations-- > 0) {
 			struct pollfd pfd = {server_sock, POLLIN, 0};
 			poll(&pfd, 1, 100);
@@ -1611,10 +1634,12 @@ TEST_F(LIBHTTP2, MultiStream)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+			PollItemReferences poll_references(items, count);
 
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
 					struct http2_stream *s = http2_ctx_accept_stream(ctx);
+					if (s != nullptr) accepted_streams.insert(s);
 				} else if (items[i].stream && items[i].readable) {
 					struct http2_stream *stream = items[i].stream;
 					uint8_t buf[1024];
@@ -1640,7 +1665,8 @@ TEST_F(LIBHTTP2, MultiStream)
 			usleep(2000);
 		}
 
-		for (auto stream : processed_streams) {
+		// Each accept owns one reference, including streams incomplete at timeout.
+		for (auto stream : accepted_streams) {
 			http2_stream_close(stream);
 		}
 
@@ -1694,6 +1720,7 @@ TEST_F(LIBHTTP2, MultiStream)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+			PollItemReferences poll_references(items, count);
 
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream && items[i].readable) {
@@ -1758,6 +1785,7 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+			PollItemReferences poll_references(items, count);
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
 					stream = http2_ctx_accept_stream(ctx);
@@ -1843,6 +1871,7 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+			PollItemReferences poll_references(items, count);
 			if (http2_stream_get_status(stream) > 0)
 				break;
 
@@ -1908,6 +1937,7 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+			PollItemReferences poll_references(items, count);
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
 					stream = http2_ctx_accept_stream(ctx);
@@ -1955,6 +1985,8 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
 
 		EXPECT_LT(loop_count, 100) << "Server loop did not terminate (infinite loop detected)";
 
+		// Release the accept-owned reference after observing loop termination.
+		http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
 
@@ -2021,6 +2053,7 @@ TEST_F(LIBHTTP2, StreamClose)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+			PollItemReferences poll_references(items, count);
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
 					stream = http2_ctx_accept_stream(ctx);
@@ -2077,6 +2110,7 @@ TEST_F(LIBHTTP2, StreamClose)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+			PollItemReferences poll_references(items, count);
 			if (http2_stream_get_status(stream) > 0)
 				break;
 			usleep(20000);

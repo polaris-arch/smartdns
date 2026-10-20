@@ -48,6 +48,10 @@ int _dns_client_send_http2(struct dns_server_info *server_info, struct dns_query
  */
 int _dns_client_process_http2(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now);
 
+int _dns_client_http2_process_write(struct dns_server_info *server_info);
+
+int _dns_client_send_buffered_http2_requests(struct dns_server_info *server_info);
+
 #ifdef __cplusplus
 }
 #endif

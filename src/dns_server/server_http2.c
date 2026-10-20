@@ -18,6 +18,7 @@
  *************************************************************************/
 
 #include "server_http2.h"
+#include "any.h"
 #include "connection.h"
 #include "dns_server.h"
 #include "server_tls.h"
@@ -83,6 +84,13 @@ static void _dns_server_http2_process_stream(struct dns_server_conn_tls_client *
 {
 	uint8_t buf[DNS_IN_PACKSIZE];
 	int len = 0;
+
+	/* A reset can arrive in the same read as the original request. */
+	if (http2_stream_is_reset(stream)) {
+		http2_stream_get(stream);
+		http2_stream_close(stream);
+		return;
+	}
 
 	const char *method = http2_stream_get_method(stream);
 	if (method == NULL) {
@@ -253,9 +261,9 @@ int _dns_server_process_http2(struct dns_server_conn_tls_client *tls_client, str
 	if (event->events & EPOLLOUT) {
 		int loop = 0;
 		while (http2_ctx_want_write(ctx) && loop++ < 10) {
-			if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) {
-				break;
-			}
+			int poll_ret = http2_ctx_poll(ctx, NULL, 0, NULL);
+			_dns_server_any_cancel_http2_resets(tls_client);
+			if (poll_ret < 0) break;
 		}
 	}
 
@@ -285,6 +293,9 @@ int _dns_server_process_http2(struct dns_server_conn_tls_client *tls_client, str
 		while (loop_count++ < MAX_LOOP_COUNT) {
 			poll_count = 0;
 			ret = http2_ctx_poll_readable(ctx, poll_items, sizeof(poll_items) / sizeof(poll_items[0]), &poll_count);
+			/* RST_STREAM need not produce a readable item once the request body
+			 * was consumed. Scan bounded ANY interests even when poll_count is 0. */
+			_dns_server_any_cancel_http2_resets(tls_client);
 			if (ret < 0) {
 				if (ret == HTTP2_ERR_EAGAIN) {
 					break;

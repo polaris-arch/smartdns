@@ -35,6 +35,9 @@ int _dns_client_send_tcp(struct dns_server_info *server_info, void *packet, unsi
 
 void _dns_client_check_tcp(void);
 
+int _dns_client_send_framed(struct dns_server_info *server, struct dns_query_struct *query, void *packet, unsigned short len);
+int _dns_client_process_stream_writes(struct dns_server_info *server_info);
+
 #ifdef __cplusplus
 }
 #endif /*__cplusplus */

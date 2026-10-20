@@ -22,6 +22,7 @@
 #include "smartdns/util.h"
 
 #include "address.h"
+#include "any.h"
 #include "bind.h"
 #include "bootstrap_dns.h"
 #include "client_rule.h"
@@ -170,6 +171,12 @@ static int _config_server_name(void *data, int argc, char *argv[])
 }
 
 static struct config_item _config_item[] = {
+	CONF_CUSTOM("any-response-mode", _config_any_mode, NULL),
+	CONF_CUSTOM("any-aggregate-types", _config_any_types, NULL),
+	CONF_CUSTOM("any-aggregate-concurrency", _config_any_number, group_member(any.concurrency)),
+	CONF_CUSTOM("any-aggregate-max-attempts", _config_any_number, group_member(any.max_attempts)),
+	CONF_CUSTOM("any-aggregate-timeout-ms", _config_any_number, group_member(any.timeout_ms)),
+	CONF_CUSTOM("any-aggregate-partial", _config_any_partial, NULL),
 	CONF_CUSTOM("server-name", _config_server_name, NULL),
 	CONF_YESNO("resolv-hostname", &dns_conf.resolv_hostname),
 	CONF_CUSTOM("bind", _config_bind_ip_udp, NULL),
@@ -501,6 +508,7 @@ static int _dns_conf_load_post(void)
 	}
 
 	_dns_conf_group_post();
+	if (_config_any_verify() != 0) return -1;
 
 	_dns_conf_dns64_post();
 

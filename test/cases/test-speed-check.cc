@@ -45,6 +45,16 @@ TEST_F(SpeedCheck, response_mode)
 		return smartdns::SERVER_REQUEST_SOA;
 	});
 
+	/* Model unreachable probes without depending on external network routes.
+	 * Cover both TCP implementations used by the default check order. */
+	for (const char *ip : {"1.2.3.4", "5.6.7.8"}) {
+		server.MockPing(PING_TYPE_ICMP, ip, 60, 10000);
+		for (const char *port : {":80", ":443"}) {
+			std::string host = std::string(ip) + port;
+			server.MockPing(PING_TYPE_TCP, host.c_str(), 60, 10000);
+			server.MockPing(PING_TYPE_TCP_SYN, host.c_str(), 60, 10000);
+		}
+	}
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:61053
 response-mode first-ping
@@ -124,6 +134,16 @@ TEST_F(SpeedCheck, domain_rules_none)
 		return smartdns::SERVER_REQUEST_SOA;
 	});
 
+	/* Model unreachable probes without depending on external network routes.
+	 * Cover both TCP implementations used by the default check order. */
+	for (const char *ip : {"1.2.3.4", "5.6.7.8"}) {
+		server.MockPing(PING_TYPE_ICMP, ip, 60, 10000);
+		for (const char *port : {":80", ":443"}) {
+			std::string host = std::string(ip) + port;
+			server.MockPing(PING_TYPE_TCP, host.c_str(), 60, 10000);
+			server.MockPing(PING_TYPE_TCP_SYN, host.c_str(), 60, 10000);
+		}
+	}
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:61053
 domain-rules /a.com/ -c none

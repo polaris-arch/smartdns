@@ -21,6 +21,7 @@
 #include "conn_stream.h"
 #include "ecs.h"
 #include "query.h"
+#include "upstream_policy.h"
 
 void _dns_client_query_get(struct dns_query_struct *query)
 {
@@ -45,6 +46,9 @@ void _dns_client_query_release(struct dns_query_struct *query)
 		return;
 	}
 
+	dns_query_budget_put(query->budget);
+	query->budget = NULL;
+
 	/* notify caller query end */
 	if (query->callback) {
 		tlog(TLOG_DEBUG, "result: %s, qtype: %d, has-result: %d, id %d", query->domain, query->qtype, query->has_result,
@@ -61,6 +65,7 @@ void _dns_client_query_release(struct dns_query_struct *query)
 	}
 	pthread_mutex_unlock(&query->lock);
 
+	_dns_attempt_free_all(query);
 	pthread_mutex_destroy(&query->lock);
 
 	/* free resource */
@@ -80,6 +85,11 @@ void _dns_client_query_release(struct dns_query_struct *query)
 
 void _dns_client_query_remove(struct dns_query_struct *query)
 {
+	/* Only one callback/timeout/stream error may retire the live query. */
+	pthread_mutex_lock(&query->lock);
+	if (query->terminal) { pthread_mutex_unlock(&query->lock); return; }
+	query->terminal = 1;
+	pthread_mutex_unlock(&query->lock);
 	/* remove query from period check list, and release reference*/
 	pthread_mutex_lock(&client.domain_map_lock);
 	list_del_init(&query->dns_request_list);
@@ -126,6 +136,7 @@ int _dns_client_send_query(struct dns_query_struct *query)
 	head.rd = 1;
 	head.ra = 0;
 	head.ad = query->edns0_do;
+	head.cd = query->checking_disabled;
 	head.rcode = 0;
 
 	if (dns_packet_init(packet, DNS_PACKSIZE, &head) != 0) {
@@ -312,15 +323,11 @@ int _dns_client_query_parser_options(struct dns_query_struct *query, struct dns_
 
 void _dns_client_retry_dns_query(struct dns_query_struct *query)
 {
-	if (atomic_dec_and_test(&query->retry_count) || (query->has_result != 0)) {
-		_dns_client_query_remove(query);
-		if (query->has_result == 0) {
-			tlog(TLOG_DEBUG, "retry query %s, type: %d, id: %d failed", query->domain, query->qtype, query->sid);
-		}
-	} else {
-		tlog(TLOG_DEBUG, "retry query %s, type: %d, id: %d", query->domain, query->qtype, query->sid);
-		_dns_client_send_query(query);
-	}
+	/* Errors schedule work; never recursively broadcast while siblings are live. */
+	if (query->terminal) return;
+	if (atomic_read(&query->dns_request_sent) > 0) return;
+	query->next_send_tick = get_tick_count() + 100;
+	return;
 }
 
 int _dns_client_add_hashmap(struct dns_query_struct *query)

@@ -16,11 +16,13 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <cstdio>
 #include "client.h"
 #include "smartdns/dns.h"
 #include "include/utils.h"
 #include "server.h"
 #include "gtest/gtest.h"
+#include <atomic>
 
 class Server : public ::testing::Test
 {
@@ -137,10 +139,10 @@ dualstack-ip-selection no
 
 TEST_F(Server, retry_no_response)
 {
+	std::atomic<int> count{0};
 	smartdns::MockServer server_upstream;
 	smartdns::MockServer server_upstream1;
 	smartdns::Server server;
-	int count = 0;
 
 	server_upstream.Start("udp://0.0.0.0:61053", [&](struct smartdns::ServerRequestContext *request) {
 		count++;
@@ -150,6 +152,7 @@ TEST_F(Server, retry_no_response)
 	server.Start(R"""(bind [::]:60053
 bind-tcp [::]:60053
 server 127.0.0.1:61053
+dualstack-ip-selection no
 )""");
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("a.com", 60053));
@@ -157,7 +160,7 @@ server 127.0.0.1:61053
 	ASSERT_EQ(client.GetAnswerNum(), 0);
 	EXPECT_EQ(client.GetStatus(), "SERVFAIL");
 	EXPECT_GE(client.GetQueryTime(), 1500);
-	EXPECT_GE(count, 4);
+	EXPECT_EQ(count.load(), 4); // initial send plus all three retries, no duplicate fanout
 }
 
 TEST_F(Server, max_queries)
@@ -276,28 +279,47 @@ dualstack-ip-selection no
 
 TEST_F(Server, fallback)
 {
+    std::atomic<int> primary_count{0}, fallback_count{0};
+    std::atomic<bool> fallback_before_primary{false};
 	smartdns::MockServer server_upstream;
 	smartdns::Server server;
+    smartdns::MockServer primary;
+    // Keep the primary alive but silent. A closed port would instead exercise
+    // immediate transport failure/prohibition and cannot establish timeout order.
+    ASSERT_TRUE(primary.Start("udp://127.0.0.1:61054", [&](struct smartdns::ServerRequestContext *request) {
+        primary_count++;
+        return smartdns::SERVER_REQUEST_NO_RESPONSE;
+    }));
 
-	server_upstream.Start("udp://0.0.0.0:61053", [](struct smartdns::ServerRequestContext *request) {
-		if (request->qtype != DNS_T_A) {
+	ASSERT_TRUE(server_upstream.Start("udp://0.0.0.0:61053", [&](struct smartdns::ServerRequestContext *request) {
+		fallback_count++;
+        if (primary_count.load() == 0) fallback_before_primary = true;
+        if (request->qtype != DNS_T_A) {
 			return smartdns::SERVER_REQUEST_SOA;
 		}
 		smartdns::MockServer::AddIP(request, request->domain.c_str(), "1.2.3.4", 611);
 		return smartdns::SERVER_REQUEST_OK;
-	});
+	}));
 
 	server.MockPing(PING_TYPE_ICMP, "2001::", 128, 10000);
-	server.Start(R"""(bind [::]:60053
+	ASSERT_TRUE(server.Start(R"""(bind [::]:60053
 bind-tcp [::]:60053
 server 127.0.0.1:61053 -fallback
 server 127.0.0.1:61054
-)""");
+dualstack-ip-selection no
+speed-check-mode none
+)"""));
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("a.com", 60053));
 	std::cout << client.GetResult() << std::endl;
 	ASSERT_EQ(client.GetAnswerNum(), 1);
-	EXPECT_GE(client.GetQueryTime(), 1000);
+	// Fallback is eligible after the first 500 ms retry interval, not after
+    // the incidental one-second idle scan delay of the old worker loop.
+    EXPECT_GE(client.GetQueryTime(), 500);
+    EXPECT_GE(primary_count.load(), 1);
+    EXPECT_LE(primary_count.load(), 2); // initial primary, at most one retry
+    EXPECT_EQ(fallback_count.load(), 1);
+    EXPECT_FALSE(fallback_before_primary.load());
 	EXPECT_EQ(client.GetStatus(), "NOERROR");
 	EXPECT_EQ(client.GetAnswer()[0].GetName(), "a.com");
 	EXPECT_EQ(client.GetAnswer()[0].GetData(), "1.2.3.4");
@@ -588,4 +610,53 @@ server 127.0.0.1:61053
 	EXPECT_LE(client.GetQueryTime(), 5);
 	EXPECT_EQ(client.GetAnswer()[0].GetName(), "A.cOm");
 	EXPECT_EQ(client.GetAnswer()[0].GetData(), "1.2.3.4");
+}
+TEST_F(Server, StartupFailureNotificationIsNotReady)
+{
+    smartdns::Server server;
+    EXPECT_FALSE(server.Start("bind 127.0.0.1:60053\nany-response-mode invalid-mode\n"));
+    EXPECT_FALSE(server.IsRunning());
+}
+
+TEST_F(Server, FixtureChildRejectsMalformedArguments)
+{
+    auto rejected = [](std::vector<std::string> args) {
+        std::vector<char *> argv;
+        for (auto &arg : args) argv.push_back(const_cast<char *>(arg.c_str()));
+        argv.push_back(nullptr);
+        return smartdns::Server::RunFixtureChild(args.size(), argv.data());
+    };
+    EXPECT_EQ(rejected({"test.bin", "--smartdns-fixture-child"}), 2);
+    EXPECT_EQ(rejected({"test.bin", "--smartdns-fixture-child", ""}), 2);
+    EXPECT_EQ(rejected({"test.bin", "--smartdns-fixture-child", "/unused", "1"}), 2);
+    EXPECT_EQ(rejected({"test.bin", "--smartdns-fixture-child", "/unused", "0", "127.0.0.1", "60", "0.125"}), 2);
+    EXPECT_EQ(rejected({"test.bin", "--smartdns-fixture-child", "/unused", "1x", "127.0.0.1", "60", "0.125"}), 2);
+    EXPECT_EQ(rejected({"test.bin", "--smartdns-fixture-child", "/unused", "1", "", "60", "0.125"}), 2);
+    EXPECT_EQ(rejected({"test.bin", "--smartdns-fixture-child", "/unused", "1", "127.0.0.1", "60x", "0.125"}), 2);
+    EXPECT_EQ(rejected({"test.bin", "--smartdns-fixture-child", "/unused", "1", "127.0.0.1", "60", "0.125x"}), 2);
+    EXPECT_EQ(rejected({"test.bin", "--smartdns-fixture-child", "/unused", "1", "127.0.0.1", "60", "nan"}), 2);
+}
+
+TEST_F(Server, MockUpstreamIdleShutdownWithReadableStdin)
+{
+	// A mock upstream may be idle when local rules answer every DNS query.
+	// Keep fd 0 readable, exercising the former prepublication poll hazard.
+	int saved_stdin = dup(STDIN_FILENO);
+	ASSERT_GE(saved_stdin, 0);
+	Defer { EXPECT_EQ(dup2(saved_stdin, STDIN_FILENO), STDIN_FILENO); close(saved_stdin); };
+	FILE *input = fopen("/dev/null", "r");
+	ASSERT_NE(input, nullptr);
+	Defer { fclose(input); };
+	ASSERT_EQ(dup2(fileno(input), STDIN_FILENO), STDIN_FILENO);
+	std::atomic<int> callbacks{0};
+	for (int i = 0; i < 16; i++) {
+		smartdns::MockServer upstream;
+		ASSERT_TRUE(upstream.Start("udp://127.0.0.1:61053", [&](smartdns::ServerRequestContext *) {
+			callbacks++; return smartdns::SERVER_REQUEST_NO_RESPONSE;
+		}));
+		usleep(1000);
+		upstream.Stop();
+		EXPECT_FALSE(upstream.IsRunning());
+	}
+	EXPECT_EQ(callbacks, 0);
 }

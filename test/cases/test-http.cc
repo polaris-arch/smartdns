@@ -45,6 +45,7 @@ TEST_F(HTTP, http1_1_request_parse)
 					   "Host: www.example.com\r\n"
 					   "User-Agent: smartdns/46\r\n"
 					   "Accept: */*\r\n"
+					   "Content-Length: 11\r\n"
 					   "\r\n"
 					   "hello world";
 	struct http_head *http_head = http_head_init(1024, HTTP_VERSION_1_1);

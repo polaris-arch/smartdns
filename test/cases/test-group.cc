@@ -140,11 +140,11 @@ ignore-ip 7.8.9.10
 	server.MockPing(PING_TYPE_ICMP, "1.2.3.4", 60, 20);
 	server.MockPing(PING_TYPE_ICMP, "7.8.9.10", 60, 10);
 
-	server.Start(R"""(bind [::]:60053
+	ASSERT_TRUE(server.Start(R"""(bind [::]:60053
 conf-file /tmp/smartdns_conf_file*.conf -g client
 server udp://127.0.0.1:61053
 ignore-ip 1.2.3.4
-)""");
+)"""));
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("a.com", 60053));
 	std::cout << client.GetResult() << std::endl;

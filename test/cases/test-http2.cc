@@ -1,6 +1,7 @@
 #include "client.h"
 #include "server.h"
 #include "smartdns/dns.h"
+#include "smartdns/dns_any.h"
 #include "smartdns/http2.h"
 #include "smartdns/util.h"
 #include "gtest/gtest.h"
@@ -11,6 +12,7 @@
 #include <cctype>
 #include <cstring>
 #include <fcntl.h>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -18,16 +20,46 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <poll.h>
+#include <signal.h>
+#include <pthread.h>
 #include <set>
 #include <string>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
 namespace
 {
+
+/* OpenSSL's socket BIO may write during read/handshake as well as SSL_write.
+ * Block SIGPIPE only around this thread's TLS operation; preserve errno, SSL
+ * return values, prior signal mask and pre-existing pending signals. Peer-close
+ * remains a real transport error for assertions rather than killing test.bin. */
+template <class Operation> int TlsIoWithoutSigpipe(Operation operation)
+{
+	sigset_t pipe_signal, previous, pending;
+	sigemptyset(&pipe_signal); sigaddset(&pipe_signal, SIGPIPE);
+	int error = pthread_sigmask(SIG_BLOCK, &pipe_signal, &previous);
+	if (error) { errno = error; return -1; }
+	if (sigpending(&pending) != 0) {
+		int saved = errno; pthread_sigmask(SIG_SETMASK, &previous, nullptr); errno = saved; return -1;
+	}
+	bool consume = !sigismember(&previous, SIGPIPE) && !sigismember(&pending, SIGPIPE);
+	int result = operation();
+	int saved = errno;
+	if (consume && result <= 0 && saved == EPIPE) {
+		timespec zero{};
+		while (sigtimedwait(&pipe_signal, nullptr, &zero) < 0 && errno == EINTR) {
+			/* Retry only interrupted zero-time waits before restoring the mask. */
+		}
+	}
+	pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+	errno = saved;
+	return result;
+}
 
 const char *HTTP2_TEST_CERT_FILE = "/tmp/smartdns-http2-test-cert.pem";
 const char *HTTP2_TEST_KEY_FILE = "/tmp/smartdns-http2-test-key.pem";
@@ -42,7 +74,7 @@ bool EnsureHTTP2TestCert()
 }
 
 bool BuildDnsAResponse(const std::vector<uint8_t> &request, const char *ip, std::vector<uint8_t> *response,
-					   std::string *error)
+					   std::string *error, bool answer_any = false)
 {
 	unsigned char request_packet_buff[DNS_PACKSIZE];
 	unsigned char response_packet_buff[DNS_PACKSIZE];
@@ -81,7 +113,7 @@ bool BuildDnsAResponse(const std::vector<uint8_t> &request, const char *ip, std:
 		return false;
 	}
 
-	if (qtype == DNS_T_A) {
+	if (qtype == DNS_T_A || (answer_any && qtype == DNS_T_ANY)) {
 		if (inet_pton(AF_INET, ip, addr) != 1) {
 			*error = std::string("invalid response IP: ") + ip;
 			return false;
@@ -102,6 +134,27 @@ bool BuildDnsAResponse(const std::vector<uint8_t> &request, const char *ip, std:
 class LimitedHTTP2DoHUpstream
 {
   public:
+	/* Optional wire-control mode for the real ANY coordinator integration test.
+	 * All TLS I/O remains on the peer connection thread. No production hooks. */
+	struct WireState {
+		std::vector<unsigned> headers;
+		std::map<unsigned, unsigned> data_bytes;
+		std::set<unsigned> resets;
+		std::map<unsigned, unsigned> reset_codes;
+		std::set<unsigned> updates_sent;
+		unsigned settings_acks = 0;
+		bool zero_settings_sent = false;
+	};
+	void EnableZeroWindow() { zero_window_ = true; } // wire-control mode, before Start only
+	void AdvertiseZeroWindow() { zero_window_requested_ = true; }
+	WireState ObserveWire() {
+		std::lock_guard<std::mutex> lock(wire_lock_); return wire_;
+	}
+	void ReleaseWindow(unsigned id) {
+		std::lock_guard<std::mutex> lock(wire_lock_); window_commands_.push_back(id);
+	}
+	bool WireFailed() const { return wire_failed_.load(); }
+	unsigned ConnectionCount() const { return connections_.load(); }
 	~LimitedHTTP2DoHUpstream() { Stop(); }
 
 	bool Start(int port, int max_concurrent_streams, const char *response_ip)
@@ -185,7 +238,68 @@ class LimitedHTTP2DoHUpstream
   private:
 	struct Connection {
 		SSL *ssl = nullptr;
+		LimitedHTTP2DoHUpstream *owner = nullptr;
+		std::vector<uint8_t> captured;
+		size_t parsed = 24; // client connection preface
 	};
+
+	void ObserveClientBytes(Connection *conn, const uint8_t *bytes, size_t size) {
+		if (!zero_window_) return;
+		// This one-operation fixture must fail rather than consume unbounded input.
+		if (conn->captured.size() + size > 65536) { wire_failed_ = true; return; }
+		conn->captured.insert(conn->captured.end(), bytes, bytes + size);
+		std::lock_guard<std::mutex> lock(wire_lock_);
+		while (conn->parsed + 9 <= conn->captured.size()) {
+			const uint8_t *frame = conn->captured.data() + conn->parsed;
+			unsigned length = (frame[0] << 16) | (frame[1] << 8) | frame[2];
+			if (conn->parsed + 9 + length > conn->captured.size()) break;
+			unsigned id = ((frame[5] & 0x7f) << 24) | (frame[6] << 16) | (frame[7] << 8) | frame[8];
+			if (frame[3] == 1) wire_.headers.push_back(id);
+			if (frame[3] == 0) wire_.data_bytes[id] += length;
+			if (frame[3] == 3 && length == 4) {
+				wire_.resets.insert(id);
+				wire_.reset_codes[id] = (static_cast<unsigned>(frame[9]) << 24) |
+					(frame[10] << 16) | (frame[11] << 8) | frame[12];
+			}
+			if (frame[3] == 4 && (frame[4] & 1)) wire_.settings_acks++;
+			conn->parsed += 9 + length;
+		}
+	}
+
+	bool WriteControl(Connection *conn, int fd, const std::vector<uint8_t> &frame) {
+		// One bounded, serialized TLS write. Retry keeps the same immutable buffer.
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+		size_t offset = 0;
+		while (run_ && offset < frame.size() && std::chrono::steady_clock::now() < deadline) {
+			int n = TlsIoWithoutSigpipe([&] { return SSL_write(conn->ssl, frame.data() + offset, frame.size() - offset); });
+			if (n > 0) { offset += n; continue; }
+			int error = SSL_get_error(conn->ssl, n);
+			if (error != SSL_ERROR_WANT_WRITE && error != SSL_ERROR_WANT_READ) break;
+			pollfd pfd{fd, static_cast<short>(error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT), 0};
+			poll(&pfd, 1, 10);
+		}
+		if (offset == frame.size()) return true;
+		wire_failed_ = true; return false;
+	}
+
+	bool WriteWindowCommands(Connection *conn, int fd) {
+		if (zero_window_requested_.exchange(false)) {
+			// Send after warmup. HTTP/2 permits requests before initial SETTINGS;
+			// observing the ACK here makes the zero-window precondition causal.
+			if (!WriteControl(conn, fd, {0,0,6,4,0,0,0,0,0, 0,4,0,0,0,0})) return false;
+			std::lock_guard<std::mutex> lock(wire_lock_); wire_.zero_settings_sent = true;
+		}
+		std::vector<unsigned> commands;
+		{ std::lock_guard<std::mutex> lock(wire_lock_); commands.swap(window_commands_); }
+		for (unsigned id : commands) {
+			std::vector<uint8_t> frame{0,0,4,8,0, static_cast<uint8_t>(id >> 24),
+				static_cast<uint8_t>(id >> 16), static_cast<uint8_t>(id >> 8),
+				static_cast<uint8_t>(id), 0,0,0xff,0xff};
+			if (!WriteControl(conn, fd, frame)) return false;
+			std::lock_guard<std::mutex> lock(wire_lock_); wire_.updates_sent.insert(id);
+		}
+		return true;
+	}
 
 	static int AlpnSelectCallback(SSL *, const unsigned char **out, unsigned char *outlen, const unsigned char *in,
 								  unsigned int inlen, void *)
@@ -210,8 +324,9 @@ class LimitedHTTP2DoHUpstream
 	static int BioRead(void *private_data, uint8_t *buf, int len)
 	{
 		Connection *conn = (Connection *)private_data;
-		int ret = SSL_read(conn->ssl, buf, len);
+		int ret = TlsIoWithoutSigpipe([&] { return SSL_read(conn->ssl, buf, len); });
 		if (ret > 0) {
+			conn->owner->ObserveClientBytes(conn, buf, ret);
 			return ret;
 		}
 
@@ -226,7 +341,8 @@ class LimitedHTTP2DoHUpstream
 	static int BioWrite(void *private_data, const uint8_t *buf, int len)
 	{
 		Connection *conn = (Connection *)private_data;
-		int ret = SSL_write(conn->ssl, buf, len);
+
+		int ret = TlsIoWithoutSigpipe([&] { return SSL_write(conn->ssl, buf, len); });
 		if (ret > 0) {
 			return ret;
 		}
@@ -242,7 +358,7 @@ class LimitedHTTP2DoHUpstream
 	bool WaitSslAccept(SSL *ssl, int fd)
 	{
 		for (int i = 0; i < 300 && run_; i++) {
-			int ret = SSL_accept(ssl);
+			int ret = TlsIoWithoutSigpipe([&] { return SSL_accept(ssl); });
 			if (ret == 1) {
 				return true;
 			}
@@ -303,7 +419,7 @@ class LimitedHTTP2DoHUpstream
 
 		std::vector<uint8_t> response;
 		std::string error;
-		if (!BuildDnsAResponse(*body, response_ip_.c_str(), &response, &error)) {
+		if (!BuildDnsAResponse(*body, response_ip_.c_str(), &response, &error, zero_window_)) {
 			return false;
 		}
 
@@ -329,6 +445,7 @@ class LimitedHTTP2DoHUpstream
 		}
 
 		Connection conn;
+		conn.owner = this;
 		conn.ssl = SSL_new(ssl_ctx_);
 		if (conn.ssl == nullptr) {
 			close(fd);
@@ -341,6 +458,10 @@ class LimitedHTTP2DoHUpstream
 			return;
 		}
 
+		unsigned connection = ++connections_;
+		if (zero_window_ && connection != 1) {
+			wire_failed_ = true; SSL_free(conn.ssl); close(fd); return;
+		}
 		struct http2_settings settings = {};
 		settings.max_concurrent_streams = max_concurrent_streams_;
 		struct http2_ctx *ctx = http2_ctx_server_new("limited-doh-upstream", BioRead, BioWrite, &conn, &settings);
@@ -359,6 +480,7 @@ class LimitedHTTP2DoHUpstream
 			struct pollfd pfd = {fd, POLLIN | POLLOUT, 0};
 			poll(&pfd, 1, 10);
 
+			if (zero_window_ && !http2_ctx_want_write(ctx) && !WriteWindowCommands(&conn, fd)) break;
 			struct http2_poll_item items[16] = {};
 			int count = 0;
 			int ret = http2_ctx_poll(ctx, items, 16, &count);
@@ -374,6 +496,8 @@ class LimitedHTTP2DoHUpstream
 						bodies[stream] = std::vector<uint8_t>();
 					}
 				}
+				// Poll observations are independent of the accept-owned stream set.
+				if (items[i].stream != nullptr) http2_stream_put(items[i].stream);
 			}
 
 			for (auto it = streams.begin(); it != streams.end();) {
@@ -427,6 +551,13 @@ class LimitedHTTP2DoHUpstream
 	std::vector<std::thread> client_threads_;
 	std::atomic<bool> run_{false};
 	std::atomic<int> request_count_{0};
+	bool zero_window_ = false;
+	std::atomic<bool> wire_failed_{false};
+	std::atomic<bool> zero_window_requested_{false};
+	std::atomic<unsigned> connections_{0};
+	std::mutex wire_lock_;
+	WireState wire_;
+	std::vector<unsigned> window_commands_;
 	int max_concurrent_streams_ = 1;
 	std::string response_ip_ = "1.2.3.4";
 	std::string last_error_;
@@ -508,7 +639,7 @@ class HTTP2DoHClient
 		}
 
 		SSL_set_fd(ssl_, fd_);
-		int ssl_connect_ret = SSL_connect(ssl_);
+		int ssl_connect_ret = TlsIoWithoutSigpipe([&] { return SSL_connect(ssl_); });
 		if (ssl_connect_ret != 1) {
 			int ssl_get_error = SSL_get_error(ssl_, ssl_connect_ret);
 			int saved_errno = errno;
@@ -715,6 +846,17 @@ class HTTP2DoHClient
 		return true;
 	}
 
+	void CancelPending(PendingResponse *pending)
+	{
+		if (pending && pending->stream) {
+			/* With request END_STREAM sent and no response yet, close emits a
+			 * real RST_STREAM while retaining the shared HTTP/2 connection. */
+			http2_stream_close(pending->stream);
+			pending->stream = nullptr;
+			pending->done = true;
+		}
+	}
+
 	void ClosePending(std::vector<PendingResponse> *pending_responses)
 	{
 		if (pending_responses == nullptr) {
@@ -772,7 +914,7 @@ class HTTP2DoHClient
 	static int BioRead(void *private_data, uint8_t *buf, int len)
 	{
 		HTTP2DoHClient *client = (HTTP2DoHClient *)private_data;
-		int ret = SSL_read(client->ssl_, buf, len);
+		int ret = TlsIoWithoutSigpipe([&] { return SSL_read(client->ssl_, buf, len); });
 		if (ret > 0) {
 			return ret;
 		}
@@ -789,7 +931,7 @@ class HTTP2DoHClient
 	static int BioWrite(void *private_data, const uint8_t *buf, int len)
 	{
 		HTTP2DoHClient *client = (HTTP2DoHClient *)private_data;
-		int ret = SSL_write(client->ssl_, buf, len);
+		int ret = TlsIoWithoutSigpipe([&] { return SSL_write(client->ssl_, buf, len); });
 		if (ret > 0) {
 			return ret;
 		}
@@ -896,7 +1038,7 @@ class HTTP2DoHClient
 	std::string last_error_;
 };
 
-std::vector<uint8_t> BuildDnsQuery(const char *domain, uint16_t id)
+std::vector<uint8_t> BuildDnsQuery(const char *domain, uint16_t id, int qtype = DNS_T_A)
 {
 	unsigned char packet_buff[DNS_PACKSIZE];
 	unsigned char out[DNS_IN_PACKSIZE];
@@ -912,7 +1054,7 @@ std::vector<uint8_t> BuildDnsQuery(const char *domain, uint16_t id)
 		return {};
 	}
 
-	if (dns_add_domain(packet, domain, DNS_T_A, DNS_C_IN) != 0) {
+	if (dns_add_domain(packet, domain, qtype, DNS_C_IN) != 0) {
 		return {};
 	}
 
@@ -1014,7 +1156,7 @@ bool DnsResponseHasA(const std::vector<uint8_t> &response, const char *expected_
 }
 
 bool DnsResponseIsValidForQuery(const std::vector<uint8_t> &response, uint16_t expected_id,
-							   const std::string &expected_domain, const char *expected_ip, std::string *error)
+							   const std::string &expected_domain, const char *expected_ip, std::string *error, int expected_type = DNS_T_A)
 {
 	unsigned char packet_buff[DNS_PACKSIZE];
 	unsigned char encoded_buff[DNS_PACKSIZE];
@@ -1048,7 +1190,7 @@ bool DnsResponseIsValidForQuery(const std::vector<uint8_t> &response, uint16_t e
 	}
 
 	if (dns_get_domain(query_rrs, domain, sizeof(domain), &qtype, &qclass) != 0 ||
-		qtype != DNS_T_A || qclass != DNS_C_IN) {
+		qtype != expected_type || qclass != DNS_C_IN) {
 		*error = "query parse failed: " + DnsResponseSummary(response);
 		return false;
 	}
@@ -1071,7 +1213,15 @@ bool DnsResponseIsValidForQuery(const std::vector<uint8_t> &response, uint16_t e
 		*error = "dns_encode failed: " + DnsResponseSummary(response);
 		return false;
 	}
-	if ((size_t)encoded_len != response.size()) {
+	/* Aggregate ANY writes uncompressed owner names, so re-encoding may
+	 * validly change its length. Validate its original extents instead. */
+	if (expected_type == DNS_T_ANY) {
+		std::vector<uint8_t> validated = response;
+		if (dns_any_wire_age(validated.data(), validated.size(), 0, nullptr) != 0) {
+			*error = "invalid ANY wire extents";
+			return false;
+		}
+	} else if ((size_t)encoded_len != response.size()) {
 		*error = "dns body length mismatch: body=" + std::to_string(response.size()) +
 				 ", encoded=" + std::to_string(encoded_len) + ", " + DnsResponseSummary(response);
 		return false;
@@ -1587,6 +1737,8 @@ log-level error
 )"""));
 
 	usleep(2000000);
+	ASSERT_TRUE(server_wrap.IsRunning()) << "upstream child exited before stress";
+	ASSERT_TRUE(server.IsRunning()) << "forwarder child exited before stress";
 
 	struct Scenario {
 		const char *name;
@@ -1614,7 +1766,8 @@ log-level error
 			}
 		}
 
-		ASSERT_EQ(stats.completed, stats.total) << stats.first_failure;
+		ASSERT_EQ(stats.completed, stats.total) << stats.first_failure
+			<< " upstream_alive=" << server_wrap.IsRunning() << " forwarder_alive=" << server.IsRunning();
 		ASSERT_EQ(stats.success, stats.total) << stats.first_failure;
 	}
 }
@@ -1689,6 +1842,8 @@ log-level error
 )"""));
 
 	usleep(500000);
+	ASSERT_TRUE(server_wrap.IsRunning()) << "upstream child exited before stress";
+	ASSERT_TRUE(server.IsRunning()) << "forwarder child exited before stress";
 
 	const int stream_count = 1024;
 	HTTP2DoHClient client;
@@ -1705,7 +1860,8 @@ log-level error
 
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 	while (std::chrono::steady_clock::now() < deadline) {
-		ASSERT_TRUE(client.PumpPending(&pending, 1)) << client.LastError();
+		ASSERT_TRUE(client.PumpPending(&pending, 1)) << client.LastError()
+			<< " upstream_alive=" << server_wrap.IsRunning() << " forwarder_alive=" << server.IsRunning();
 		bool all_done = true;
 		for (const auto &item : pending) {
 			if (!item.done) {
@@ -2291,4 +2447,244 @@ log-level debug
 	ASSERT_TRUE(client.Query("example.com", 61053));
 	EXPECT_EQ(client.GetStatus(), "NOERROR");
 	EXPECT_EQ(client.GetAnswer()[0].GetData(), "1.2.3.4");
+}
+
+
+/* ANY reset regressions reuse the loopback TLS/H2 client above. A complete POST
+ * END_STREAM is normal; only an explicit RST_STREAM removes an ANY interest. */
+TEST(AnyOffline, Http2ResetOnlyCancelsItsWaiter)
+{
+	ASSERT_TRUE(EnsureHTTP2TestCert());
+	std::atomic<int> probes{0}, typed{0}; smartdns::MockServer upstream; smartdns::Server server;
+	ASSERT_TRUE(upstream.Start("udp://127.0.0.1:61053", [&](smartdns::ServerRequestContext *r) {
+		EXPECT_EQ(dns_add_domain(r->response_packet, r->domain.c_str(), r->qtype, r->qclass), 0);
+		if (r->qtype == DNS_T_ANY) {
+			probes++; usleep(300000); r->response_packet->head.rcode = DNS_RC_REFUSED;
+		} else {
+			typed++; EXPECT_EQ(r->qtype, DNS_T_A); unsigned char ip[4] = {1, 2, 3, 4};
+			dns_add_A(r->response_packet, DNS_RRS_AN, r->domain.c_str(), 60, ip);
+		}
+		return smartdns::SERVER_REQUEST_OK;
+	}));
+	ASSERT_TRUE(server.Start(std::string("bind-https 127.0.0.1:60053 -alpn h2\n") +
+		"bind-cert-file " + HTTP2_TEST_CERT_FILE + "\nbind-cert-key-file " + HTTP2_TEST_KEY_FILE + "\n"
+		"server 127.0.0.1:61053\ncache-size 256\nresolv-hostname no\nlocal-ptr-enable no\n"
+		"speed-check-mode none\ndualstack-ip-selection no\nany-response-mode aggregate\nany-aggregate-types A\n"));
+	HTTP2DoHClient client; ASSERT_TRUE(client.Connect("127.0.0.1", 60053)) << client.LastError();
+	std::vector<HTTP2DoHClient::PendingResponse> pending(2);
+	ASSERT_TRUE(client.StartQuery(BuildDnsQuery("h2-shared-any.test", 0x7401, DNS_T_ANY), &pending[0]));
+	ASSERT_TRUE(client.StartQuery(BuildDnsQuery("h2-shared-any.test", 0x7402, DNS_T_ANY), &pending[1]));
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+	while (!probes && std::chrono::steady_clock::now() < deadline) {
+		ASSERT_TRUE(client.PumpPending(&pending, 10)) << client.LastError(); usleep(1000);
+	}
+	ASSERT_EQ(probes, 1);
+	for (int i = 0; i < 20; i++) { ASSERT_TRUE(client.PumpPending(&pending, 1)); usleep(1000); }
+	ASSERT_FALSE(pending[0].done); ASSERT_FALSE(pending[1].done);
+	client.CancelPending(&pending[0]);
+	deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+	while (!pending[1].done && std::chrono::steady_clock::now() < deadline) {
+		ASSERT_TRUE(client.PumpPending(&pending, 10)) << client.LastError(); usleep(1000);
+	}
+	ASSERT_TRUE(pending[1].done); ASSERT_TRUE(pending[1].ok) << pending[1].error;
+	EXPECT_EQ(pending[1].status, 200);
+	std::string error;
+	EXPECT_TRUE(DnsResponseIsValidForQuery(pending[1].response, 0x7402, "h2-shared-any.test", "1.2.3.4", &error, DNS_T_ANY)) << error;
+	ASSERT_GE(pending[1].response.size(), 12U); EXPECT_EQ(pending[1].response[6], 0); EXPECT_EQ(pending[1].response[7], 1);
+	EXPECT_EQ(probes, 1); EXPECT_EQ(typed, 1);
+	client.ClosePending(&pending);
+}
+
+TEST(AnyOffline, LastHttp2ResetCancelsFallbackButKeepsConnectionUsable)
+{
+	ASSERT_TRUE(EnsureHTTP2TestCert());
+	std::atomic<int> probes{0}, cancelled_children{0}, live{0}, live_children{0}; smartdns::MockServer upstream; smartdns::Server server;
+	ASSERT_TRUE(upstream.Start("udp://127.0.0.1:61053", [&](smartdns::ServerRequestContext *r) {
+		EXPECT_EQ(dns_add_domain(r->response_packet, r->domain.c_str(), r->qtype, r->qclass), 0);
+		if (r->domain == "h2-cancel-any.test") {
+			if (r->qtype == DNS_T_ANY) { probes++; usleep(300000); }
+			else cancelled_children++;
+			r->response_packet->head.rcode = DNS_RC_REFUSED;
+		} else if (r->qtype == DNS_T_ANY) {
+			live++; r->response_packet->head.rcode = DNS_RC_REFUSED;
+		} else {
+			live_children++; EXPECT_EQ(r->qtype, DNS_T_A); unsigned char ip[4] = {5, 6, 7, 8};
+			dns_add_A(r->response_packet, DNS_RRS_AN, r->domain.c_str(), 60, ip);
+		}
+		return smartdns::SERVER_REQUEST_OK;
+	}));
+	ASSERT_TRUE(server.Start(std::string("bind-https 127.0.0.1:60053 -alpn h2\n") +
+		"bind-cert-file " + HTTP2_TEST_CERT_FILE + "\nbind-cert-key-file " + HTTP2_TEST_KEY_FILE + "\n"
+		"server 127.0.0.1:61053\ncache-size 256\nresolv-hostname no\nlocal-ptr-enable no\n"
+		"speed-check-mode none\ndualstack-ip-selection no\nany-response-mode aggregate\nany-aggregate-types A\n"));
+	HTTP2DoHClient client; ASSERT_TRUE(client.Connect("127.0.0.1", 60053)) << client.LastError();
+	std::vector<HTTP2DoHClient::PendingResponse> pending(1);
+	ASSERT_TRUE(client.StartQuery(BuildDnsQuery("h2-cancel-any.test", 0x7411, DNS_T_ANY), &pending[0]));
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+	while (!probes && std::chrono::steady_clock::now() < deadline) {
+		ASSERT_TRUE(client.PumpPending(&pending, 10)) << client.LastError(); usleep(1000);
+	}
+	ASSERT_EQ(probes, 1); ASSERT_FALSE(pending[0].done);
+	client.CancelPending(&pending[0]);
+	deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(700);
+	while (std::chrono::steady_clock::now() < deadline) {
+		ASSERT_TRUE(client.PumpPending(&pending, 10)) << client.LastError(); usleep(1000);
+	}
+	EXPECT_EQ(cancelled_children, 0); EXPECT_EQ(probes, 1);
+	std::vector<uint8_t> response;
+	ASSERT_TRUE(client.Query(BuildDnsQuery("h2-live-any.test", 0x7412, DNS_T_ANY), &response)) << client.LastError();
+	std::string error;
+	EXPECT_TRUE(DnsResponseIsValidForQuery(response, 0x7412, "h2-live-any.test", "5.6.7.8", &error, DNS_T_ANY)) << error;
+	EXPECT_EQ(live, 1); EXPECT_EQ(live_children, 1); EXPECT_EQ(cancelled_children, 0);
+}
+
+
+/* Full coordinator-to-wire regression: downstream ANY cancellation must remove
+ * an upstream body blocked by flow control, while a sibling completes DNS on
+ * the same TLS/H2 connection. Synchronization uses observed frames, not sleeps. */
+TEST(AnyOffline, UpstreamZeroWindowCancelThenUpdatePreservesCompleteSiblingDns)
+{
+	LimitedHTTP2DoHUpstream upstream;
+	upstream.EnableZeroWindow();
+	ASSERT_TRUE(upstream.Start(61053, 16, "5.6.7.8")) << upstream.LastError();
+	smartdns::Server server;
+	ASSERT_TRUE(server.Start(std::string("bind-https 127.0.0.1:60053 -alpn h2\n") +
+		"bind-cert-file " + HTTP2_TEST_CERT_FILE + "\nbind-cert-key-file " + HTTP2_TEST_KEY_FILE + "\n"
+		"server https://127.0.0.1:61053/dns-query -no-check-certificate -alpn h2\n"
+		"cache-size 256\nresolv-hostname no\nlocal-ptr-enable no\nspeed-check-mode none\n"
+		"dualstack-ip-selection no\nany-response-mode passthrough\n"));
+	HTTP2DoHClient client;
+	ASSERT_TRUE(client.Connect("127.0.0.1", 60053)) << client.LastError();
+	// Complete one ordinary request before changing the peer window. Client
+	// request transmission before initial SETTINGS is legal and is not the case
+	// this regression intends to exercise.
+	std::vector<uint8_t> warmup;
+	ASSERT_TRUE(client.Query(BuildDnsQuery("h2-wire-warmup.test", 0x7420, DNS_T_A), &warmup));
+	std::string warmup_error;
+	ASSERT_TRUE(DnsResponseIsValidForQuery(warmup, 0x7420, "h2-wire-warmup.test",
+		"5.6.7.8", &warmup_error)) << warmup_error;
+	ASSERT_EQ(upstream.RequestCount(), 1);
+	std::vector<HTTP2DoHClient::PendingResponse> pending(2);
+	// Require the upstream CANCEL before the existing 500ms attempt timer can
+	// retire it. Then keep the entire sibling exchange below the 2s parent budget.
+	// If scheduling misses either bound this test fails; it never calls that success.
+	auto started = std::chrono::steady_clock::now();
+	auto deadline = started + std::chrono::milliseconds(450);
+	auto pump_until = [&](const std::function<bool()> &done) {
+		while (!done() && std::chrono::steady_clock::now() < deadline) {
+			if (upstream.WireFailed() || !client.PumpPending(&pending, 1)) return false;
+		}
+		return done() && !upstream.WireFailed() && std::chrono::steady_clock::now() < deadline;
+	};
+	upstream.AdvertiseZeroWindow();
+	ASSERT_TRUE(pump_until([&] {
+		auto state = upstream.ObserveWire();
+		return state.zero_settings_sent && state.settings_acks >= 2;
+	}));
+	// Reset the causal clock only before a new ANY operation exists, never while
+	// a request budget or attempt timer is running.
+	started = std::chrono::steady_clock::now();
+	deadline = started + std::chrono::milliseconds(450);
+	ASSERT_TRUE(client.StartQuery(BuildDnsQuery("h2-wire-cancel-any.test", 0x7421, DNS_T_ANY), &pending[0]));
+	ASSERT_TRUE(pump_until([&] { return upstream.ObserveWire().headers.size() == 2; }));
+	auto wire = upstream.ObserveWire();
+	ASSERT_GE(wire.settings_acks, 2u);
+	unsigned canceled = wire.headers[1];
+	ASSERT_EQ(wire.data_bytes[canceled], 0u); ASSERT_EQ(upstream.RequestCount(), 1);
+	ASSERT_FALSE(pending[0].done);
+	ASSERT_TRUE(client.StartQuery(BuildDnsQuery("h2-wire-live-any.test", 0x7422, DNS_T_ANY), &pending[1]));
+	client.CancelPending(&pending[0]); // actual downstream RST_STREAM, not budget API
+	ASSERT_TRUE(pump_until([&] { return upstream.ObserveWire().resets.count(canceled) != 0; }));
+	deadline = started + std::chrono::milliseconds(1500);
+	// A late WINDOW_UPDATE after the cancellation has crossed the real wire.
+	upstream.ReleaseWindow(canceled);
+	ASSERT_TRUE(pump_until([&] {
+		auto state = upstream.ObserveWire();
+		return state.updates_sent.count(canceled) && state.headers.size() == 3;
+	}));
+	wire = upstream.ObserveWire();
+	ASSERT_EQ(wire.reset_codes[canceled], 8u); // CANCEL observed on upstream wire
+	unsigned sibling = wire.headers[2]; ASSERT_GT(sibling, canceled);
+	ASSERT_EQ(wire.data_bytes[canceled], 0u); ASSERT_EQ(wire.data_bytes[sibling], 0u);
+	ASSERT_FALSE(pending[1].done);
+	upstream.ReleaseWindow(sibling);
+	ASSERT_TRUE(pump_until([&] { return pending[1].done; }));
+	ASSERT_TRUE(pending[1].ok) << pending[1].error; ASSERT_EQ(pending[1].status, 200);
+	std::string error;
+	EXPECT_TRUE(DnsResponseIsValidForQuery(pending[1].response, 0x7422,
+		"h2-wire-live-any.test", "5.6.7.8", &error, DNS_T_ANY)) << error;
+	ASSERT_GE(pending[1].response.size(), 12u);
+	EXPECT_EQ(pending[1].response[6], 0); EXPECT_EQ(pending[1].response[7], 1);
+	wire = upstream.ObserveWire();
+	EXPECT_EQ(wire.data_bytes[canceled], 0u); EXPECT_GT(wire.data_bytes[sibling], 12u);
+	EXPECT_EQ(wire.headers.size(), 3u); EXPECT_EQ(upstream.RequestCount(), 2);
+	EXPECT_EQ(upstream.ConnectionCount(), 1u); EXPECT_FALSE(upstream.WireFailed());
+	client.ClosePending(&pending);
+}
+
+
+TEST(HTTP2, ScopedTlsIoPreservesBrokenPipeErrorAndSignalMask)
+{
+	int sockets[2];
+	ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+	close(sockets[1]);
+	sigset_t before, after;
+	struct sigaction action_before{}, action_after{};
+	ASSERT_EQ(pthread_sigmask(SIG_SETMASK, nullptr, &before), 0);
+	ASSERT_EQ(sigaction(SIGPIPE, nullptr, &action_before), 0);
+	const char byte = 'x';
+	errno = 0;
+	int result = TlsIoWithoutSigpipe([&] { return static_cast<int>(write(sockets[0], &byte, 1)); });
+	int error = errno;
+	close(sockets[0]);
+	EXPECT_EQ(result, -1); EXPECT_EQ(error, EPIPE);
+	ASSERT_EQ(pthread_sigmask(SIG_SETMASK, nullptr, &after), 0);
+	ASSERT_EQ(sigaction(SIGPIPE, nullptr, &action_after), 0);
+	EXPECT_EQ(sigismember(&before, SIGPIPE), sigismember(&after, SIGPIPE));
+	EXPECT_EQ(action_before.sa_handler, action_after.sa_handler);
+}
+
+/* Isolate expected SIGPIPE delivery so a regression is observable as child
+ * status, without changing the test runner's process-wide disposition. */
+TEST(HTTP2, ScopedTlsIoPreservesUnrelatedAndCallerOwnedSignals)
+{
+	for (int scenario = 0; scenario < 4; ++scenario) {
+		pid_t child = fork();
+		ASSERT_GE(child, 0);
+		if (child == 0) {
+			sigset_t pipes, pending, after;
+			sigemptyset(&pipes); sigaddset(&pipes, SIGPIPE);
+			struct sigaction action{};
+			action.sa_handler = SIG_DFL;
+			sigemptyset(&action.sa_mask);
+			if (sigaction(SIGPIPE, &action, nullptr) != 0) _exit(10);
+			bool caller_blocked = scenario < 2;
+			if (pthread_sigmask(caller_blocked ? SIG_BLOCK : SIG_UNBLOCK, &pipes, nullptr) != 0) _exit(11);
+			if (scenario == 0 && raise(SIGPIPE) != 0) _exit(12);
+			int result = TlsIoWithoutSigpipe([&] {
+				if (scenario != 0 && raise(SIGPIPE) != 0) _exit(13);
+				errno = scenario == 2 ? EAGAIN : EPIPE;
+				return scenario == 3 ? 1 : -1;
+			});
+			int saved = errno;
+			/* Unblocked cases must deliver the unrelated signal when the
+			 * wrapper restores the original mask, before reaching here. */
+			if (!caller_blocked) _exit(14);
+			if (result != -1 || saved != EPIPE) _exit(15);
+			if (sigpending(&pending) != 0 || sigismember(&pending, SIGPIPE) != 1) _exit(16);
+			if (pthread_sigmask(SIG_SETMASK, nullptr, &after) != 0 || sigismember(&after, SIGPIPE) != 1) _exit(17);
+			_exit(0);
+		}
+		int status = 0;
+		pid_t reaped;
+		do { reaped = waitpid(child, &status, 0); } while (reaped < 0 && errno == EINTR);
+		ASSERT_EQ(reaped, child);
+		if (scenario < 2) {
+			ASSERT_TRUE(WIFEXITED(status)) << "scenario=" << scenario << " status=" << status;
+			EXPECT_EQ(WEXITSTATUS(status), 0) << "scenario=" << scenario;
+		} else {
+			ASSERT_TRUE(WIFSIGNALED(status)) << "scenario=" << scenario << " status=" << status;
+			EXPECT_EQ(WTERMSIG(status), SIGPIPE) << "scenario=" << scenario;
+		}
+	}
 }

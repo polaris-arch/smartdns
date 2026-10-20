@@ -18,7 +18,10 @@
 
 #define _GNU_SOURCE
 
+#define _GNU_SOURCE
 #include "smartdns/http_parse.h"
+#include "query.h"
+#include "upstream_policy.h"
 #include "smartdns/lib/stringutil.h"
 #include "smartdns/util.h"
 
@@ -150,6 +153,61 @@ errout:
 	return -1;
 }
 
+/* Consume exactly one HTTP/1 FIFO owner, including canceled tombstones. */
+static int _dns_client_http1_response(struct dns_server_info *server, struct http_head *head)
+{
+    int code = http_head_get_httpcode(head);
+    if (code >= 100 && code < 200) return code == 101 ? -1 : 0;
+    if (code == 429 || code == 503)
+        _dns_policy_http_error(server, code, http_head_get_fields_value(head, "retry-after"));
+    else if (code != 200)
+        server->prohibit = 1; /* retain the other-status policy used by H2/H3 */
+    struct dns_query_struct *query = NULL;
+    struct dns_conn_stream *stream = NULL;
+    pthread_mutex_lock(&server->lock);
+    if (!list_empty(&server->conn_stream_list))
+        stream = list_first_entry(&server->conn_stream_list, struct dns_conn_stream, server_list);
+    if (!stream || !stream->http1_sent) {
+        pthread_mutex_unlock(&server->lock);
+        return -1;
+    }
+    query = stream->query;
+    if (query) {
+        _dns_client_query_get(query);
+        pthread_mutex_lock(&query->lock);
+        list_del_init(&stream->query_list);
+        stream->query = NULL;
+        pthread_mutex_unlock(&query->lock);
+        _dns_client_conn_stream_put(stream);
+    }
+    unsigned int generation = stream->attempt_generation;
+    list_del_init(&stream->server_list);
+    stream->server_info = NULL;
+    _dns_client_conn_stream_put(stream);
+    pthread_mutex_unlock(&server->lock);
+    int ret = 0;
+    if (query) {
+        if (code != 200) {
+            _dns_attempt_retire(query, server, generation);
+            _dns_client_retry_dns_query(query);
+        } else if (!query->terminal) {
+            const unsigned char *data = http_head_get_data(head);
+            int len = http_head_get_data_len(head);
+            unsigned short id = 0;
+            if (len >= 2) memcpy(&id, data, 2);
+            if (len < 12 || ntohs(id) != query->sid ||
+                _dns_http_age((unsigned char *)data, len, http_head_get_fields_value(head, "age")) < 0) ret = -1;
+            else ret = _dns_client_recv(server, (unsigned char *)data, len, &server->addr, server->ai_addrlen);
+        }
+        _dns_client_query_release(query);
+    }
+    const char *connection = http_head_get_fields_value(head, "connection");
+    if (connection && strcasestr(connection, "close")) return -1;
+    /* Response completion wakes the next FIFO item even without EPOLLOUT. */
+    if (!ret) ret = _dns_client_process_stream_writes(server);
+    return ret;
+}
+
 static int _dns_client_process_tcp_buff(struct dns_server_info *server_info)
 {
 	int len = 0;
@@ -166,7 +224,12 @@ static int _dns_client_process_tcp_buff(struct dns_server_info *server_info)
 			}
 
 			len = http_head_parse(http_head, server_info->recv_buff.data, server_info->recv_buff.len);
-			if (len < 0) {
+            if (len < 0) {
+                if (len != -1) {
+                    int code = http_head_get_httpcode(http_head);
+                    if (code == 429 || code == 503)
+                        _dns_policy_http_error(server_info, code, http_head_get_fields_value(http_head, "retry-after"));
+                }
 				if (len == -1) {
 					ret = 0;
 					goto out;
@@ -181,16 +244,8 @@ static int _dns_client_process_tcp_buff(struct dns_server_info *server_info)
 				goto out;
 			}
 
-			if (http_head_get_httpcode(http_head) != 200) {
-				tlog(TLOG_WARN, "http server query from %s:%d failed, server return http code : %d, %s",
-					 server_info->ip, server_info->port, http_head_get_httpcode(http_head),
-					 http_head_get_httpcode_msg(http_head));
-				server_info->prohibit = 1;
-				goto out;
-			}
-
-			dns_packet_len = http_head_get_data_len(http_head);
-			inpacket_data = (unsigned char *)http_head_get_data(http_head);
+            if (_dns_client_http1_response(server_info, http_head) != 0) goto out;
+            goto consumed_response;
 		} else {
 			/* tcp result format
 			 * | len (short) | dns query result |
@@ -226,6 +281,7 @@ static int _dns_client_process_tcp_buff(struct dns_server_info *server_info)
 			goto out;
 		}
 
+consumed_response:
 		if (http_head) {
 			http_head_destroy(http_head);
 			http_head = NULL;
@@ -253,66 +309,104 @@ out:
 	return ret;
 }
 
-static int _dns_client_process_https_streams(struct dns_server_info *server_info)
+static void _dns_client_sent_stream_detach(struct dns_conn_stream *stream)
 {
-	struct dns_conn_stream *stream, *tmp;
-	int ret = 0;
-
-	/* If negotiated HTTP/2, skip HTTP/1.1 processing */
-	if (server_info->alpn_selected[0] != '\0' && strncmp(server_info->alpn_selected, "h2", 2) == 0) {
-		return 0;
-	}
-
-	pthread_mutex_lock(&server_info->lock);
-	list_for_each_entry_safe(stream, tmp, &server_info->conn_stream_list, server_list)
-	{
-		if (stream->send_buff.len == 0) {
-			continue;
-		}
-		/* Format raw DNS data to HTTP/1.1 */
-		unsigned char http_packet[DNS_IN_PACKSIZE];
-		int http_len = _dns_client_format_https_packet(server_info, stream->send_buff.data, stream->send_buff.len,
-													   http_packet, sizeof(http_packet));
-		if (http_len < 0) {
-			goto errout;
-		}
-		/* Send the formatted packet */
-		int send_len;
-		if (server_info->ssl) {
-			send_len = _dns_client_socket_ssl_send(server_info, http_packet, http_len);
-		} else {
-			send_len = send(server_info->fd, http_packet, http_len, MSG_NOSIGNAL);
-		}
-		if (send_len < 0) {
-			if (errno == EAGAIN) {
-				/* Buffer the formatted data */
-				if (_dns_client_send_data_to_buffer(server_info, http_packet, http_len) != 0) {
-					goto errout;
-				}
-				goto out;
-			}
-			goto errout;
-		}
-		if (send_len < http_len) {
-			/* Buffer remaining */
-			if (_dns_client_send_data_to_buffer(server_info, http_packet + send_len, http_len - send_len) != 0) {
-				goto errout;
-			}
-			goto out;
-		}
-		/* Clear stream buffer after sending */
-		stream->send_buff.len = 0;
-		/* Remove from list and release */
-		list_del_init(&stream->server_list);
-		_dns_client_conn_stream_put(stream);
-	}
-out:
-	pthread_mutex_unlock(&server_info->lock);
-	return ret;
-errout:
-	ret = -1;
-	goto out;
+    _dns_client_conn_stream_get(stream);
+    if (stream->query) {
+        pthread_mutex_lock(&stream->query->lock);
+        list_del_init(&stream->query_list);
+        pthread_mutex_unlock(&stream->query->lock);
+        stream->query = NULL;
+        _dns_client_conn_stream_put(stream);
+    }
+    list_del_init(&stream->server_list);
+    stream->server_info = NULL;
+    _dns_client_conn_stream_put(stream);
+    _dns_client_conn_stream_put(stream);
 }
+
+int _dns_client_process_stream_writes(struct dns_server_info *server)
+{
+    if (server->status != DNS_SERVER_STATUS_CONNECTED ||
+        (server->type == DNS_SERVER_HTTPS && !strncmp(server->alpn_selected, "h2", 2))) return 0;
+    int ret = 0;
+    pthread_mutex_lock(&server->lock);
+    struct dns_conn_stream *stream, *next;
+    list_for_each_entry_safe(stream, next, &server->conn_stream_list, server_list) {
+        if (stream->http1_sent) break;
+        struct dns_query_struct *q = stream->query;
+        if (!q || q->terminal || !dns_query_budget_remaining_ms(q->budget)) {
+            /* A failed SSL write can be uncertain. Do not reuse its byte stream. */
+            if (stream->write_attempted) { ret = -1; break; }
+            if (q) _dns_attempt_retire(q, server, stream->attempt_generation);
+            _dns_client_sent_stream_detach(stream);
+            continue;
+        }
+        if (!stream->send_formatted) {
+            unsigned char framed[DNS_IN_PACKSIZE];
+            int len = _dns_client_format_https_packet(server, stream->send_buff.data,
+                       stream->send_buff.len, framed, sizeof(framed));
+            if (len < 0) { ret = -1; break; }
+            memcpy(stream->send_buff.data, framed, len);
+            stream->send_buff.len = len;
+            stream->send_formatted = 1;
+        }
+        int admission = _dns_attempt_wire_begin(q, server, stream->attempt_generation);
+        if (admission == DNS_ADMIT_DONE) {
+            if (stream->write_attempted) { ret = -1; break; }
+            _dns_attempt_retire(q, server, stream->attempt_generation);
+            _dns_client_sent_stream_detach(stream);
+            continue;
+        }
+        if (admission != DNS_ADMIT_OK) break;
+        stream->write_attempted = 1;
+        int sent = server->ssl ? _dns_client_socket_ssl_send(server,
+                   stream->send_buff.data + stream->send_offset, stream->send_buff.len - stream->send_offset) :
+                   send(server->fd, stream->send_buff.data + stream->send_offset,
+                        stream->send_buff.len - stream->send_offset, MSG_NOSIGNAL);
+        if (sent <= 0) {
+            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            ret = -1; break;
+        }
+        _dns_attempt_mark_sent(q, server, stream->attempt_generation);
+        stream->send_offset += sent;
+        if (stream->send_offset < stream->send_buff.len) break;
+        if (server->type == DNS_SERVER_HTTPS) {
+            stream->http1_sent = 1;
+            stream->send_buff.len = 0;
+            break;
+        }
+        _dns_client_sent_stream_detach(stream); /* TCP/DoT reply uses DNS ID */
+    }
+    pthread_mutex_unlock(&server->lock);
+    return ret;
+}
+
+int _dns_client_send_framed(struct dns_server_info *server, struct dns_query_struct *q,
+                           void *packet, unsigned short len)
+{
+    if (!len || len > DNS_IN_PACKSIZE - 2) return -1;
+    struct dns_conn_stream *stream = _dns_client_conn_stream_new_write();
+    if (!stream) return -1;
+    unsigned short length = htons(len);
+    memcpy(stream->send_buff.data, &length, 2);
+    memcpy(stream->send_buff.data + 2, packet, len);
+    stream->send_buff.len = len + 2;
+    stream->send_formatted = 1;
+    stream->attempt_generation = _dns_attempt_generation(q, server);
+    stream->type = server->type;
+    pthread_mutex_lock(&server->lock);
+    pthread_mutex_lock(&q->lock);
+    stream->server_info = server; stream->query = q;
+    list_add_tail(&stream->server_list, &server->conn_stream_list);
+    _dns_client_conn_stream_get(stream);
+    list_add_tail(&stream->query_list, &q->conn_stream_list);
+    pthread_mutex_unlock(&q->lock);
+    pthread_mutex_unlock(&server->lock);
+    _dns_attempt_mark_buffered(q, server);
+    return _dns_client_process_stream_writes(server);
+}
+
 int _dns_client_process_tcp(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now)
 {
 	int len = 0;
@@ -401,8 +495,9 @@ int _dns_client_process_tcp(struct dns_server_info *server_info, struct epoll_ev
 		}
 
 		/* Process HTTPS streams if any */
-		if (server_info->type == DNS_SERVER_HTTPS && server_info->send_buff.len == 0) {
-			if (_dns_client_process_https_streams(server_info) != 0) {
+		if ((server_info->type == DNS_SERVER_HTTPS || server_info->type == DNS_SERVER_TLS ||
+             server_info->type == DNS_SERVER_TCP) && server_info->send_buff.len == 0) {
+			if (_dns_client_process_stream_writes(server_info) != 0) {
 				goto errout;
 			}
 		}

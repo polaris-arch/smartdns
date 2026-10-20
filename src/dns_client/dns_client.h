@@ -69,8 +69,16 @@ typedef enum dns_server_status {
 	DNS_SERVER_STATUS_DISCONNECTED,
 } dns_server_status;
 
+struct dns_upstream_policy;
+struct dns_query_attempt;
+
 /* dns server information */
+struct dns_http3_control;
 struct dns_server_info {
+	struct dns_http3_control *http3_control;
+	struct dns_conn_stream *http2_write_owner;
+    int http2_policy_blocked;
+	unsigned long http3_control_epoch;
 	atomic_t refcnt;
 	struct list_head list;
 	struct list_head check_list;
@@ -110,6 +118,8 @@ struct dns_server_info {
 	time_t last_recv;
 	unsigned long send_tick;
 	int prohibit;
+	struct dns_upstream_policy *policy;
+	unsigned int active_attempts;
 	atomic_t is_alive;
 	int is_already_prohibit;
 
@@ -234,17 +244,25 @@ struct dns_query_replied {
 	struct dns_server_info *server;
 };
 
+/* Request bytes are bounded by DNS_IN_PACKSIZE on every stream transport.
+ * Receive storage is separate so TCP/DoT write owners do not allocate 32 KiB. */
+struct dns_stream_send_buff { unsigned char data[DNS_IN_PACKSIZE]; int len; };
+struct dns_stream_recv_buff { unsigned char *data; int len; };
 struct dns_conn_stream {
 	atomic_t refcnt;
 	struct list_head query_list;
 	struct list_head server_list;
-	struct dns_server_buff send_buff;
-	struct dns_server_buff recv_buff;
+	struct dns_stream_send_buff send_buff;
+	struct dns_stream_recv_buff recv_buff;
 
 	struct dns_query_struct *query;
 	struct dns_server_info *server_info;
 
 	int recv_done;
+	int http1_sent;
+	int send_formatted, send_offset, write_attempted;
+	int http3_started;
+	unsigned int attempt_generation;
 	SSL *quic_stream;
 	struct http2_stream *http2_stream;
 	dns_server_type_t type;
@@ -277,6 +295,14 @@ struct dns_query_struct {
 	/* caller notification */
 	dns_client_callback callback;
 	void *user_ptr;
+
+	struct dns_query_budget *budget;
+	struct dns_query_attempt *attempts;
+	unsigned long created_tick;
+	unsigned long next_send_tick;
+	int terminal;
+	int single_upstream;
+	int checking_disabled;
 
 	/* retry count */
 	atomic_t retry_count;

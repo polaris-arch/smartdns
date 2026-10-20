@@ -22,6 +22,7 @@
 #include "smartdns/dns.h"
 #include "smartdns/fast_ping.h"
 #include "include/utils.h"
+#include <atomic>
 #include <functional>
 #include <string>
 #include <sys/socket.h>
@@ -57,6 +58,8 @@ class Server
 	bool Start(const std::string &conf, enum CONF_TYPE type = CONF_TYPE_STRING);
 	void Stop(bool graceful = true);
 	bool IsRunning();
+	// Private test.bin subprocess entry, before GoogleTest initialization.
+	static int RunFixtureChild(int argc, char **argv);
 
   private:
 	static void StartPost(void *arg);
@@ -113,7 +116,7 @@ class MockServer
 						struct sockaddr_storage *addr, socklen_t *addrlen);
 	int fd_{0};
 	std::thread thread_;
-	bool run_{false};
+	std::atomic<bool> run_{false};
 	ServerRequest callback_{nullptr};
 };
 

@@ -1,3 +1,5 @@
+#include "upstream_policy.h"
+#include "client_http3_control.h"
 /*************************************************************************
  *
  * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
@@ -103,12 +105,19 @@ void _dns_client_close_socket_ext(struct dns_server_info *server_info, int no_de
 		pthread_mutex_unlock(&server_info->lock);
 		return;
 	}
+    /* A disconnected transport never replays old buffered DNS requests for free. */
+    no_del_conn_list = 0;
+    server_info->send_buff.len = 0;
+    server_info->recv_buff.len = 0;
+    server_info->http2_policy_blocked = 0;
 	server_status = server_info->status;
 	server_info->status = DNS_SERVER_STATUS_DISCONNECTED;
 
 	if (server_info->ssl) {
+        int protocol_shutdown = _dns_http3_control_shutdown(server_info);
+        _dns_http3_control_free(server_info);
 		/* Shutdown ssl */
-		if (server_status == DNS_SERVER_STATUS_CONNECTED) {
+		if (server_status == DNS_SERVER_STATUS_CONNECTED && !protocol_shutdown) {
 			_ssl_shutdown(server_info);
 		}
 
@@ -126,6 +135,8 @@ void _dns_client_close_socket_ext(struct dns_server_info *server_info, int no_de
 					conn_stream->quic_stream = NULL;
 				}
 
+                if (conn_stream->query)
+                    _dns_attempt_retire(conn_stream->query, server_info, conn_stream->attempt_generation);
 				if (no_del_conn_list == 1) {
 					continue;
 				}
@@ -140,8 +151,10 @@ void _dns_client_close_socket_ext(struct dns_server_info *server_info, int no_de
 
 			list_for_each_entry_safe(conn_stream, tmp, &server_info->conn_stream_list, server_list)
 			{
+                if (conn_stream->query)
+                    _dns_attempt_retire(conn_stream->query, server_info, conn_stream->attempt_generation);
 				if (conn_stream->http2_stream) {
-					http2_stream_close(conn_stream->http2_stream);
+					http2_stream_abort(conn_stream->http2_stream);
 					conn_stream->http2_stream = NULL;
 				}
 
@@ -160,6 +173,17 @@ void _dns_client_close_socket_ext(struct dns_server_info *server_info, int no_de
 		server_info->ssl_write_len = -1;
 	}
 
+    struct dns_conn_stream *pending, *pending_next;
+    list_for_each_entry_safe(pending, pending_next, &server_info->conn_stream_list, server_list) {
+        if (pending->query) _dns_attempt_retire(pending->query, server_info, pending->attempt_generation);
+        list_del_init(&pending->server_list); pending->server_info = NULL;
+        _dns_client_conn_stream_put(pending);
+    }
+    if (server_info->http2_write_owner) {
+        struct dns_conn_stream *owner = server_info->http2_write_owner;
+        server_info->http2_write_owner = NULL;
+        _dns_client_conn_stream_put(owner);
+    }
 	/* Clean up HTTP/2 context (connection-level) */
 	if (server_info->http2_ctx) {
 		http2_ctx_put(server_info->http2_ctx);

@@ -241,6 +241,10 @@ static int _smartdns_prepare_server_flags(struct client_dns_server_flags *flags,
 	flags->set_mark = server->set_mark;
 	flags->drop_packet_latency_ms = server->drop_packet_latency_ms;
 	flags->tcp_keepalive = server->tcp_keepalive;
+	flags->max_query_rate = server->max_query_rate;
+	flags->query_burst = server->query_burst;
+	flags->max_concurrent_queries = server->max_concurrent_queries;
+	safe_strncpy(flags->quota_group, server->quota_group, sizeof(flags->quota_group));
 	flags->subnet_all_query_types = server->subnet_all_query_types;
 	flags->fallback = server->fallback;
 	safe_strncpy(flags->proxyname, server->proxyname, sizeof(flags->proxyname));
@@ -1097,13 +1101,14 @@ int smartdns_reg_post_func(smartdns_post_func func, void *arg)
 static void smartdns_test_notify_func(int fd_notify, uint64_t retval)
 {
 	int unused __attribute__((unused));
-	/* notify parent kickoff */
+	/* Ready includes fixture setup. Failed initialization must not invoke a
+	 * hook that requires initialized server/ping state. */
+	if (retval == 1 && _smartdns_post != NULL) {
+		_smartdns_post(_smartdns_post_arg);
+	}
+	/* notify parent kickoff only after the successful post hook completes */
 	if (fd_notify > 0) {
 		unused = write(fd_notify, &retval, sizeof(retval));
-	}
-
-	if (_smartdns_post != NULL) {
-		_smartdns_post(_smartdns_post_arg);
 	}
 }
 

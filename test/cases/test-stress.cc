@@ -11,6 +11,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <cstring>
+#include <poll.h>
+#include <cerrno>
 
 // Helper function to get environment variable with default value
 int get_env_int(const char* name, int default_value) {
@@ -83,7 +85,20 @@ bool udp_dns_query(const std::string& domain, int port) {
     // Receive response
     unsigned char response[512];
     socklen_t addr_len = sizeof(addr);
-    int recv_len = recvfrom(sock, response, sizeof(response), 0, (struct sockaddr*)&addr, &addr_len);
+    // A dead resolver must fail the case rather than leave all joins blocked.
+    // Use the same five-second query bound as the existing H2 UDP stress client.
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    int available = 0;
+    do {
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) break;
+        pollfd pfd{sock, POLLIN, 0};
+        available = poll(&pfd, 1, static_cast<int>(remaining));
+    } while (available < 0 && errno == EINTR);
+    int recv_len = available > 0 ? recvfrom(sock, response, sizeof(response), MSG_DONTWAIT,
+        (struct sockaddr*)&addr, &addr_len) : -1;
+    if (recv_len < 0) std::cerr << "stress DNS response failed: domain=" << domain
+        << " port=" << port << " poll=" << available << " errno=" << errno << std::endl;
     close(sock);
 
     if (recv_len < 12) return false;
@@ -155,11 +170,12 @@ TEST_P(Stress, Query) {
     smartdns::Server main_server;
 
     // Start upstream server (second layer) that returns fixed IP and mocks ping
-    upstream_server.Start(config.upstream_bind_config + R"""(
+    ASSERT_TRUE(upstream_server.Start(config.upstream_bind_config + R"""(
 address /test.com/192.168.1.100
 address /example.com/192.168.1.101
 address /domain.com/192.168.1.102
-)""");
+server 127.0.0.1:9
+)"""));
 
     // Mock ping responses for the IPs
     main_server.MockPing(PING_TYPE_ICMP, "192.168.1.100", 60, 10);
@@ -167,10 +183,10 @@ address /domain.com/192.168.1.102
     main_server.MockPing(PING_TYPE_ICMP, "192.168.1.102", 60, 20);
 
     // Start main server that forwards to upstream via specified protocol
-    main_server.Start(config.bind_config + "\n" + config.server_config + R"""(
+    ASSERT_TRUE(main_server.Start(config.bind_config + "\n" + config.server_config + R"""(
 cache-size 0
 speed-check-mode ping
-)""");
+)"""));
 
     // Wait for servers to be ready
     std::this_thread::sleep_for(std::chrono::milliseconds(500));

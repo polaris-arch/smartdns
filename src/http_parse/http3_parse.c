@@ -410,6 +410,7 @@ static int http3_build_body_payload(const uint8_t *body, int body_len, uint8_t *
 
 static int _quicvarint_decode(const uint8_t *buffer, int buffer_len, uint64_t *value)
 {
+    if (buffer_len <= 0) return -1;
 	if ((buffer[0] & 0xC0) == 0x00) {
 		if (buffer_len < 1) {
 			return -1;
@@ -467,6 +468,7 @@ static int _quic_read_varint(const uint8_t *buffer, int buffer_len, uint64_t *va
 
 	while (p < buffer + buffer_len) {
 		uint8_t b = *p;
+        if ((uint64_t)(b & 127) > (UINT64_MAX - i) >> m) return -2;
 		i += (uint64_t)(b & 127) << m;
 		if ((b & 128) == 0) {
 			*value = i;
@@ -528,8 +530,8 @@ static int _http3_parse_headers_payload(struct http_head *http_head, const uint8
 {
 	int offset = 0;
 	int offset_ret = 0;
-	int insert_count = 0;
-	int delta_base = 0;
+	uint64_t insert_count = 0;
+	uint64_t delta_base = 0;
 	struct qpack_header_field *header = NULL;
 	const char *name = NULL;
 	const char *value = NULL;
@@ -543,14 +545,17 @@ static int _http3_parse_headers_payload(struct http_head *http_head, const uint8
 		return -1;
 	}
 
-	insert_count = data[0];
-	delta_base = data[1];
-
-	if (insert_count != 0 || delta_base != 0) {
-		return -2;
-	}
-
-	offset += 2;
+    offset_ret = _quic_read_varint(data, data_len, &insert_count, 8);
+    if (offset_ret < 0) return offset_ret;
+    offset = offset_ret;
+    if (offset >= data_len) return -1;
+    int negative_base = data[offset] & 0x80;
+    offset_ret = _quic_read_varint(data + offset, data_len - offset, &delta_base, 7);
+    if (offset_ret < 0) return offset_ret;
+    offset += offset_ret;
+    /* Zero dynamic capacity requires RIC=0, but a positive static-only Base
+     * is legal and irrelevant. A signed Base would underflow RIC=0. */
+    if (insert_count != 0 || negative_base) return -2;
 
 	while (offset < data_len) {
 		index = -1;
@@ -709,6 +714,8 @@ static int _http_head_setup_http3_0_httpcode(struct http_head *http_head)
 
 	http_head->head_type = HTTP_HEAD_RESPONSE;
 
+    if (strlen(status) != 3 || status[0] < '1' || status[0] > '9' ||
+        status[1] < '0' || status[1] > '9' || status[2] < '0' || status[2] > '9') return -1;
 	status_code = atoi(status);
 	if (status_code < 100 || status_code > 999) {
 		return -1;
@@ -748,6 +755,9 @@ int http_head_parse_http3_0(struct http_head *http_head, const uint8_t *data, in
 			return -3;
 		}
 
+        if (frame_type == 2 || frame_type == 3 || frame_type == 4 || frame_type == 6 ||
+            frame_type == 7 || frame_type == 8 || frame_type == 9 || frame_type == 13) return HTTP3_PARSE_FRAME_UNEXPECTED;
+        if (frame_type == 5) return HTTP3_PARSE_PUSH_FORBIDDEN;
 		if ((uint64_t)(data_len - offset) < frame_len) {
 			return -1;
 		}
@@ -755,13 +765,13 @@ int http_head_parse_http3_0(struct http_head *http_head, const uint8_t *data, in
 		if (frame_type == HTTP3_HEADER_FRAME) {
 			int header_len = 0;
 			header_len = _http3_parse_headers_payload(http_head, data + offset, frame_len);
-			if (header_len < 0) {
-				return header_len;
-			}
+            if (header_len < 0) return header_len == -3 ? -3 : HTTP3_PARSE_QPACK_ERROR;
 
-			if (_http_head_setup_http3_0_httpcode(http_head) != 0) {
-				return -1;
-			}
+            if (_http_head_setup_http3_0_httpcode(http_head) != 0) return -2;
+            if (http_head->code >= 100 && http_head->code < 200) {
+                if (http_head->code == 101) return -2;
+                return offset + (int)frame_len; /* caller consumes interim section separately */
+            }
 
 			if (_http3_get_expected_data_len(http_head, &expect_data_len) != 0) {
 				return -2;
