@@ -7,8 +7,6 @@ env:
 on:
   release:
     types: [published]
-  schedule:
-    - cron: '0 18 * * *' # Daily at 18:00 UTC (02:00 AM Beijing Time)
   workflow_dispatch:
     inputs:
       target:
@@ -427,13 +425,23 @@ jobs:
           ls -la release-assets/
           echo "==========================================="
 
+      - name: Preserve verified release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartdns-polaris-${{ github.sha }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
       # 10. Upload all packages and binaries individually to the GitHub Release (only on release event)
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v3
         if: github.event_name == 'release' || inputs.release_tag != ''
         with:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
-          target_commitish: ${{ github.sha }}
+          # Stable tags already exist and are verified above. GitHub compares this
+          # metadata target's workflows to the default branch for token permissions.
+          target_commitish: ${{ github.event.repository.default_branch }}
           name: ${{ inputs.release_tag || github.ref_name }}
           body: |
             Polaris SmartDNS, built from `${{ github.sha }}` on `${{ github.ref_name }}`.
