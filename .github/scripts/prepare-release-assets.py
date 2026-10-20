@@ -19,7 +19,8 @@ import unittest
 
 ARCHITECTURES = ("mips", "mipsel", "arm", "aarch64", "x86_64", "x86")
 EXTENSIONS = (".tar.gz", ".ipk", ".apk", ".deb")
-NIGHTLY_TAG = "nightly-polaris"
+# Polaris changes the release display name, not the upstream nightly tag.
+NIGHTLY_TAG = "nightly"
 
 
 def gh_api(endpoint, method="GET", missing_ok=False, runner=subprocess.run):
@@ -53,7 +54,7 @@ def repo_endpoint(repository):
 
 
 def clean_nightly(repository, api=gh_api):
-    """Refresh only the Polaris nightly, failing closed on any uncertain write."""
+    """Refresh only tag nightly, failing closed on any uncertain write."""
     base = repo_endpoint(repository)
     release = api(f"{base}/releases/tags/{NIGHTLY_TAG}", missing_ok=True)
     if release is not None:
@@ -279,6 +280,7 @@ class ContractTests(unittest.TestCase):
                 stdout="", returncode=1))
 
     def test_nightly_cleanup_is_scoped_and_handles_absence(self):
+        self.assertEqual(NIGHTLY_TAG, "nightly")
         for existing_release, existing_tag in ((True, True), (False, True), (False, False)):
             with self.subTest(release=existing_release, tag=existing_tag):
                 calls = []
@@ -303,7 +305,11 @@ class ContractTests(unittest.TestCase):
                 self.assertFalse(tag_exists)
                 self.assertEqual(sum(method == "DELETE" for _, method in calls),
                                  int(existing_release) + int(existing_tag))
-                self.assertTrue(all(not endpoint.endswith("/nightly") for endpoint, _ in calls))
+                self.assertTrue(all(not endpoint.endswith("/nightly-polaris") for endpoint, _ in calls))
+                tag_deletes = [endpoint for endpoint, method in calls
+                               if method == "DELETE" and "/git/refs/" in endpoint]
+                self.assertEqual(tag_deletes, ["repos/owner/repo/git/refs/tags/nightly"]
+                                 if existing_tag else [])
 
     def test_nightly_cleanup_stops_at_delete_failure(self):
         calls = []
@@ -317,6 +323,22 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             clean_nightly("owner/repo", api=api)
         self.assertEqual(len(calls), 2)  # No retry or tag modification after failure.
+
+    def test_nightly_cleanup_rejects_other_release_or_tag_identity(self):
+        for wrong_identity in ("release", "tag"):
+            with self.subTest(identity=wrong_identity):
+                calls = []
+
+                def api(endpoint, method="GET", missing_ok=False):
+                    calls.append((endpoint, method))
+                    if "/releases/" in endpoint:
+                        return ({"id": 12, "tag_name": "nightly-polaris"}
+                                if wrong_identity == "release" else None)
+                    return {"ref": "refs/tags/nightly-polaris"}
+
+                with self.assertRaises(ValueError):
+                    clean_nightly("owner/repo", api=api)
+                self.assertFalse(any(method == "DELETE" for _, method in calls))
 
     def test_nightly_cleanup_rejects_tag_that_remains(self):
         def api(endpoint, method="GET", missing_ok=False):

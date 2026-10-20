@@ -29,9 +29,10 @@ Ordinary C/C++ CI builds and tests; it does not publish packages. Run
 **Build and Release Artifacts** (`release.yml`) to run the full validation gate,
 build packages and retain an Actions artifact before publishing:
 
-- `target: all` (default), `release_tag: ''`: refresh **`nightly-polaris`** as a
-  prerelease pinned to the exact built commit. This never touches upstream-style
-  `nightly`. There is no added push or schedule trigger.
+- `target: all` (default), `release_tag: ''`: refresh the prerelease with display
+  name **`nightly-polaris`**, keeping the upstream tag name **`nightly`** and
+  pinning it to the exact built commit. No `nightly-polaris` tag is created or
+  modified. There is no added push or schedule trigger.
 - `target: all`, `release_tag: ReleaseN[.N...]-polaris`: publish an already-created
   normal stable tag at the exact workflow commit. Both manual and release-event
   paths validate its name and commit. A version is never guessed from whichever
@@ -52,7 +53,8 @@ nonempty asset set before renaming anything. Missing APKs, unexpected files and
 symlinks fail the workflow instead of silently publishing an incomplete set.
 The rename changes no package bytes. `SHA256SUMS` covers the final public names.
 Release runs are serialized. Nightly cleanup accepts only confirmed HTTP 404
-absence, stops on deletion/API errors, and only removes `nightly-polaris`.
+absence, stops on deletion/API errors, and only removes the `nightly` tag/release.
+No other tag, including `nightly-polaris`, is deleted or updated.
 Its tag is verified absent before publishing and verified at the exact built
 commit afterward; a stale tag can never silently pass the release job.
 

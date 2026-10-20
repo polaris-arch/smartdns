@@ -15,7 +15,7 @@ on:
         options: [x86_64, all]
         default: all
       release_tag:
-        description: 'Existing upstream-style tag plus -polaris at this commit; empty creates nightly-polaris'
+        description: 'Existing upstream-style tag plus -polaris at this commit; empty refreshes nightly (display name nightly-polaris)'
         type: string
         default: ''
 
@@ -46,9 +46,9 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
             # Fetch the nightly tag from origin
-            git fetch origin refs/tags/nightly-polaris:refs/tags/nightly-polaris || true
-            if git rev-parse refs/tags/nightly-polaris >/dev/null 2>&1; then
-              NIGHTLY_SHA=$(git rev-parse refs/tags/nightly-polaris)
+            git fetch origin refs/tags/nightly:refs/tags/nightly || true
+            if git rev-parse refs/tags/nightly >/dev/null 2>&1; then
+              NIGHTLY_SHA=$(git rev-parse refs/tags/nightly)
               CURRENT_SHA=$(git rev-parse HEAD)
               if [ "$NIGHTLY_SHA" = "$CURRENT_SHA" ]; then
                 echo "Current commit ($CURRENT_SHA) is the same as the existing nightly tag. Skipping scheduled build."
@@ -479,9 +479,9 @@ jobs:
         uses: softprops/action-gh-release@v3
         if: github.event_name != 'release' && inputs.release_tag == ''
         with:
-          tag_name: nightly-polaris
+          tag_name: nightly
           target_commitish: ${{ github.sha }}
-          name: "SmartDNS Nightly Build - polaris"
+          name: "nightly-polaris"
           body: |
             This release contains the latest validated Nightly build of Polaris SmartDNS.
 
@@ -499,7 +499,7 @@ jobs:
 
       - name: Verify published tag
         env:
-          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name || 'nightly-polaris' }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name || 'nightly' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 .github/scripts/prepare-release-assets.py \
