@@ -7,8 +7,6 @@ env:
 on:
   release:
     types: [published]
-  schedule:
-    - cron: '0 18 * * *' # Daily at 18:00 UTC (02:00 AM Beijing Time)
   workflow_dispatch:
     inputs:
       target:
