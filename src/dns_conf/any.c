@@ -11,8 +11,9 @@ int _config_any_mode(void *data, int argc, char *argv[])
 {
 	struct dns_conf_group *group = _config_current_rule_group();
 	if (group == NULL || argc != 2) return -1;
-	if (strcmp(argv[1], "passthrough") == 0) group->any.aggregate = 0;
-	else if (strcmp(argv[1], "aggregate") == 0) group->any.aggregate = 1;
+	if (strcmp(argv[1], "passthrough") == 0) group->any.aggregate = DNS_ANY_PASSTHROUGH;
+	else if (strcmp(argv[1], "aggregate") == 0) group->any.aggregate = DNS_ANY_AGGREGATE;
+	else if (strcmp(argv[1], "address") == 0) group->any.aggregate = DNS_ANY_ADDRESS;
 	else return -1;
 	return 0;
 }
@@ -43,7 +44,7 @@ int _config_any_verify(void)
 	struct dns_conf_group *group;
 	unsigned long bucket;
 	hash_for_each(dns_conf_rule.group, bucket, group, node) {
-		if (group->any.aggregate && group->any.type_count == 0) {
+		if (group->any.aggregate == DNS_ANY_AGGREGATE && group->any.type_count == 0) {
 			tlog(TLOG_ERROR, "any-response-mode aggregate requires any-aggregate-types in group %s", group->group_name);
 			return -1;
 		}

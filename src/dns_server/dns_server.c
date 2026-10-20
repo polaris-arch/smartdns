@@ -23,6 +23,7 @@
 #include "dns_server.h"
 #include "address.h"
 #include "any.h"
+#include "address_child.h"
 #include "answer.h"
 #include "audit.h"
 #include "cache.h"
@@ -149,6 +150,10 @@ static int dns_server_resolve_callback(const char *domain, dns_result_type rtype
 	}
 
 	if (rtype == DNS_QUERY_RESULT) {
+		_dns_server_address_cache_upstream(request, inpacket, inpacket_len);
+		/* Preserve correlated upstream evidence before ordinary selection or
+		 * policy processing can turn an address reply into a synthetic SOA. */
+		_dns_server_address_child_upstream(request, inpacket, inpacket_len);
 		tlog(TLOG_DEBUG, "query result from server %s:%d, type: %d, domain: %s qtype: %d rcode: %d, id: %d",
 			 dns_client_get_server_ip(server_info), dns_client_get_server_port(server_info),
 			 dns_client_get_server_type(server_info), domain, request->qtype, packet->head.rcode, request->id);
@@ -265,10 +270,20 @@ int _dns_server_do_query(struct dns_request *request, int skip_notify_event)
 	if (_dns_server_setup_request_conf(request) != 0) {
 		goto errout;
 	}
-
 	if (_dns_server_mdns_query_setup(request, server_group_name, &request_domain, domain_buffer,
 									 sizeof(domain_buffer)) != 0) {
 		goto errout;
+	}
+	if (_dns_server_address_child_check_context(request, server_group_name) != 0) {
+		goto errout;
+	}
+
+	/* Explicit address completion owns the parent before any local policy
+	 * can synthesize an ANY answer (notably force-qtype-SOA 255). Children
+	 * still traverse the ordinary typed policy/cache/selection pipeline. */
+	if (request->qtype == DNS_T_ANY && request->conf->any.aggregate == DNS_ANY_ADDRESS &&
+		_dns_server_process_any(request, server_group_name) == 0) {
+		goto clean_exit;
 	}
 
 	if (_dns_server_process_cname_pre(request) != 0) {
@@ -367,6 +382,10 @@ int _dns_server_do_query(struct dns_request *request, int skip_notify_event)
 	}
 
 	// Get reference for DNS query
+	request->cache_origin_plain = request->conf->any.aggregate == DNS_ANY_ADDRESS && dns_conf.cachesize > 0 &&
+		(request->qtype == DNS_T_A || request->qtype == DNS_T_AAAA) &&
+		_dns_server_any_plain_context(request, server_group_name);
+	_dns_server_address_cache_prepare(request);
 	request->request_wait++;
 	_dns_server_request_get(request);
 	if (dns_client_query(request_domain, request->qtype, dns_server_resolve_callback, request, server_group_name,

@@ -20,6 +20,7 @@
 #include "smartdns/dns_any.h"
 #include "smartdns/dns_conf.h"
 #include "address.h"
+#include "address_child.h"
 #include "audit.h"
 #include "cache.h"
 #include "dns_server.h"
@@ -902,7 +903,7 @@ int _dns_request_post(struct dns_server_post_context *context)
 	/* reply API callback */
 	_dns_result_callback(context);
 
-	if (request->conn == NULL) {
+	if (request->conn == NULL && request->address_child == NULL) {
 		return 0;
 	}
 
@@ -911,6 +912,10 @@ int _dns_request_post(struct dns_server_post_context *context)
 		tlog(TLOG_ERROR, "update packet ttl failed.");
 		return -1;
 	}
+	/* Internal observers see the actual final wire even without a connection.
+	 * The public callback remains unchanged and is not used for address joins. */
+	_dns_server_address_child_post(context);
+	if (request->conn == NULL) return 0;
 
 	tlog(TLOG_INFO, "result: %s, client: %s, qtype: %d, id: %d, group: %s, time: %lums", request->domain,
 		 get_host_by_addr(clientip, sizeof(clientip), (struct sockaddr *)&request->addr), request->qtype, request->id,
@@ -1136,7 +1141,7 @@ int _dns_server_reply_passthrough(struct dns_server_post_context *context)
 	/* reply child request */
 	_dns_result_child_post(context);
 
-	if (request->conn && context->do_reply == 1) {
+	if ((request->conn || request->address_child) && context->do_reply == 1) {
 		char clientip[DNS_MAX_CNAME_LEN] = {0};
 
 		/* When passthrough, modify the id to be the id of the client request. */
@@ -1145,6 +1150,8 @@ int _dns_server_reply_passthrough(struct dns_server_post_context *context)
 			tlog(TLOG_ERROR, "update packet ttl failed.");
 			return -1;
 		}
+		_dns_server_address_child_post(context);
+		if (request->conn == NULL) return _dns_server_reply_all_pending_list(request, context);
 
 		_dns_reply_inpacket(request, context->inpacket, context->inpacket_len);
 

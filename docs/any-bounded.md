@@ -18,6 +18,79 @@ budget using the ordinary client's configured-group/fallback capacity and nomina
 lifetime policy (currently 2 seconds), rather than aggregate's type/attempt caps.
 They do not set the single-upstream flag.
 
+## Explicit address completion (opt-in)
+
+Enable with `any-response-mode address`; disable with
+`any-response-mode passthrough`. The default remains passthrough. `aggregate`
+remains the separate finite-type fallback mode described below. These are
+SmartDNS text configuration settings; no control API is added.
+
+Address mode directly resolves A and AAAA through the ordinary address pipeline;
+it never sends an initial ANY probe and does not inspect HINFO strings. Both
+families must complete coherently. Two positive results return both families;
+one positive plus genuine upstream SOA-backed NODATA returns a single family.
+Timeout, transport failure, policy-generated SOA, malformed/incomplete data, or
+an unsupported context cannot stand in for an absent family: the result is
+SERVFAIL. Consistent NXDOMAIN remains distinct from NODATA; conflicting aliases
+or positive/NXDOMAIN results fail. This represents DNS addresses supplied by the
+configured resolver and supported rules, not reachability or all zone records.
+
+The family set is always A+AAAA, concurrency is two, and partial results are
+always disabled. Valid `any-aggregate-types`, `any-aggregate-concurrency`, and
+`any-aggregate-partial` settings are retained for compatibility but have no
+effect while address mode is selected. They take effect again when switching
+back to aggregate. Invalid settings still fail ordinary configuration parsing.
+The existing `any-aggregate-max-attempts` (default 16, range 1–64) and
+`any-aggregate-timeout-ms` (default 950, range 1–950) bound the whole operation,
+including both families and nested work. Each child does not receive a new
+budget. Rule-group inheritance and explicit group overrides apply to all modes.
+
+Address requests use bounded equivalent-request coalescing and validated fresh
+positive entries from the ordinary A/AAAA cache whose in-memory origin was
+recorded as a compatible plain upstream lookup. Legacy/persisted entries and
+entries from ECS, DNSSEC/CD or unsupported policy contexts are refetched; packet
+flags alone do not prove their original context. They do not reuse ordinary
+pending-query leaders with unrelated budgets. Negative/expired native cache
+entries are not proof of upstream absence and are not reused for completion.
+The provenance flag is set only by an actual compatible upstream lookup;
+packet, origin and TTL metadata are acquired together. Legacy and metadata-only
+replacements revoke the flag. This does not change ordinary cache behavior.
+Original upstream packets must also validate as complete positive Answers, and
+every selected address in the cache packet must be a subset of those proven
+Answers. A native reconstruction of truncated or Additional-only data cannot
+gain trusted provenance. The proof set is bounded to 64 addresses per compatible
+live request; overflow or allocation failure disables this reuse.
+Proof is collected only for native requests in an address-enabled group with
+caching enabled, including ordinary A/AAAA warmers in that group. The narrow
+allocation-free validator accepts direct positive Answers without CNAME or
+authority, with at most one empty root OPT. Positive packets with authority or
+glue are refetched for address completion; ordinary resolution is unchanged.
+The retained proof is at most 64 × 16 address bytes plus counters and a mutex;
+validation uses a 64-address stack scratch set and bounded name storage, not
+the general merger's temporary heap buffers.
+Cached CNAME packets are also refetched because the legacy cache may retain a
+collapsed alias chain without the original complete-chain provenance.
+There is no separate combined address-result cache. `cache-size 0` disables
+completed caching while preserving in-flight coalescing. Address-owned children
+suppress recursive cross-family preference checks, so a preferred-family policy
+cannot masquerade as an absent family. Ordinary A/AAAA client requests retain
+their existing behavior.
+
+The conservative context restrictions below also apply to address mode, but an
+unsupported address request fails explicitly instead of falling through to an
+upstream minimal ANY answer. In particular, ECS, DO/CD/AD, DNS64, local address
+rewrites and unsupported policy contexts are not claimed as supported.
+Address admission runs before early parent policy replies; forcing SOA for
+QTYPE 255 or configuring a local address block cannot manufacture a completed
+NOERROR address result.
+Capacity exhaustion is a bounded failure in this opt-in mode.
+
+Apply changed settings by restarting SmartDNS through the deployment's service
+manager. A universal live-reload mechanism is not promised. The previously
+merged revision `8fb86725b74e82a220947b21929e24407f5dad7f` does not recognize
+`address`; use a build containing this implementation and its matching source
+revision. A successful configuration parse alone is not runtime verification.
+
 ## Explicit finite fallback
 
 Example (an operator-selected list, not a built-in default):
@@ -63,7 +136,7 @@ for fallback. No local CNAME follow-up questions are launched: an incomplete
 upstream alias chain is an unusable child. Local CNAME/policy rewrite contexts
 bypass this feature.
 
-## Response and cache semantics
+## Passthrough / finite-fallback response and cache semantics
 
 - Fresh ANY preserves every upstream RR TTL. Cached packets independently age each
   ordinary TTL and preserve OPT flags. Cache lifetime is no longer than the
@@ -96,7 +169,8 @@ Sharing/aggregation is limited to IN, RD=1, no client DO/CD/AD, no ECS, and no
 unrecognized EDNS options/flags. Configured endpoint/fallback ECS and rule-group
 ECS also disable it. Existing policy rewrites, IP rules, parent/CNAME processing,
 DNS64, forced CNAME suppression, cache-disabled requests and unsupported contexts
-use the normal transparent path. Original ANY DO/CD are propagated even though
+use the normal transparent path in passthrough/aggregate modes; address mode
+returns a bounded failure. Original ANY DO/CD are propagated even though
 legacy non-ANY parsing treats AD/DO differently. Non-IN remains unsupported.
 Some clients enable AD/cookies by default; such queries deliberately bypass this
 first conservative implementation rather than sharing an unproven context.
@@ -111,7 +185,7 @@ source-address admission table caps each client at eight allocated operations an
 32 pending waiters across operations. These bounds limit the optional coordinator,
 not default passthrough service admission: when coordination capacity is full,
 passthrough requests continue through the ordinary native request path. Explicit
-aggregate mode retains bounded rejection because its fanout requires coordination. Source ports/ECS do not create new quota
+aggregate and address modes retain bounded rejection because its fanout requires coordination. Source ports/ECS do not create new quota
 identities; IPv4-mapped IPv6 shares the IPv4 identity. Owner quota remains charged
 until late callbacks retire, preventing cancellation from resetting admission.
 Entries are reclaimed when both counters reach zero. Aggregate capacity exhaustion
@@ -119,12 +193,14 @@ returns a bounded failure; it does not create unbounded waiting work. The first
 operation's parent budget bounds every coalesced caller's dependency; there is no
 cross-parent typed-query joining and no cancellation of unrelated work. Closing a
 downstream connection removes only its waiters; losing the last waiter cancels
-the shared budget in both modes and blocks deferred/retry sends. An individual
+the shared budget in all modes and blocks deferred/retry sends. An individual
 HTTP/2 RST_STREAM removes only that stream's waiter, leaving siblings and the
 physical connection usable. Normal request END_STREAM does not cancel a waiter.
 Reset detection runs after HTTP/2 polling even when there is no readable item for
 the already-consumed request.
-Ordinary A/AAAA neither allocate this state nor issue extra queries.
+Ordinary A/AAAA neither allocate coordinator state nor issue extra queries.
+Compatible cache-enabled native lookups retain only the separate bounded
+address-proof set described above; cache-size 0 skips that allocation.
 
 ## Verification status
 
@@ -139,8 +215,16 @@ They include `DefaultFailureFirstCannotMaskHealthySibling`,
 `DefaultLastWaiterCancellationStopsDeferredAdmission`,
 `DefaultLastWaiterCancellationStopsRetry`, `Http2ResetOnlyCancelsItsWaiter`, and
 `LastHttp2ResetCancelsFallbackButKeepsConnectionUsable`. The last two live in
-`test/cases/test-http2.cc` and reuse its local TLS/H2 client. There are 22 offline,
-23 wire-helper, and 5 configuration cases in these suites.
+`test/cases/test-http2.cc` and reuse its local TLS/H2 client. The exact required case names are maintained in the native result gate.
+`AnyAddress.*` additionally checks both address families, strict negative/error
+provenance, coherent CNAMEs, native positive-cache reuse, shared budgets and
+in-flight coalescing using loopback fixtures. The comparative driver keeps
+ordinary baseline/candidate ANY cases plus matched default A and AAAA cold/hot
+and cache-zero duplicate/unique bursts. Typed cases require every answer, exact
+cold/unique and zero hot sends, and bounded measured duplicate coalescing.
+It separately reports candidate-only address workloads, including raw per-query
+latency, CPU, process high-water RSS and actual typed send counts. These
+measurements expose proof overhead; no performance equivalence is assumed.
 
 They are authored regression cases, not evidence of execution until the combined
 batch's build/test report is available. Independent review of the final diff,

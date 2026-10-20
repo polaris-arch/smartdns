@@ -52,6 +52,85 @@ TEST(AnyBounded, NamedTypeDoesNotChangeAllSentinel)
 		EXPECT_EQ(dns_any_type_from_name(s), -1);
 }
 
+TEST(AnyBounded, PlainAddressProofAcceptsOnlyCompleteDirectAnswers)
+{
+	unsigned char addresses[DNS_ANY_MAX_RECORDS][DNS_RR_AAAA_LEN];
+	for (int type : {DNS_T_A, DNS_T_AAAA}) {
+		const Wire data(type == DNS_T_A ? 4 : 16, 7);
+		for (bool compressed : {false, true}) {
+			Wire v = response(type, 1, 0, 1); v[3] = 0x80;
+			if (compressed) {
+				u16(v, 0xc00c); u16(v, type); u16(v, DNS_C_IN);
+				u32(v, 60); u16(v, data.size()); v.insert(v.end(), data.begin(), data.end());
+			} else rr(v, "unit.test", type, 60, data);
+			rr(v, "", DNS_T_OPT, 0, {}, 1232);
+			ASSERT_EQ(dns_any_plain_addresses("unit.test", type, v.data(), v.size(), addresses), 1);
+			EXPECT_EQ(std::memcmp(addresses[0], data.data(), data.size()), 0);
+		}
+	}
+	Wire capped = response(DNS_T_A, DNS_ANY_MAX_RECORDS); capped[3] = 0x80;
+	for (int i = 0; i < DNS_ANY_MAX_RECORDS; i++)
+		rr(capped, "unit.test", DNS_T_A, 60, {1, 2, 3, static_cast<unsigned char>(i)});
+	EXPECT_EQ(dns_any_plain_addresses("unit.test", DNS_T_A, capped.data(), capped.size(), addresses),
+		DNS_ANY_MAX_RECORDS);
+}
+
+TEST(AnyBounded, PlainAddressProofRejectsMalformedOrUnsupportedPackets)
+{
+	unsigned char addresses[DNS_ANY_MAX_RECORDS][DNS_RR_AAAA_LEN];
+	auto direct = [](int answers = 1, int authority = 0, int extra = 0) {
+		Wire v = response(DNS_T_A, answers, authority, extra); v[3] = 0x80; return v;
+	};
+	Wire good = direct(); rr(good, "unit.test", DNS_T_A, 60, {1, 2, 3, 4});
+	std::vector<Wire> bad;
+	for (int flag : {0x10, 0x20, 0x40, 1}) {
+		Wire v = good; v[3] |= flag; bad.push_back(v);
+	}
+	Wire v = good; v[2] |= 2; bad.push_back(v);
+	v = good; v[2] &= ~0x80; bad.push_back(v);
+	v = good; v[2] |= 8; bad.push_back(v);
+	v = good; v.push_back(0); bad.push_back(v);
+	v = good; v.pop_back(); bad.push_back(v);
+	bad.emplace_back(good.begin(), good.begin() + 10);
+	v = good; v[direct().size() - 1] = 3; bad.push_back(v);
+	v = direct(); rr(v, "wrong.test", DNS_T_A, 60, {1, 2, 3, 4}); bad.push_back(v);
+	v = direct(); rr(v, "unit.test", DNS_T_A, 60, {1, 2, 3, 4}, 3); bad.push_back(v);
+	v = direct(); rr(v, "unit.test", DNS_T_A, 60, {1, 2, 3}); bad.push_back(v);
+	v = direct(); rr(v, "unit.test", DNS_T_AAAA, 60, Wire(16, 7)); bad.push_back(v);
+	v = direct(); rr(v, "unit.test", DNS_T_CNAME, 60, domain_data("target.test")); bad.push_back(v);
+	for (unsigned int ttl : {0U, 0x80000000U}) {
+		v = direct(); rr(v, "unit.test", DNS_T_A, ttl, {1, 2, 3, 4}); bad.push_back(v);
+	}
+	v = direct(0, 0, 1); rr(v, "unit.test", DNS_T_A, 60, {1, 2, 3, 4}); bad.push_back(v);
+	v = direct(1, 1); rr(v, "unit.test", DNS_T_A, 60, {1, 2, 3, 4});
+	rr(v, "unit.test", DNS_T_SOA, 60, soa_data()); bad.push_back(v);
+	v = direct(1, 0, 1); rr(v, "unit.test", DNS_T_A, 60, {1, 2, 3, 4});
+	rr(v, "unit.test", DNS_T_A, 60, {1, 2, 3, 5}); bad.push_back(v);
+	for (int mode = 0; mode < 4; mode++) {
+		v = direct(1, 0, mode == 3 ? 2 : 1); rr(v, "unit.test", DNS_T_A, 60, {1, 2, 3, 4});
+		rr(v, mode == 2 ? "not-root.test" : "", DNS_T_OPT, mode == 1 ? DNS_OPT_FLAG_DO : 0,
+			mode == 0 ? Wire{0, 8, 0, 0} : Wire{}, 1232);
+		if (mode == 3) rr(v, "", DNS_T_OPT, 0, {}, 1232);
+		bad.push_back(v);
+	}
+	for (bool outside : {false, true}) {
+		v = direct(); const size_t at = v.size();
+		u16(v, 0xc000 | (outside ? 4095 : at)); u16(v, DNS_T_A); u16(v, DNS_C_IN);
+		u32(v, 60); u16(v, 4); v.insert(v.end(), {1, 2, 3, 4}); bad.push_back(v);
+	}
+	v = direct(DNS_ANY_MAX_RECORDS + 1);
+	for (int i = 0; i <= DNS_ANY_MAX_RECORDS; i++) rr(v, "unit.test", DNS_T_A, 60, {1, 2, 3, 4});
+	bad.push_back(v);
+	for (size_t i = 0; i < bad.size(); i++) {
+		SCOPED_TRACE(i);
+		EXPECT_EQ(dns_any_plain_addresses("unit.test", DNS_T_A, bad[i].data(), bad[i].size(), addresses), -1);
+	}
+	EXPECT_EQ(dns_any_plain_addresses("wrong.test", DNS_T_A, good.data(), good.size(), addresses), -1);
+	EXPECT_EQ(dns_any_plain_addresses("unit.test", DNS_T_AAAA, good.data(), good.size(), addresses), -1);
+	v = good; v[12] = 0xc0; v[13] = 12;
+	EXPECT_EQ(dns_any_plain_addresses("unit.test", DNS_T_A, v.data(), v.size(), addresses), -1);
+}
+
 TEST(AnyBounded, FreshMixedTtlsAndUnknownDataRemainByteExact)
 {
 	Wire v = response(DNS_T_ANY, 3);

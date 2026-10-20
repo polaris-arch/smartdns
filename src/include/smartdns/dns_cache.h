@@ -39,6 +39,8 @@ extern "C" {
 #define MAGIC_NUMBER 0x6548634163536e44
 #define MAGIC_CACHE_DATA 0x61546144
 #define MAGIC_RECORD 0x64526352
+/* Runtime-only provenance. This is never serialized in dns_cache_info. */
+#define DNS_CACHE_ORIGIN_PLAIN (1U << 0)
 
 struct dns_cache_data_head {
 	atomic_t ref;
@@ -100,6 +102,7 @@ struct dns_cache {
 
 	struct dns_cache_info info;
 	struct dns_cache_data *cache_data;
+	unsigned int origin_flags;
 
 	struct tw_timer_list timer;
 };
@@ -144,6 +147,12 @@ int dns_cache_replace(struct dns_cache_key *key, int rcode, int ttl, int speed, 
 int dns_cache_insert(struct dns_cache_key *key, int rcode, int ttl, int speed, int timeout,
 					 struct dns_cache_data *cache_data);
 
+int dns_cache_replace_with_origin(struct dns_cache_key *key, int rcode, int ttl, int speed, int timeout,
+								 int update_time, struct dns_cache_data *cache_data, unsigned int origin_flags);
+
+int dns_cache_insert_with_origin(struct dns_cache_key *key, int rcode, int ttl, int speed, int timeout,
+								struct dns_cache_data *cache_data, unsigned int origin_flags);
+
 struct dns_cache *dns_cache_lookup(struct dns_cache_key *key);
 
 int dns_cache_total_num(void);
@@ -167,6 +176,11 @@ void dns_cache_update(struct dns_cache *dns_cache);
 int dns_cache_get_ttl(struct dns_cache *dns_cache);
 
 struct dns_cache_data *dns_cache_get_data(struct dns_cache *dns_cache);
+
+/* Atomically snapshot both packet and metadata only when required provenance
+ * matches. A later replacement cannot pair its packet with an old safe flag. */
+struct dns_cache_data *dns_cache_get_data_with_origin(struct dns_cache *dns_cache, unsigned int required_origin,
+													struct dns_cache_info *info);
 
 void dns_cache_data_get(struct dns_cache_data *cache_data);
 

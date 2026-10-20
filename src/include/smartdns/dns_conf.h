@@ -498,7 +498,14 @@ struct dns_dns64 {
 
 #define DNS_ANY_MAX_TYPES 8
 
+enum dns_any_mode {
+	DNS_ANY_PASSTHROUGH = 0,
+	DNS_ANY_AGGREGATE = 1,
+	DNS_ANY_ADDRESS = 2,
+};
+
 struct dns_any_config {
+	/* dns_any_mode; retain the legacy member name and 0/1 meanings. */
 	int aggregate;
 	unsigned short types[DNS_ANY_MAX_TYPES];
 	int type_count;

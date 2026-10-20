@@ -304,7 +304,7 @@ struct dns_cache *dns_cache_lookup(struct dns_cache_key *cache_key)
 }
 
 static int _dns_cache_replace(struct dns_cache_key *cache_key, int rcode, int ttl, int speed, int timeout,
-							  int update_time, struct dns_cache_data *cache_data)
+							  int update_time, struct dns_cache_data *cache_data, unsigned int origin_flags)
 {
 	int ret = -1;
 	struct dns_cache *dns_cache = NULL;
@@ -341,6 +341,9 @@ static int _dns_cache_replace(struct dns_cache_key *cache_key, int rcode, int tt
 	dns_cache->info.speed = speed;
 	dns_cache->info.timeout = timeout;
 	dns_cache->info.is_visited = 1;
+	/* Every replacement invalidates old provenance, including legacy callers
+	 * and metadata-only replacements. The packet and flag change together. */
+	dns_cache->origin_flags = cache_data ? origin_flags : 0;
 	if (cache_data) {
 		old_cache_data = dns_cache->cache_data;
 		dns_cache->cache_data = cache_data;
@@ -374,7 +377,13 @@ out:
 int dns_cache_replace(struct dns_cache_key *cache_key, int rcode, int ttl, int speed, int timeout, int update_time,
 					  struct dns_cache_data *cache_data)
 {
-	return _dns_cache_replace(cache_key, rcode, ttl, speed, timeout, update_time, cache_data);
+	return _dns_cache_replace(cache_key, rcode, ttl, speed, timeout, update_time, cache_data, 0);
+}
+
+int dns_cache_replace_with_origin(struct dns_cache_key *cache_key, int rcode, int ttl, int speed, int timeout,
+								 int update_time, struct dns_cache_data *cache_data, unsigned int origin_flags)
+{
+	return _dns_cache_replace(cache_key, rcode, ttl, speed, timeout, update_time, cache_data, origin_flags);
 }
 
 static void _dns_cache_remove_by_domain(struct dns_cache_key *cache_key)
@@ -414,7 +423,7 @@ static void _dns_cache_remove_by_domain(struct dns_cache_key *cache_key)
 }
 
 static int _dns_cache_insert(struct dns_cache_info *info, struct dns_cache_data *cache_data, struct list_head *head,
-							 int timeout)
+							 int timeout, unsigned int origin_flags)
 {
 	uint32_t key = 0;
 	struct dns_cache *dns_cache = NULL;
@@ -443,6 +452,7 @@ static int _dns_cache_insert(struct dns_cache_info *info, struct dns_cache_data 
 	atomic_set(&dns_cache->ref, 1);
 	memcpy(&dns_cache->info, info, sizeof(*info));
 	dns_cache->cache_data = cache_data;
+	dns_cache->origin_flags = origin_flags;
 	dns_cache->timer.function = dns_cache_expired;
 	dns_cache->timer.expires = timeout;
 	dns_cache->timer.data = dns_cache;
@@ -495,6 +505,12 @@ errout:
 int dns_cache_insert(struct dns_cache_key *cache_key, int rcode, int ttl, int speed, int timeout,
 					 struct dns_cache_data *cache_data)
 {
+	return dns_cache_insert_with_origin(cache_key, rcode, ttl, speed, timeout, cache_data, 0);
+}
+
+int dns_cache_insert_with_origin(struct dns_cache_key *cache_key, int rcode, int ttl, int speed, int timeout,
+								struct dns_cache_data *cache_data, unsigned int origin_flags)
+{
 	struct dns_cache_info info;
 
 	if (cache_data == NULL || cache_key == NULL || cache_key->dns_group_name == NULL || cache_key->domain == NULL) {
@@ -525,7 +541,7 @@ int dns_cache_insert(struct dns_cache_key *cache_key, int rcode, int ttl, int sp
 	time(&info.insert_time);
 	time(&info.replace_time);
 
-	return _dns_cache_insert(&info, cache_data, &dns_cache_head.cache_list, timeout);
+	return _dns_cache_insert(&info, cache_data, &dns_cache_head.cache_list, timeout, origin_flags);
 }
 
 int dns_cache_update_timer(struct dns_cache_key *key, int timeout)
@@ -590,6 +606,20 @@ struct dns_cache_data *dns_cache_get_data(struct dns_cache *dns_cache)
 	cache_data = dns_cache->cache_data;
 	pthread_mutex_unlock(&dns_cache_head.lock);
 	return cache_data;
+}
+
+struct dns_cache_data *dns_cache_get_data_with_origin(struct dns_cache *dns_cache, unsigned int required_origin,
+													struct dns_cache_info *info)
+{
+	struct dns_cache_data *data = NULL;
+	pthread_mutex_lock(&dns_cache_head.lock);
+	if (dns_cache->cache_data && (dns_cache->origin_flags & required_origin) == required_origin) {
+		data = dns_cache->cache_data;
+		dns_cache_data_get(data);
+		*info = dns_cache->info;
+	}
+	pthread_mutex_unlock(&dns_cache_head.lock);
+	return data;
 }
 
 void dns_cache_data_get(struct dns_cache_data *cache_data)
@@ -722,7 +752,9 @@ static int _dns_cache_read_to_cache(struct dns_cache_record *cache_record, struc
 	}
 
 	dns_cache_data_get(cache_data);
-	if (_dns_cache_insert(&cache_record->info, cache_data, head, timeout) != 0) {
+	/* The persisted ABI has no origin attestation. Loaded entries remain
+	 * usable normally, but never inherit address-mode trusted provenance. */
+	if (_dns_cache_insert(&cache_record->info, cache_data, head, timeout, 0) != 0) {
 		tlog(TLOG_ERROR, "insert cache data failed.");
 		dns_cache_data_put(cache_data);
 		cache_data = NULL;

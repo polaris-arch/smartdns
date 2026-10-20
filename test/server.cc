@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iostream>
 #include <cstdint>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <cmath>
@@ -340,6 +341,9 @@ void Server::StartPost(void *arg)
 		fast_ping_fake_ip_add(PING_TYPE_TCP, "[2001::]:443", 64, 10);
 		dns_server_check_ipv6_ready();
 	}
+	if (server->startup_.MarkInitialized()) {
+		dns_server_stop();
+	}
 }
 
 namespace {
@@ -385,6 +389,11 @@ bool Server::Start(const std::string &conf, enum CONF_TYPE type)
 			<< " errno=" << saved_errno << " (" << strerror(saved_errno) << ")" << std::endl;
 		return false;
 	};
+	if (pid_ > 0 || thread_.joinable()) {
+		errno = EBUSY;
+		return fail_start("fixture already running");
+	}
+	startup_.Reset();
 
 	fds[0] = 0;
 	fds[1] = 0;
@@ -482,14 +491,38 @@ cache-persist no
 	pfd[0].fd = fds[0];
 	pfd[0].events = POLLIN;
 
-	int ret = poll(pfd, 1, 10000);
-	uint64_t notification = 0;
-	ssize_t count = ret > 0 ? read(fds[0], &notification, sizeof(notification)) : -1;
-	if (count != sizeof(notification) || notification != 1) {
+	/* In thread mode glibc's setuid/setgid handshake can interrupt this
+	 * thread's poll. Retrying must not restart the ten-second deadline. */
+	if (mode_ == CREATE_MODE_THREAD) {
+		std::cout << "Server thread waiting for readiness (total deadline 10000ms)" << std::endl;
+	}
+	auto ready = WaitForFixtureReady(10000,
+		[]() -> int64_t {
+			return std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count();
+		},
+		[&](int remaining) { return poll(pfd, 1, remaining); },
+		[&](uint64_t &value) { return read(fds[0], &value, sizeof(value)); });
+	int ret = ready.poll_result;
+	uint64_t notification = ready.notification;
+	ssize_t count = ready.bytes;
+	if (mode_ == CREATE_MODE_THREAD) {
+		/* Death-test stderr is captured until child exit; keep the startup
+		 * stage visible even if a later assertion or teardown blocks. */
+		std::cout << "Server thread readiness: poll=" << ret << " bytes=" << count
+			<< " notification=" << notification << " errno=" << ready.error << std::endl;
+	}
+	if (!ready.IsReady()) {
 		std::cerr << "Server startup failed: pid=" << pid << " poll=" << ret
-			<< " bytes=" << count << " notification=" << notification << " errno=" << errno << std::endl;
+			<< " bytes=" << count << " notification=" << notification << " errno=" << ready.error << std::endl;
 		if (pid > 0) { kill(pid, SIGKILL); waitpid(pid, nullptr, 0); }
-		if (thread_.joinable()) { dns_server_stop(); thread_.join(); }
+		if (thread_.joinable()) {
+			/* If init is not finished, StartPost performs the stop later.
+			 * Stopping now would be lost when dns_server_init resets run. */
+			if (startup_.Cancel()) dns_server_stop();
+			std::cout << "Server thread startup cancelled; joining worker" << std::endl;
+			thread_.join();
+		}
 		return false;
 	}
 	pid_ = pid;

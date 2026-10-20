@@ -1,6 +1,7 @@
-/* Bounded ANY cache/singleflight and explicit finite typed fallback.
- * Ordinary A/AAAA never enter this module. */
+/* Bounded ANY coordination: transparent probes, finite fallback, and explicit
+ * strict address completion. Ordinary A/AAAA clients never enter the coordinator. */
 #include "any.h"
+#include "address_child.h"
 #include "context.h"
 #include "request.h"
 #include "server_http2.h"
@@ -30,7 +31,7 @@ struct any_key {
 struct any_operation;
 struct any_child {
 	struct any_operation *owner;
-	int type, started, ended, has_result;
+	int type, started, ended, has_result, reported;
 	unsigned long received;
 	int len;
 	unsigned char data[DNS_IN_PACKSIZE];
@@ -139,14 +140,20 @@ static uint32_t elapsed(unsigned long start)
 }
 
 /* This is deliberately stricter than the legacy A/AAAA cache key. Unsupported
- * context stays transparent; it never receives guessed shared/synthesized data. */
-static int eligible(struct dns_request *request, const char *route)
+ * context stays transparent in legacy modes and fails in explicit address mode;
+ * it never receives guessed shared/synthesized data. */
+int _dns_server_any_plain_context(struct dns_request *request, const char *route)
 {
 	struct dns_conf_ipset_nftset no_ipset = {0};
+	if (!route) route = DNS_SERVER_GROUP_DEFAULT;
 	if (memcmp(&request->conf->ipset_nftset, &no_ipset, sizeof(no_ipset))) return 0;
+	/* Address-mode completeness cannot be replaced by a policy-generated
+	 * negative for the parent ANY question before either family is observed. */
+	if (request->qtype == DNS_T_ANY && request->conf->any.aggregate == DNS_ANY_ADDRESS && request->conf->soa_table &&
+		(request->conf->soa_table[DNS_T_ANY / 8] & (1 << (DNS_T_ANY % 8)))) return 0;
 	for (int i = 0; i < dns_conf.server_num; i++) if (dns_conf.servers[i].result_flag) return 0;
 	if (request->server_flags & BIND_FLAG_NO_CACHE) return 0;
-	if (request->qclass != DNS_C_IN || request->any_do || request->any_cd || request->any_ad ||
+	if (request->qclass != DNS_C_IN || request->edns0_do || request->any_do || request->any_cd || request->any_ad ||
 		!request->any_rd || request->any_unknown_context || request->has_ecs || request->prefetch ||
 		request->is_mdns_lookup || request->has_cname || request->parent_request || request->no_cache ||
 		request->conf->ipv4_ecs.enable || request->conf->ipv6_ecs.enable || request->conf->dns_dns64.prefix_len ||
@@ -233,7 +240,7 @@ static void finish(struct any_operation *op, unsigned char *wire, int len)
 	op->final_len = len; op->finished = get_tick_count();
 	if (len > 0) memcpy(op->final_wire, wire, len);
 	dns_query_budget_cancel(op->budget);
-	if (len > 0) cache_result(&op->key, wire, len);
+	if (len > 0 && op->key.config.aggregate != DNS_ANY_ADDRESS) cache_result(&op->key, wire, len);
 	pthread_mutex_lock(&any_lock);
 	if (op->table_slot >= 0 && operations[op->table_slot] == op) {
 		operations[op->table_slot] = NULL; atomic_dec(&any_active);
@@ -267,7 +274,7 @@ static void finish_aggregate(struct any_operation *op)
 		tlog(TLOG_DEBUG, "ANY aggregate failed validation or has no usable configured result");
 		len = dns_any_empty_response(op->key.domain, DNS_RC_SERVFAIL, 0, wire, sizeof(wire));
 	}
-	else {
+	else if (op->key.config.aggregate != DNS_ANY_ADDRESS) {
 		/* Only coherent, validated child packets seed the private typed cache. */
 		for (int i = 1; i <= op->key.config.type_count; i++) {
 			struct any_child *child = &op->children[i];
@@ -398,9 +405,63 @@ static void launch(struct any_operation *op, int index)
 	}
 }
 
+/* Result and request destruction are distinct: ping/native callbacks may still
+ * own a child after its finalized answer has been observed. */
+static void address_callback(void *arg, enum dns_address_child_result result,
+                             const unsigned char *wire, int len, int final_release)
+{
+	struct any_child *child = arg;
+	struct any_operation *op = child->owner;
+	int release = 0, wake = 0;
+	pthread_mutex_lock(&op->lock);
+	if (!final_release && !child->reported) {
+		child->reported = 1; op->completed++;
+		if (!op->terminal && (result == DNS_ADDRESS_CHILD_POSITIVE ||
+			result == DNS_ADDRESS_CHILD_NODATA || result == DNS_ADDRESS_CHILD_NXDOMAIN) &&
+			wire && len >= 12 && len <= DNS_IN_PACKSIZE) {
+			memcpy(child->data, wire, len); child->len = len;
+			child->received = get_tick_count(); child->has_result = 1;
+		}
+		wake = !op->terminal;
+	}
+	if (final_release && !child->ended) {
+		child->ended = 1; op->active--; release = 1;
+		if (!child->reported) { child->reported = 1; op->completed++; }
+		wake = !op->terminal;
+	}
+	pthread_mutex_unlock(&op->lock);
+	if (wake) _dns_server_wakeup_thread();
+	if (release) operation_put(op);
+}
+
+static void schedule_address(struct any_operation *op)
+{
+	if (!op->expanded) {
+		/* Reserve BOTH callback lifetimes before a synchronous cache completion
+		 * is possible. Keep the parent alive across both unlocked admissions. */
+		struct dns_request *parent = op->waiters[0];
+		_dns_server_request_get(parent);
+		op->expanded = 1; op->next = 2;
+		for (int i = 1; i <= 2; i++) {
+			op->children[i].started = 1; op->active++; operation_get(op);
+		}
+		pthread_mutex_unlock(&op->lock);
+		for (int i = 1; i <= 2; i++) {
+			struct any_child *child = &op->children[i];
+			if (_dns_server_address_child_start(parent, child->type, op->budget,
+				address_callback, child) != 0)
+				address_callback(child, DNS_ADDRESS_CHILD_FAILURE, NULL, 0, 1);
+		}
+		_dns_server_request_release_complete(parent, 0);
+		pthread_mutex_lock(&op->lock);
+	}
+	if (!op->terminal && op->completed == 2) finish_aggregate(op);
+}
+
 static void schedule(struct any_operation *op)
 {
 	if (op->terminal) return;
+	if (op->key.config.aggregate == DNS_ANY_ADDRESS) { schedule_address(op); return; }
 	if (!op->children[0].started) {
 		launch(op, 0);
 		if (op->children[0].ended && !op->expanded && !op->terminal) finish_probe(op);
@@ -424,13 +485,23 @@ int _dns_server_process_any(struct dns_request *request, const char *group_name)
 	struct any_operation *op = NULL;
 	struct dns_query_budget *budget = NULL;
 	const char *route = group_name ? group_name : DNS_SERVER_GROUP_DEFAULT;
-	if (request->qtype != DNS_T_ANY || !eligible(request, route)) return -1;
+	if (request->qtype != DNS_T_ANY) return -1;
+	if (!_dns_server_any_plain_context(request, route)) {
+		if (request->conf->any.aggregate != DNS_ANY_ADDRESS) return -1;
+		reply(request, NULL, -1, 0); return 0;
+	}
 	safe_strncpy(key.domain, request->domain, sizeof(key.domain));
 	safe_strncpy(key.route, route, sizeof(key.route));
 	safe_strncpy(key.rule_group, request->dns_group_name, sizeof(key.rule_group));
 	key.conf = request->conf; key.server_flags = request->server_flags; key.config = request->conf->any;
 	key.qtype = DNS_T_ANY;
-	cached_len = cache_lookup(&key, cached);
+	if (key.config.aggregate == DNS_ANY_ADDRESS) {
+		/* Legacy finite-RR options do not change the address contract or split
+		 * otherwise equivalent singleflight keys. */
+		memset(key.config.types, 0, sizeof(key.config.types));
+		key.config.types[0] = DNS_T_A; key.config.types[1] = DNS_T_AAAA;
+		key.config.type_count = 2; key.config.concurrency = 2; key.config.partial = 0;
+	} else cached_len = cache_lookup(&key, cached);
 	if (!cached_len) {
 		/* The ordinary-policy helper takes the client server-list lock. Never
 		 * call it with any_lock/op->lock held: receive callbacks take those

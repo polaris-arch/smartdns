@@ -61,6 +61,23 @@ TEST_F(AnyConfig, AggregateModeWithoutTypeListFailsFinalValidation)
 	/* hash_add with key zero selects bucket zero. Verification scans all buckets. */
 	hlist_add_head(&group.node, &dns_conf_rule.group[0]);
 	EXPECT_EQ(_config_any_verify(), -1);
+	group.any.aggregate = DNS_ANY_ADDRESS; EXPECT_EQ(_config_any_verify(), 0);
+	group.any.aggregate = DNS_ANY_AGGREGATE;
 	group.any.type_count = 1; group.any.types[0] = DNS_T_A; EXPECT_EQ(_config_any_verify(), 0);
 	dns_conf_rule = saved;
+}
+
+TEST_F(AnyConfig, AddressIsExplicitAndPreservesLegacyOptionsForModeSwitch)
+{
+	ASSERT_EQ(parse(_config_any_types, "TXT"), 0);
+	ASSERT_EQ(parse(_config_any_partial, "yes"), 0);
+	ASSERT_EQ(parse(_config_any_mode, "address"), 0);
+	EXPECT_EQ(group.any.aggregate, DNS_ANY_ADDRESS);
+	EXPECT_EQ(group.any.type_count, 1); EXPECT_EQ(group.any.types[0], DNS_T_TXT);
+	EXPECT_EQ(group.any.partial, 1);
+	ASSERT_EQ(parse(_config_any_mode, "aggregate"), 0);
+	EXPECT_EQ(group.any.aggregate, DNS_ANY_AGGREGATE);
+	EXPECT_EQ(group.any.types[0], DNS_T_TXT);
+	ASSERT_EQ(parse(_config_any_mode, "passthrough"), 0);
+	EXPECT_EQ(group.any.aggregate, DNS_ANY_PASSTHROUGH);
 }

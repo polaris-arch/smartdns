@@ -284,6 +284,9 @@ struct dns_request_txt {
 
 struct dns_request {
 	atomic_t refcnt;
+	/* Internal address-mode custody. Ordinary requests leave both NULL. */
+	struct dns_address_child_state *address_child;
+	struct dns_query_budget *query_budget;
 
 	struct dns_server_conn_head *conn;
 	struct dns_conf_group *conf;
@@ -320,9 +323,13 @@ struct dns_request {
 	int has_ecs;
 	struct dns_opt_ecs ecs;
 	int edns0_do;
-	/* Capture original ANY context independently of legacy AD+DO behavior. */
+	/* Original wire context, also needed to attest native cache provenance.
+	 * Capturing it does not change ordinary non-ANY forwarding behavior. */
 	unsigned char any_do, any_cd, any_ad, any_rd, any_unknown_context;
 	unsigned short any_udp_size;
+	/* Set only when this request enters a compatible native upstream lookup. */
+	unsigned char cache_origin_plain;
+	struct dns_address_cache_origin *cache_origin;
 
 	struct list_head https_svcb_list;
 

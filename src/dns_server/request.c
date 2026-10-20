@@ -18,6 +18,7 @@
 
 #include "request.h"
 #include "address.h"
+#include "address_child.h"
 #include "connection.h"
 #include "context.h"
 #include "ddr.h"
@@ -179,6 +180,7 @@ static void _dns_server_delete_request(struct dns_request *request)
 		free(request->original_domain);
 	}
 
+	_dns_server_address_child_release(request);
 	memset(request, 0, sizeof(*request));
 	free(request);
 	atomic_dec(&server.request_num);
@@ -831,6 +833,10 @@ struct dns_request *_dns_server_new_child_request(struct dns_request *request, c
 		memcpy(&child_request->ecs, &request->ecs, sizeof(child_request->ecs));
 		child_request->has_ecs = request->has_ecs;
 	}
+	if (_dns_server_address_child_inherit(child_request, request) != 0) {
+		child_request->parent_request = NULL;
+		goto errout;
+	}
 	_dns_server_request_get(request);
 	/* reference count is 1 hold by parent request */
 	request->child_request = child_request;
@@ -853,6 +859,7 @@ int _dns_server_request_copy(struct dns_request *request, struct dns_request *fr
 	int addr_len = 0;
 
 	request->rcode = from->rcode;
+	_dns_server_address_child_copy(request, from);
 
 	if (from->has_ip) {
 		request->has_ip = 1;
@@ -1237,6 +1244,10 @@ int _dns_server_setup_query_option(struct dns_request *request, struct dns_query
 		options->enable_flag |= DNS_QUEY_OPTION_EDNS0_DO;
 	}
 	if (request->qtype == DNS_T_ANY && request->any_cd) options->enable_flag |= DNS_QUEY_OPTION_CD;
+	if (request->query_budget) {
+		options->enable_flag |= DNS_QUEY_OPTION_BUDGET;
+		options->budget = request->query_budget;
+	}
 	options->conf_group_name = request->dns_group_name;
 	return 0;
 }
@@ -1376,7 +1387,9 @@ int _dns_server_parser_request(struct dns_request *request, struct dns_packet *p
 	}
 
 	request->qclass = qclass;
-	if (request->qtype == DNS_T_ANY) {
+	{
+		/* Native cache reuse must remember the original request context even
+		 * when an ordinary A/AAAA response drops ECS/DO/CD/AD from its wire. */
 		unsigned int opts = dns_get_OPT_option(packet);
 		request->any_do = !!(opts & DNS_OPT_FLAG_DO);
 		request->any_cd = packet->head.cd;
@@ -1403,7 +1416,7 @@ int _dns_server_parser_request(struct dns_request *request, struct dns_packet *p
 	}
 
 	for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(packet, rrs)) {
-		if (request->qtype == DNS_T_ANY) request->any_unknown_context = 1;
+		request->any_unknown_context = 1;
 		switch (rrs->type) {
 		case DNS_OPT_T_TCP_KEEPALIVE: {
 			unsigned short idle_timeout = 0;

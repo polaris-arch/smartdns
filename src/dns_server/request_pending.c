@@ -28,6 +28,9 @@ int _dns_server_set_to_pending_list(struct dns_request *request)
 	struct dns_request_pending_list *pending_list_tmp = NULL;
 	uint32_t key = 0;
 	int ret = -1;
+	/* The legacy key has neither deadline/budget identity nor detachable
+	 * follower custody. The owning address coordinator coalesces instead. */
+	if (request->address_child) return ret;
 	if (request->qtype != DNS_T_A && request->qtype != DNS_T_AAAA) {
 		return ret;
 	}

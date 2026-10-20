@@ -82,6 +82,37 @@ static int question(const unsigned char *data, int len, const char *domain, int 
 	return 0;
 }
 
+int dns_any_plain_addresses(const char *domain, int qtype, const unsigned char *wire, int len,
+						   unsigned char addresses[DNS_ANY_MAX_RECORDS][DNS_RR_AAAA_LEN])
+{
+	int off;
+	char owner[DNS_MAX_CNAME_LEN];
+	if ((qtype != DNS_T_A && qtype != DNS_T_AAAA) || question(wire, len, domain, qtype, &off) ||
+		(wire[2] & 2) || (wire[3] & 0x7f)) return -1; /* no TC/Z/AD/CD/error */
+	int count = get16(wire + 6), extra = get16(wire + 10);
+	int size = qtype == DNS_T_A ? DNS_RR_A_LEN : DNS_RR_AAAA_LEN;
+	if (count < 1 || count > DNS_ANY_MAX_RECORDS || get16(wire + 8) || extra > 1) return -1;
+	for (int i = 0; i < count; i++) {
+		if (read_name(wire, len, &off, owner) || strcasecmp(owner, domain) || off + 10 + size > len ||
+			get16(wire + off) != (unsigned int)qtype || get16(wire + off + 2) != DNS_C_IN ||
+			get16(wire + off + 8) != (unsigned int)size ||
+			!get32(wire + off + 4) || get32(wire + off + 4) > INT_MAX) return -1;
+		off += 10;
+		memset(addresses[i], 0, DNS_RR_AAAA_LEN);
+		memcpy(addresses[i], wire + off, size);
+		off += size;
+	}
+	if (extra) {
+		/* Plain empty OPT only. All other additional/authority data remains
+		 * valid for ordinary processing but cannot attest this narrow cache. */
+		if (read_name(wire, len, &off, owner) || owner[0] || off + 10 > len ||
+			get16(wire + off) != DNS_T_OPT || get16(wire + off + 2) < DNS_DEFAULT_PACKET_SIZE ||
+			get32(wire + off + 4) || get16(wire + off + 8)) return -1;
+		off += 10;
+	}
+	return off == len ? count : -1;
+}
+
 int dns_any_type_from_name(const char *name)
 {
 	static const struct { const char *name; int type; } supported[] = {

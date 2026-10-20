@@ -110,6 +110,10 @@ void _dns_server_set_dualstack_selection(struct dns_request *request)
 {
 	struct dns_rule_flags *rule_flag = NULL;
 
+	if (request->address_child) {
+		request->dualstack_selection = 0;
+		return;
+	}
 	if (request->dualstack_selection_query || is_ipv6_ready == 0) {
 		request->dualstack_selection = 0;
 		return;
@@ -191,6 +195,7 @@ static void _dns_server_check_complete_dualstack(struct dns_request *request, st
 
 int _dns_server_force_dualstack(struct dns_request *request)
 {
+	if (request->address_child) return -1;
 	/* for dualstack request as first pending request, check if need to choose another request*/
 	if (request->dualstack_request) {
 		struct dns_request *dualstack_request = request->dualstack_request;
@@ -259,6 +264,7 @@ int _dns_server_query_dualstack(struct dns_request *request)
 	struct dns_request *request_dualstack = NULL;
 	dns_type_t qtype = request->qtype;
 
+	if (request->address_child) return 0;
 	if (request->dualstack_selection == 0) {
 		return 0;
 	}

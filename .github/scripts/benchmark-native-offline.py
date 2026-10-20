@@ -30,6 +30,23 @@ All-response and successful-response latency distributions are reported
 separately, alongside every response code and timeout; fast rejection is not
 a speedup.
 
+Matched default-mode A and AAAA cases additionally measure 100 cold names,
+the same 100 hot names, and fresh-process 100-duplicate / 100-unique bursts
+with cache-size 0 for BOTH binaries. Every typed query must succeed with the
+exact fixture address. Cold/unique sends are exactly one per name, hot sends
+are zero, and duplicate coalescing is measured within one to 100 sends.
+These cases compare default typed performance separately from opted-in address
+work; default groups and cache-size 0 bypass proof allocation. CPU, latency and RSS
+remain observations, not a static claim of no regression or an allocation
+counter.
+
+Candidate-only address cases require complete A+AAAA answers without upstream
+ANY requests: 100 cold names, 100 names independently primed through ordinary
+A and AAAA queries, and a 32-request duplicate burst with completed caching
+disabled. Priming has its own validated samples and send counts; no address
+ANY request precedes the native-cache experiment. The delayed duplicate burst
+reports observed coalescing, not a scheduling-independent singleflight proof.
+
 The HTTP/1.1 TLS fixture returns 429 with Retry-After: 1 throughout a fixed
 50-query, 10-query/second phase, then switches to successful DNS replies.
 After 1.2 seconds, a 20-query recovery phase runs on the SAME resolver process.
@@ -82,13 +99,16 @@ BASELINE_REVISION = "dfc9ef4bd947891178924c06070fbccc3ea370ba"
 QUERY_COUNT = 100
 QUERY_TIMEOUT = 4.0
 AGGREGATE_INFLIGHT = 8
+ADDRESS_DUPLICATES = 32
+EXPECTED_SUBMITTED_QUERIES = 1340 + 4 * QUERY_COUNT + ADDRESS_DUPLICATES + 2 * 2 * 4 * QUERY_COUNT
 UPSTREAM_LIMIT = 4000
 GLOBAL_TIMEOUT = 180
 LOOPBACK = "127.0.0.1"
-ANY, A, TXT = 255, 1, 16
+ANY, A, AAAA, TXT = 255, 1, 28, 16
 ADDRESS = bytes((192, 0, 2, 1))
+ADDRESS6 = bytes.fromhex("20010db8000000000000000000000001")
 TEXT = b"offline-benchmark"
-TYPE_NAMES = {A: "A", TXT: "TXT", ANY: "ANY"}
+TYPE_NAMES = {A: "A", AAAA: "AAAA", TXT: "TXT", ANY: "ANY"}
 COMMON_TEMPLATE = """\
 bind 127.0.0.1:{resolver_port}
 bind-tcp 127.0.0.1:{resolver_port}
@@ -118,6 +138,11 @@ any-aggregate-concurrency 2
 any-aggregate-max-attempts 3
 any-aggregate-timeout-ms 950
 any-aggregate-partial no
+"""
+ADDRESS_CONFIG = """\
+any-response-mode address
+any-aggregate-max-attempts 2
+any-aggregate-timeout-ms 950
 """
 
 
@@ -191,15 +216,17 @@ def make_query(name, ident, qtype=ANY):
     return struct.pack("!6H", ident, 0x0100, 1, 0, 0, 0) + encode_name(name) + struct.pack("!HH", qtype, 1)
 
 
-def make_answer(query, aggregate=False):
+def make_answer(query, aggregate=False, address=False):
     ident, flags, name, qtype, _, _ = question(query)
     if flags & 0x8000 or qtype not in TYPE_NAMES:
         raise ValueError("unexpected fixture request")
-    rcode = 5 if aggregate and qtype == ANY else 0
+    rcode = 5 if (aggregate and qtype == ANY) or (address and qtype not in (A, AAAA)) else 0
     answers = []
     if not rcode:
         if qtype in (ANY, A):
             answers.append((A, ADDRESS))
+        elif qtype == AAAA:
+            answers.append((AAAA, ADDRESS6))
         elif qtype == TXT:
             answers.append((TXT, bytes((len(TEXT),)) + TEXT))
     wire = struct.pack("!6H", ident, 0x8180 | rcode, 1, len(answers), 0, 0)
@@ -209,9 +236,9 @@ def make_answer(query, aggregate=False):
     return wire
 
 
-def validate_response(wire, name, ident, aggregate=False, allowed_rcodes=(0,)):
-    actual_id, flags, actual_name, qtype, offset, counts = question(wire)
-    if actual_id != ident or actual_name != name or qtype != ANY:
+def validate_response(wire, name, ident, aggregate=False, allowed_rcodes=(0,), qtype=ANY, address=False):
+    actual_id, flags, actual_name, actual_type, offset, counts = question(wire)
+    if actual_id != ident or actual_name != name or actual_type != qtype:
         raise ValueError("response question/ID differs from request")
     if not flags & 0x8000 or flags & 0x0200:
         raise ValueError("response QR/TC flags incorrect")
@@ -236,9 +263,13 @@ def validate_response(wire, name, ident, aggregate=False, allowed_rcodes=(0,)):
                 records.append((kind, data))
     if offset != len(wire):
         raise ValueError("trailing DNS data")
-    expected = [(A, ADDRESS)]
-    if aggregate:
+    expected = [(AAAA, ADDRESS6)] if qtype == AAAA else [(A, ADDRESS)]
+    if qtype == TXT:
+        expected = [(TXT, bytes((len(TEXT),)) + TEXT)]
+    if qtype == ANY and aggregate:
         expected.append((TXT, bytes((len(TEXT),)) + TEXT))
+    if qtype == ANY and address:
+        expected.append((AAAA, ADDRESS6))
     if rcode == 0 and sorted(records) != sorted(expected):
         raise ValueError("NOERROR response has incorrect answer data")
     if rcode != 0 and records:
@@ -269,6 +300,11 @@ def expected_case_names():
     result = ["common/%s/%s" % (label, case) for label in ("baseline", "candidate")
               for case in dns_cases + ("sustained_429", "recovery_after_429")]
     result += ["candidate_only_aggregate/candidate/" + case for case in dns_cases]
+    result += ["candidate_only_address/candidate/" + case for case in (
+        "cold_dualstack", "prime_native_a", "prime_native_aaaa", "warm_native_cache", "duplicate_32")]
+    result += ["common_typed/%s/%s/%s" % (label, kind, phase)
+               for label in ("baseline", "candidate") for kind in ("A", "AAAA")
+               for phase in ("cold", "hot", "duplicate_100_cache0", "unique_100_cache0")]
     return sorted(result)
 
 
@@ -307,8 +343,9 @@ def resolver_environment(source):
 class Fixture:
     """One bounded UDP reactor or bounded HTTP/1.1-TLS connection set."""
 
-    def __init__(self, aggregate=False, delay=0.0, cert=None, key=None):
+    def __init__(self, aggregate=False, delay=0.0, cert=None, key=None, address=False):
         self.aggregate, self.delay = aggregate, delay
+        self.address = address
         self.is_tls = cert is not None
         self.mode = "ok"
         self.transitions = []
@@ -380,7 +417,7 @@ class Fixture:
             self._record(query)
             sequence += 1
             heapq.heappush(pending, (time.monotonic() + self.delay, sequence,
-                                     make_answer(query, self.aggregate), address))
+                                     make_answer(query, self.aggregate, self.address), address))
 
     def _tls_accept(self):
         accepted = 0
@@ -503,7 +540,7 @@ def count_log_bytes(data):
 
 
 class Resolver:
-    def __init__(self, binary, directory, fixture, cache_size, aggregate=False):
+    def __init__(self, binary, directory, fixture, cache_size, aggregate=False, address=False):
         self.directory = directory
         directory.mkdir(parents=True)
         self.port = reserve_resolver_port()
@@ -514,6 +551,8 @@ class Resolver:
                                         cache_size=cache_size, log_file=self.logfile)
         if aggregate:
             config += AGGREGATE_CONFIG
+        if address:
+            config += ADDRESS_CONFIG
         self.config = config
         config_path = directory / "smartdns.conf"
         config_path.write_text(config)
@@ -603,7 +642,8 @@ def query_capacity(query_count, serial, max_inflight):
 
 
 def run_queries(resolver, fixture, query_names, *, serial=False, interval=0.0,
-                aggregate=False, allowed_rcodes=(0,), timeout=QUERY_TIMEOUT, max_inflight=None):
+                aggregate=False, allowed_rcodes=(0,), timeout=QUERY_TIMEOUT, max_inflight=None,
+                qtype=ANY, address=False):
     """One UDP client; fixed IDs/names/order; absolute paced or immediate burst."""
     capacity = query_capacity(len(query_names), serial, max_inflight)
     initial_events = len(fixture.snapshot())
@@ -625,8 +665,9 @@ def run_queries(resolver, fixture, query_names, *, serial=False, interval=0.0,
                 ident = 1000 + next_query
                 name = query_names[next_query]
                 sent = time.monotonic()
-                sock.send(make_query(name, ident))
+                sock.send(make_query(name, ident, qtype))
                 pending[ident] = {"index": next_query, "id": ident, "name": name,
+                                  "qtype": qtype,
                                   "sent_seconds": sent - start, "_sent": sent}
                 next_query += 1
             now = time.monotonic()
@@ -655,7 +696,8 @@ def run_queries(resolver, fixture, query_names, *, serial=False, interval=0.0,
                     row = pending.pop(ident)
                     row["latency_ms"] = (received - row.pop("_sent")) * 1000
                     try:
-                        row["rcode"] = validate_response(wire, row["name"], ident, aggregate, allowed_rcodes)
+                        row["rcode"] = validate_response(wire, row["name"], ident, aggregate, allowed_rcodes,
+                                                         qtype=qtype, address=address)
                         row["outcome"] = "response"
                     except ValueError as exc:
                         row.update(outcome="invalid", rcode=None, error=str(exc))
@@ -675,6 +717,7 @@ def run_queries(resolver, fixture, query_names, *, serial=False, interval=0.0,
     result = summarise(samples, events, extra)
     result.update(expected_submitted=len(query_names), elapsed_seconds=elapsed,
                   client_max_inflight=capacity,
+                  client_question_type=TYPE_NAMES[qtype],
                   session_directory=str(resolver.directory),
                   cpu_seconds={"user": after["user_cpu_seconds"] - before["user_cpu_seconds"],
                                "system": after["system_cpu_seconds"] - before["system_cpu_seconds"]},
@@ -710,6 +753,52 @@ def check_burst_result(result, aggregate):
     # Only the explicitly bounded aggregate experiment permits admission errors.
     return check_result(result, all_success=not aggregate, minimum_sends=factor,
                         maximum_sends=QUERY_COUNT * factor)
+
+
+def check_address_result(result, expected_by_type=None, per_name_expected=None):
+    """Exact cold/cache send contracts; duplicate bursts retain observed sharing."""
+    exact = sum(expected_by_type.values()) if expected_by_type is not None else None
+    check_result(result, all_success=True, minimum_sends=2 if exact is None else exact,
+                 maximum_sends=2 * result["submitted"] if exact is None else exact)
+    validation = result["validation"]
+    actual = result["upstream"]["by_qtype"]
+    if set(actual) - {"A", "AAAA"}:
+        validation["failures"].append("address mode sent an upstream type other than A/AAAA")
+    if expected_by_type is not None and actual != expected_by_type:
+        validation["failures"].append("address/native-cache upstream type counts differ")
+    if expected_by_type is None and (set(actual) != {"A", "AAAA"} or
+                                     any(count > result["submitted"] for count in actual.values())):
+        validation["failures"].append("duplicate address burst has invalid family send counts")
+    if per_name_expected is not None:
+        expected = {sample["name"]: per_name_expected for sample in result["samples"]}
+        if result["upstream"]["by_name"] != expected:
+            validation["failures"].append("address/native-cache per-name send counts differ")
+    validation["requires_no_upstream_any"] = True
+    validation["expected_upstream_by_qtype"] = expected_by_type
+    validation["passed"] = not validation["failures"]
+    return result
+
+
+def check_default_typed_result(result, qtype, phase):
+    """Require complete matched typed work, not faster rejection or extra fanout."""
+    kind = TYPE_NAMES[qtype]
+    if qtype not in (A, AAAA) or phase not in ("cold", "hot", "duplicate", "unique"):
+        raise ValueError("invalid default typed measurement")
+    minimum = 0 if phase == "hot" else 1 if phase == "duplicate" else result["submitted"]
+    maximum = 0 if phase == "hot" else result["submitted"]
+    check_result(result, all_success=True, minimum_sends=minimum, maximum_sends=maximum)
+    actual = result["upstream"]
+    expected_types = {kind: actual["sends"]} if actual["sends"] else {}
+    expected_names = {} if phase == "hot" else {
+        sample["name"]: {kind: actual["sends"] if phase == "duplicate" else 1}
+        for sample in result["samples"]}
+    validation = result["validation"]
+    if actual["by_qtype"] != expected_types or actual["by_name"] != expected_names:
+        validation["failures"].append("default typed upstream type/per-name workload differs")
+    validation["passed"] = not validation["failures"]
+    validation["expected_question_type"] = kind
+    validation["phase"] = phase
+    return result
 
 
 def finish_session(report, resolver, fixture):
@@ -777,6 +866,34 @@ def run_dns_cases(report, label, binary, root, aggregate=False):
             finish_session(report, resolver, fixture)
 
 
+def run_default_typed_cases(report, label, binary, root):
+    for qtype in (A, AAAA):
+        kind = TYPE_NAMES[qtype]
+        prefix = "common_typed/%s/%s/" % (label, kind)
+        directory = root / "common_typed" / label / kind
+        with Fixture() as fixture:
+            resolver = Resolver(binary, directory / "cold-hot", fixture, 256)
+            with resolver:
+                query_names = names("typed-" + kind.lower())
+                for phase in ("cold", "hot"):
+                    result = run_queries(resolver, fixture, query_names, serial=True, qtype=qtype)
+                    check_default_typed_result(result, qtype, phase)
+                    result["workload"] = "100 default %s %s names; matched baseline/candidate config and serial schedule" % (kind, phase)
+                    report["cases"][prefix + phase] = result
+            finish_session(report, resolver, fixture)
+        for phase in ("duplicate", "unique"):
+            with Fixture(delay=0.025) as fixture:
+                resolver = Resolver(binary, directory / (phase + "-cache0"), fixture, 0)
+                with resolver:
+                    result = run_queries(resolver, fixture, names(phase), qtype=qtype)
+                    check_default_typed_result(result, qtype, phase)
+                    result["workload"] = "100 default %s %s burst queries; cache-size 0; every answer required" % (kind, phase)
+                    result["cache_note"] = ("No completed cache or native proof-set allocation. Duplicate native pending "
+                                            "coalescing is observed, not required to achieve exactly one send.")
+                    report["cases"][prefix + phase + "_100_cache0"] = result
+                finish_session(report, resolver, fixture)
+
+
 def run_backpressure(report, label, binary, root, cert, key):
     prefix = "common/%s/" % label
     with Fixture(cert=cert, key=key) as fixture:
@@ -800,6 +917,57 @@ def run_backpressure(report, label, binary, root, cert, key):
         finish_session(report, resolver, fixture)
 
 
+def run_address_cases(report, binary, root):
+    prefix = "candidate_only_address/candidate/"
+    directory = root / "candidate_only_address" / "candidate"
+    with Fixture(address=True) as fixture:
+        resolver = Resolver(binary, directory / "cold", fixture, 256, address=True)
+        with resolver:
+            result = run_queries(resolver, fixture, names("address-cold"), address=True,
+                                 max_inflight=AGGREGATE_INFLIGHT)
+            check_address_result(result, {"A": QUERY_COUNT, "AAAA": QUERY_COUNT}, {"A": 1, "AAAA": 1})
+            result["workload"] = "100 cold address-mode ANY names; full A+AAAA; exactly two typed sends per name"
+            report["cases"][prefix + "cold_dualstack"] = result
+        finish_session(report, resolver, fixture)
+
+    # A separate process proves that native positive entries, not an earlier
+    # completed ANY result, supply the warm address answers.
+    with Fixture(address=True) as fixture:
+        resolver = Resolver(binary, directory / "native-cache", fixture, 256, address=True)
+        with resolver:
+            warm_names = names("address-warm")
+            for qtype, phase in ((A, "prime_native_a"), (AAAA, "prime_native_aaaa")):
+                result = run_queries(resolver, fixture, warm_names, qtype=qtype,
+                                     max_inflight=AGGREGATE_INFLIGHT)
+                kind = TYPE_NAMES[qtype]
+                check_address_result(result, {kind: QUERY_COUNT}, {kind: 1})
+                result["workload"] = "Prime 100 native positive %s entries before any address-mode ANY query" % kind
+                report["cases"][prefix + phase] = result
+            result = run_queries(resolver, fixture, warm_names, address=True,
+                                 max_inflight=AGGREGATE_INFLIGHT)
+            check_address_result(result, {})
+            result["workload"] = "100 address-mode ANY answers from independently primed native A/AAAA entries; zero sends"
+            report["cases"][prefix + "warm_native_cache"] = result
+        finish_session(report, resolver, fixture)
+
+    with Fixture(address=True, delay=0.025) as fixture:
+        resolver = Resolver(binary, directory / "duplicate", fixture, 0, address=True)
+        with resolver:
+            result = run_queries(resolver, fixture, ["address-duplicate.benchmark.test"] * ADDRESS_DUPLICATES,
+                                 address=True)
+            check_address_result(result)
+            result["workload"] = "32 duplicate address ANY requests, cache-size 0, delayed typed fixture; all must succeed"
+            result["coalescing_observation"] = {
+                "uncoalesced_typed_sends": 2 * ADDRESS_DUPLICATES,
+                "observed_typed_sends": result["upstream"]["sends"],
+                "saved_typed_sends": 2 * ADDRESS_DUPLICATES - result["upstream"]["sends"],
+                "single_typed_pair_observed": result["upstream"]["by_qtype"] == {"A": 1, "AAAA": 1},
+                "note": "Timing-dependent measurement; deterministic admission-barrier proof belongs to AnyAddress tests.",
+            }
+            report["cases"][prefix + "duplicate_32"] = result
+        finish_session(report, resolver, fixture)
+
+
 def write_report(root, report):
     path = root / "results.json"
     path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
@@ -812,15 +980,16 @@ def write_report(root, report):
         "and complete request/fixture samples are retained in results.json.",
         "Peak RSS is process lifetime VmHWM; cold/repeated share a process.",
         "",
-        "case | success/submitted | timeout | success p50 ms | success p95 ms | sends/query | peak RSS KiB",
+        "case | success/submitted | timeout | success p50 ms | success p95 ms | sends/query | user CPU s | system CPU s | peak RSS KiB",
     ]
     for name, case in sorted(report["cases"].items()):
         latency = case["successful_response_latency"]
         fmt = lambda value: "n/a" if value is None else "%.3f" % value
-        lines.append("%s | %d/%d | %d | %s | %s | %.3f | %d" %
+        lines.append("%s | %d/%d | %d | %s | %s | %.3f | %.6f | %.6f | %d" %
                      (name, case["successful_responses"], case["submitted"], case["timeouts"],
                       fmt(latency["p50_ms"]), fmt(latency["p95_ms"]),
-                      case["upstream"]["sends_per_submitted_query"], case["process_peak_rss_kib"]))
+                      case["upstream"]["sends_per_submitted_query"], case["cpu_seconds"]["user"],
+                      case["cpu_seconds"]["system"], case["process_peak_rss_kib"]))
     lines.extend(["", "Experiment validation: " + report["status"]])
     if report.get("error"):
         lines.append("Error: " + report["error"])
@@ -828,6 +997,135 @@ def write_report(root, report):
 
 
 class SourceTests(unittest.TestCase):
+    def test_default_typed_exact_workloads_reject_errors_and_wrong_sends(self):
+        for qtype in (A, AAAA):
+            for phase in ("cold", "hot", "unique", "duplicate"):
+                query_names = ["same.test"] * 3 if phase == "duplicate" else ["n%d.test" % i for i in range(3)]
+                samples = [{"name": name, "outcome": "response", "rcode": 0, "latency_ms": 1.0}
+                           for name in query_names]
+                events = [] if phase == "hot" else [
+                    {"name": name, "qtype": qtype, "http_status": None} for name in sorted(set(query_names))]
+
+                def result_for(rows, sends):
+                    result = summarise(rows, sends, 0)
+                    result.update(expected_submitted=3, samples=rows, upstream_events=sends)
+                    return check_default_typed_result(result, qtype, phase)
+
+                self.assertTrue(result_for(samples, events)["validation"]["passed"])
+                failures = [dict(row) for row in samples]
+                failures[0]["rcode"] = 2
+                self.assertFalse(result_for(failures, events)["validation"]["passed"])
+                wrong = events + [{"name": query_names[0], "qtype": ANY, "http_status": None}]
+                self.assertFalse(result_for(samples, wrong)["validation"]["passed"])
+                if phase in ("cold", "unique"):
+                    self.assertFalse(result_for(samples, events[:-1])["validation"]["passed"])
+                if phase == "duplicate":
+                    self.assertTrue(result_for(samples, events * 3)["validation"]["passed"])
+                    self.assertFalse(result_for(samples, events * 4)["validation"]["passed"])
+
+    def test_default_typed_orchestration_matches_both_binaries(self):
+        schedules, configs = [], []
+
+        def resolver_for(binary, directory, fixture, cache_size):
+            resolver = mock.MagicMock()
+            resolver.binary, resolver.directory = binary, directory
+            resolver.cache_size, resolver.calls = cache_size, 0
+            configs.append((binary, cache_size, directory.name))
+            return resolver
+
+        def queries_for(resolver, fixture, query_names, **options):
+            qtype = options["qtype"]
+            schedules.append((resolver.binary, tuple(query_names), dict(options), resolver.cache_size))
+            hot = resolver.cache_size and resolver.calls > 0
+            resolver.calls += 1
+            samples = [{"name": name, "outcome": "response", "rcode": 0, "latency_ms": 1.0}
+                       for name in query_names]
+            events = [] if hot else [
+                {"name": name, "qtype": qtype, "http_status": None} for name in sorted(set(query_names))]
+            result = summarise(samples, events, 0)
+            result.update(expected_submitted=len(samples), samples=samples, upstream_events=events)
+            return result
+
+        report = {"cases": {}}
+        with mock.patch.dict(run_default_typed_cases.__globals__, Fixture=mock.MagicMock(),
+                             Resolver=resolver_for, run_queries=queries_for, finish_session=mock.Mock()):
+            for label in ("baseline", "candidate"):
+                run_default_typed_cases(report, label, label, Path("/virtual"))
+        self.assertEqual(len(report["cases"]), 16)
+        self.assertTrue(all(case["validation"]["passed"] for case in report["cases"].values()))
+        self.assertEqual([row[1:] for row in schedules if row[0] == "baseline"],
+                         [row[1:] for row in schedules if row[0] == "candidate"])
+        self.assertEqual([row[1:] for row in configs if row[0] == "baseline"],
+                         [row[1:] for row in configs if row[0] == "candidate"])
+        self.assertEqual(sum(case["submitted"] for case in report["cases"].values()), 1600)
+        self.assertTrue(all(name in expected_case_names() for name in report["cases"]))
+
+    def test_address_fixture_answers_typed_queries_and_refuses_any(self):
+        name = "address-fixture.benchmark.test"
+        for kind in (A, AAAA):
+            wire = make_answer(make_query(name, 12, kind), address=True)
+            self.assertEqual(validate_response(wire, name, 12, qtype=kind), 0)
+        wire = make_answer(make_query(name, 12), address=True)
+        self.assertEqual(validate_response(wire, name, 12, allowed_rcodes=(5,), address=True), 5)
+
+    def test_address_response_requires_both_exact_families(self):
+        name = "address-answer.benchmark.test"
+        single = make_answer(make_query(name, 12))
+        dual = bytearray(single)
+        struct.pack_into("!H", dual, 6, 2)
+        dual += b"\xc0\x0c" + struct.pack("!HHIH", AAAA, 1, 60, len(ADDRESS6)) + ADDRESS6
+        self.assertEqual(validate_response(bytes(dual), name, 12, address=True), 0)
+        with self.assertRaises(ValueError):
+            validate_response(single, name, 12, address=True)
+        with self.assertRaises(ValueError):
+            validate_response(bytes(dual[:-1]) + b"\xff", name, 12, address=True)
+        with self.assertRaises(ValueError):
+            validate_response(bytes(dual), name, 12, qtype=AAAA, address=True)
+
+    def test_address_exact_sends_and_native_cache_zero_sends(self):
+        samples = [{"name": "address-%d.benchmark.test" % index, "outcome": "response",
+                    "rcode": 0, "latency_ms": 1.0} for index in range(2)]
+        events = [{"name": sample["name"], "qtype": kind, "http_status": None}
+                  for sample in samples for kind in (A, AAAA)]
+
+        def result_for(upstream):
+            result = summarise(samples, upstream, 0)
+            result.update(expected_submitted=2, samples=samples, upstream_events=upstream)
+            return result
+
+        result = result_for(events)
+        check_address_result(result, {"A": 2, "AAAA": 2}, {"A": 1, "AAAA": 1})
+        self.assertTrue(result["validation"]["passed"])
+        result = result_for([])
+        check_address_result(result, {})
+        self.assertTrue(result["validation"]["passed"])
+        result = result_for(events[:1])
+        check_address_result(result, {})
+        self.assertFalse(result["validation"]["passed"])
+        # Neither correct total sends nor successful responses can hide an ANY.
+        wrong = [dict(event) for event in events]
+        wrong[0]["qtype"] = ANY
+        result = result_for(wrong)
+        check_address_result(result, {"A": 2, "AAAA": 2}, {"A": 1, "AAAA": 1})
+        self.assertFalse(result["validation"]["passed"])
+        self.assertIn("address mode sent an upstream type other than A/AAAA", result["validation"]["failures"])
+
+    def test_address_duplicate_observation_still_requires_all_success(self):
+        samples = [{"name": "address-duplicate.benchmark.test", "outcome": "response",
+                    "rcode": 0, "latency_ms": 25.0} for _ in range(ADDRESS_DUPLICATES)]
+        for pair_count in (1, ADDRESS_DUPLICATES):
+            events = [{"name": samples[0]["name"], "qtype": kind, "http_status": None}
+                      for _ in range(pair_count) for kind in (A, AAAA)]
+            result = summarise(samples, events, 0)
+            result.update(expected_submitted=ADDRESS_DUPLICATES, samples=samples, upstream_events=events)
+            check_address_result(result)
+            self.assertTrue(result["validation"]["passed"])
+        samples[-1] = dict(samples[-1], rcode=2)
+        result = summarise(samples, events, 0)
+        result.update(expected_submitted=ADDRESS_DUPLICATES, samples=samples, upstream_events=events)
+        check_address_result(result)
+        self.assertFalse(result["validation"]["passed"])
+
     def test_question_and_minimal_any(self):
         query = make_query("cold-000.benchmark.test", 1234)
         wire = make_answer(query)
@@ -871,8 +1169,9 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(len(set(names("duplicate"))), 1)
         self.assertEqual(len(set(names("unique"))), 100)
         self.assertEqual(names("cold"), names("cold"))
-        self.assertEqual(len(expected_case_names()), 16)
-        self.assertEqual(len(set(expected_case_names())), 16)
+        self.assertEqual(len(expected_case_names()), 37)
+        self.assertEqual(len(set(expected_case_names())), 37)
+        self.assertEqual(EXPECTED_SUBMITTED_QUERIES, 3372)
         self.assertEqual(query_capacity(100, True, None), 1)
         self.assertEqual(query_capacity(100, False, None), 100)
         self.assertEqual(query_capacity(100, False, AGGREGATE_INFLIGHT), 8)
@@ -1044,12 +1343,13 @@ def main():
     # Never overwrite or mix measurements from separate invocations.
     root.mkdir(parents=True, exist_ok=False)
     report = {"schema_version": 1, "status": "incomplete", "cases": {}, "sessions": [],
-              "expected_cases": expected_case_names(), "expected_submitted_queries": 1340,
+              "expected_cases": expected_case_names(), "expected_submitted_queries": EXPECTED_SUBMITTED_QUERIES,
               "expected_baseline_source_revision": BASELINE_REVISION,
               "source_provenance": "Caller must retain exact source archives/build manifest; binary hash alone is insufficient.",
               "binaries": {label: {"path": str(binary), "sha256": sha256(binary)}
                            for label, binary in (("baseline", args.baseline), ("candidate", args.candidate))},
               "common_config_template": COMMON_TEMPLATE, "candidate_only_aggregate_config": AGGREGATE_CONFIG,
+              "candidate_only_address_config": ADDRESS_CONFIG,
               "child_environment_adjustments": ["SMARTDNS_RESTART_ON_CRASH removed"],
               "host": {"uname": list(os.uname()), "python": sys.version, "network_interfaces": sorted(interfaces)},
               "limits": {"global_timeout_seconds": GLOBAL_TIMEOUT, "per_query_timeout_seconds": QUERY_TIMEOUT,
@@ -1065,9 +1365,13 @@ def main():
         for label, binary in (("baseline", args.baseline), ("candidate", args.candidate)):
             run_dns_cases(report, label, binary, root)
             write_report(root, report)
+            run_default_typed_cases(report, label, binary, root)
+            write_report(root, report)
             run_backpressure(report, label, binary, root, args.tls_cert, args.tls_key)
             write_report(root, report)
         run_dns_cases(report, "candidate", args.candidate, root, aggregate=True)
+        write_report(root, report)
+        run_address_cases(report, args.candidate, root)
         if sorted(report["cases"]) != report["expected_cases"]:
             raise InvalidMeasurement("missing or extra benchmark case")
         if sum(case["submitted"] for case in report["cases"].values()) != report["expected_submitted_queries"]:

@@ -17,6 +17,7 @@
  */
 
 #include "cache.h"
+#include "address_child.h"
 #include "answer.h"
 #include "context.h"
 #include "dns_server.h"
@@ -24,6 +25,7 @@
 #include "request.h"
 #include "rules.h"
 #include "soa.h"
+#include "smartdns/dns_any.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -129,6 +131,7 @@ int _dns_server_request_update_cache(struct dns_request *request, int speed, dns
 {
 	int ttl = 0;
 	int ret = -1;
+	unsigned int origin_flags = 0;
 
 	if (qtype != DNS_T_A && qtype != DNS_T_AAAA && qtype != DNS_T_HTTPS) {
 		goto errout;
@@ -148,6 +151,17 @@ int _dns_server_request_update_cache(struct dns_request *request, int speed, dns
 	cache_key.domain = request->domain;
 	cache_key.qtype = request->qtype;
 	cache_key.query_flag = request->server_flags;
+	/* The request must actually have entered upstream resolution, not merely
+	 * look plain after a local reply or an unproven cache/pending hit.
+	 * Recheck mutable CNAME state before attesting the finalized blob. The
+	 * route/ECS predicate was captured before entering client callbacks; do
+	 * not acquire the client's server-list lock again from a receive path. */
+	if ((qtype == DNS_T_A || qtype == DNS_T_AAAA) && request->cache_origin_plain &&
+		request->rcode == DNS_RC_NOERROR && !request->is_cache_reply &&
+		!request->has_cname && !request->parent_request && !request->is_mdns_lookup &&
+		cache_data && cache_data->head.size > 0 && cache_data->head.size <= DNS_IN_PACKSIZE &&
+		_dns_server_address_cache_proven(request, cache_data->data, cache_data->head.size))
+		origin_flags = DNS_CACHE_ORIGIN_PLAIN;
 
 	if (request->prefetch) {
 		/* no prefetch for mdns request */
@@ -156,16 +170,16 @@ int _dns_server_request_update_cache(struct dns_request *request, int speed, dns
 			goto errout;
 		}
 
-		if (dns_cache_replace(&cache_key, request->rcode, ttl, speed,
+		if (dns_cache_replace_with_origin(&cache_key, request->rcode, ttl, speed,
 							  _dns_server_get_cache_timeout(request, &cache_key, ttl),
-							  !(request->prefetch_flags & PREFETCH_FLAGS_EXPIRED), cache_data) != 0) {
+							  !(request->prefetch_flags & PREFETCH_FLAGS_EXPIRED), cache_data, origin_flags) != 0) {
 			ret = 0;
 			goto errout;
 		}
 	} else {
 		/* insert result to cache */
-		if (dns_cache_insert(&cache_key, request->rcode, ttl, speed, _dns_server_get_cache_timeout(request, NULL, ttl),
-							 cache_data) != 0) {
+		if (dns_cache_insert_with_origin(&cache_key, request->rcode, ttl, speed, _dns_server_get_cache_timeout(request, NULL, ttl),
+							 cache_data, origin_flags) != 0) {
 			ret = -1;
 			goto errout;
 		}
@@ -256,12 +270,28 @@ static int _dns_server_process_cache_packet(struct dns_request *request, struct 
 {
 	int ret = -1;
 	struct dns_cache_packet *cache_packet = NULL;
+	struct dns_cache_info origin_info = {0};
+	int origin_ttl = 0;
 	if (dns_cache->info.qtype != request->qtype) {
 		goto out;
 	}
 
-	cache_packet = (struct dns_cache_packet *)dns_cache_get_data(dns_cache);
+	if (request->address_child) {
+		/* Snapshot the provenance, packet and its age/TTL under one cache
+		 * lock. A concurrent replacement cannot authenticate a new unsafe
+		 * packet with an old flag or extend an old packet with new metadata. */
+		cache_packet = (struct dns_cache_packet *)dns_cache_get_data_with_origin(
+			dns_cache, DNS_CACHE_ORIGIN_PLAIN, &origin_info);
+		time_t now = time(NULL);
+		time_t age = now > origin_info.insert_time ? now - origin_info.insert_time : 0;
+		if (age < origin_info.ttl) origin_ttl = origin_info.ttl - age;
+	} else cache_packet = (struct dns_cache_packet *)dns_cache_get_data(dns_cache);
 	if (cache_packet == NULL) {
+		goto out;
+	}
+	if (request->address_child && (origin_ttl <= 0 || origin_info.qtype != request->qtype ||
+		origin_info.rcode != DNS_RC_NOERROR || cache_packet->head.size <= 0 ||
+		cache_packet->head.size > DNS_IN_PACKSIZE)) {
 		goto out;
 	}
 
@@ -273,16 +303,27 @@ static int _dns_server_process_cache_packet(struct dns_request *request, struct 
 	struct dns_server_post_context context;
 	_dns_server_post_context_init(&context, request);
 
-	if (request->original_domain != NULL && cache_packet->head.size < DNS_IN_PACKSIZE) {
+	if (request->address_child || (request->original_domain != NULL && cache_packet->head.size < DNS_IN_PACKSIZE)) {
 		context.inpacket = context.inpacket_buff;
 		memcpy(context.inpacket, cache_packet->data, cache_packet->head.size);
 	} else {
 		context.inpacket = cache_packet->data;
 	}
 	context.inpacket_len = cache_packet->head.size;
-	request->ping_time = dns_cache->info.speed;
+	request->ping_time = request->address_child ? origin_info.speed : dns_cache->info.speed;
 
-	if (dns_decode(context.packet, context.packet_maxlen, cache_packet->data, cache_packet->head.size) != 0) {
+	if (request->address_child) {
+		time_t now = time(NULL);
+		uint32_t minimum = 0;
+		/* Never rewrite the shared cache blob. Age each RR exactly once and
+		 * reject a stale CNAME even if the cache entry's address TTL is fresh. */
+		time_t elapsed = now > origin_info.insert_time ? now - origin_info.insert_time : 0;
+		uint32_t age = elapsed > UINT32_MAX ? UINT32_MAX : elapsed;
+		if (dns_any_wire_age(context.inpacket, context.inpacket_len, age, &minimum) ||
+			minimum == 0 || _dns_server_address_child_cache_positive(request, context.inpacket,
+				&context.inpacket_len, origin_ttl)) goto out;
+	}
+	if (dns_decode(context.packet, context.packet_maxlen, context.inpacket, context.inpacket_len) != 0) {
 		tlog(TLOG_ERROR, "decode cache failed, %d, %d", context.packet_maxlen, context.inpacket_len);
 		goto out;
 	}
@@ -301,7 +342,7 @@ static int _dns_server_process_cache_packet(struct dns_request *request, struct 
 	context.do_audit = 1;
 	context.do_reply = 1;
 	context.is_cache_reply = 1;
-	context.reply_ttl = _dns_server_get_expired_ttl_reply(request, dns_cache);
+	context.reply_ttl = request->address_child ? -1 : _dns_server_get_expired_ttl_reply(request, dns_cache);
 	ret = _dns_server_reply_passthrough(&context);
 out:
 	if (cache_packet) {
@@ -407,6 +448,12 @@ reply_cache:
 	}
 
 out_update_cache:
+	if (request->address_child) {
+		/* A hit was admitted only while fresh. Do not race a wall-clock TTL
+		 * boundary into an unbudgeted asynchronous prefetch. */
+		dns_cache_update(dns_cache);
+		goto out;
+	}
 	if (dns_cache_get_ttl(dns_cache) == 0) {
 		struct dns_server_query_option dns_query_options;
 		int prefetch_flags = 0;

@@ -22,6 +22,7 @@
 #include "smartdns/dns.h"
 #include "smartdns/fast_ping.h"
 #include "include/utils.h"
+#include "include/fixture_startup.h"
 #include <atomic>
 #include <functional>
 #include <string>
@@ -70,6 +71,7 @@ class Server
 	TempFile conf_temp_file_;
 	std::vector<MockPingIP> mock_ping_ips_;
 	enum CREATE_MODE mode_;
+	FixtureStartupCancellation startup_;
 };
 
 struct ServerRequestContext {
