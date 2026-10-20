@@ -21,6 +21,7 @@
 #include "smartdns/dns.h"
 #include "include/utils.h"
 #include "server.h"
+#include <atomic>
 #include "gtest/gtest.h"
 #include <atomic>
 
@@ -168,7 +169,6 @@ TEST_F(Server, max_queries)
 	smartdns::MockServer server_upstream;
 	smartdns::MockServer server_upstream1;
 	smartdns::Server server;
-	int count = 0;
 
 	server_upstream.Start("udp://0.0.0.0:61053", [&](struct smartdns::ServerRequestContext *request) {
 		smartdns::MockServer::AddIP(request, request->domain.c_str(), "1.2.3.4", 611);
@@ -186,8 +186,8 @@ max-query-limit 2
 )""");
 
 	std::vector<std::thread> threads;
-	int success_num = 0;
-	int refused_num = 0;
+	std::atomic<int> success_num{0};
+	std::atomic<int> refused_num{0};
 	for (int i = 0; i < 5; i++) {
 		auto t = std::thread([&]() {
 			smartdns::Client client;
@@ -211,8 +211,8 @@ max-query-limit 2
 		t.join();
 	}
 
-	EXPECT_EQ(success_num, 2);
-	EXPECT_EQ(refused_num, 3);
+	EXPECT_EQ(success_num.load(), 2);
+	EXPECT_EQ(refused_num.load(), 3);
 
 	for (int i = 0; i < 5; i++) {
 		smartdns::Client client;

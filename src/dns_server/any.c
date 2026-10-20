@@ -19,6 +19,54 @@
 #define ANY_CLIENT_OPERATIONS 8
 #define ANY_CLIENT_WAITERS 32
 
+static unsigned int wire_u16(const unsigned char *p) { return ((unsigned int)p[0] << 8) | p[1]; }
+
+/* The generic decoder deliberately discards unknown options, COOKIE and
+ * PADDING. Attest the original wire before using it as a cache/view origin. */
+void _dns_server_any_wire_context(struct dns_request *request, const unsigned char *wire, int len)
+{
+	if (request->qtype != DNS_T_ANY && request->qtype != DNS_T_A && request->qtype != DNS_T_AAAA) return;
+	if (len < 12 || len > DNS_IN_PACKSIZE || (wire_u16(wire + 2) & ~(0x0100 | 0x0020 | 0x0010)) ||
+		wire_u16(wire + 4) != 1 || wire_u16(wire + 6) || wire_u16(wire + 8)) goto unsupported;
+	int pos = 12;
+	while (pos < len) {
+		unsigned int label = wire[pos++];
+		if (!label) break;
+		if ((label & 0xc0) == 0xc0) {
+			if (pos >= len) goto unsupported;
+			pos++;
+			break; /* dns_decode has already validated the compressed name. */
+		}
+		if (label > 63 || label > (unsigned int)(len - pos)) goto unsupported;
+		pos += label;
+	}
+	if (pos + 4 > len) goto unsupported;
+	pos += 4;
+	unsigned int additional = wire_u16(wire + 10);
+	if (!additional) {
+		if (pos != len) goto unsupported;
+		return;
+	}
+	if (additional != 1 || pos + 11 > len || wire[pos] || wire_u16(wire + pos + 1) != DNS_T_OPT ||
+		wire[pos + 5] || wire[pos + 6]) goto unsupported;
+	int end = pos + 11 + wire_u16(wire + pos + 9);
+	pos += 11;
+	if (end != len) goto unsupported;
+	while (pos < end) {
+		if (pos + 4 > end) goto unsupported;
+		unsigned int option = wire_u16(wire + pos), size = wire_u16(wire + pos + 2);
+		pos += 4;
+		if (size > (unsigned int)(end - pos)) goto unsupported;
+		request->any_unknown_context = 1;
+		if (option != DNS_OPT_T_COOKIE && option != DNS_OPT_T_PADDING && option != DNS_OPT_T_TCP_KEEPALIVE)
+			goto unsupported;
+		pos += size;
+	}
+	return;
+unsupported:
+	request->any_unknown_context = request->any_unsupported_context = 1;
+}
+
 struct any_key {
 	char domain[DNS_MAX_CNAME_LEN];
 	char route[DNS_GROUP_NAME_LEN];
@@ -31,7 +79,7 @@ struct any_key {
 struct any_operation;
 struct any_child {
 	struct any_operation *owner;
-	int type, started, ended, has_result, reported;
+	int type, started, ended, has_result, reported, policy_negative;
 	unsigned long received;
 	int len;
 	unsigned char data[DNS_IN_PACKSIZE];
@@ -44,7 +92,7 @@ struct any_operation {
 	struct dns_request *waiters[ANY_WAITERS_MAX];
 	int waiter_clients[ANY_WAITERS_MAX];
 	int owner_client;
-	int waiter_count, terminal, table_slot, active, next, completed, expanded;
+	int waiter_count, terminal, table_slot, active, next, completed, expanded, shareable;
 	int final_len;
 	unsigned long finished;
 	unsigned char final_wire[DNS_IN_PACKSIZE];
@@ -168,6 +216,66 @@ int _dns_server_any_plain_context(struct dns_request *request, const char *route
 	return 1;
 }
 
+/* Resolving through native policy is distinct from proving that a legacy
+ * cache entry or another client's operation is safe to reuse. AD on a query
+ * only advertises client capability; synthesized replies still clear AD. */
+int _dns_server_any_address_context(struct dns_request *request, const char *route)
+{
+	return request->qclass == DNS_C_IN && request->any_rd &&
+		!request->edns0_do && !request->any_do && !request->any_cd &&
+		!request->any_unsupported_context && !request->has_ecs && !request->is_mdns_lookup &&
+		!request->prefetch && !request->conf->dns_dns64.prefix_len &&
+		!request->conf->ipv4_ecs.enable && !request->conf->ipv6_ecs.enable &&
+		!dns_client_group_has_ecs(route ? route : DNS_SERVER_GROUP_DEFAULT);
+}
+
+/* Validate aliases before suppressing them. Suppression must not hide a
+ * disagreement between the two upstream canonical names. */
+int _dns_server_any_flatten_addresses(const char *domain, int qtype, unsigned char *wire, int len)
+{
+	unsigned char packet_buf[DNS_PACKSIZE], output_buf[DNS_PACKSIZE];
+	struct dns_packet *packet = (struct dns_packet *)packet_buf;
+	struct dns_packet *output = (struct dns_packet *)output_buf;
+	if (dns_decode(packet, sizeof(packet_buf), wire, len)) return -1;
+	struct dns_head head = packet->head;
+	if (dns_packet_init(output, sizeof(output_buf), &head) ||
+		dns_add_domain(output, domain, qtype, DNS_C_IN)) return -1;
+	int count = 0, alias_ttl = INT_MAX;
+	struct dns_rrs *rr = dns_get_rrs_start(packet, DNS_RRS_AN, &count);
+	for (int i = 0; rr && i < count; i++, rr = dns_get_rrs_next(packet, rr)) {
+		char owner[DNS_MAX_CNAME_LEN], target[DNS_MAX_CNAME_LEN];
+		int ttl;
+		if (rr->type == DNS_T_CNAME) {
+			if (dns_get_CNAME(rr, owner, sizeof(owner), &ttl, target, sizeof(target))) return -1;
+			if (ttl < alias_ttl) alias_ttl = ttl;
+		}
+	}
+	rr = dns_get_rrs_start(packet, DNS_RRS_AN, &count);
+	for (int i = 0; rr && i < count; i++, rr = dns_get_rrs_next(packet, rr)) {
+		char owner[DNS_MAX_CNAME_LEN];
+		unsigned char address[DNS_RR_AAAA_LEN];
+		int ttl, ret;
+		if (rr->type == DNS_T_CNAME) continue;
+		if (rr->type != DNS_T_A && rr->type != DNS_T_AAAA) return -1;
+		ret = rr->type == DNS_T_A ? dns_get_A(rr, owner, sizeof(owner), &ttl, address) :
+			dns_get_AAAA(rr, owner, sizeof(owner), &ttl, address);
+		if (ret) return -1;
+		if (ttl > alias_ttl) ttl = alias_ttl;
+		ret = rr->type == DNS_T_A ? dns_add_A(output, DNS_RRS_AN, domain, ttl, address) :
+			dns_add_AAAA(output, DNS_RRS_AN, domain, ttl, address);
+		if (ret) return -1;
+	}
+	rr = dns_get_rrs_start(packet, DNS_RRS_NS, &count);
+	for (int i = 0; rr && i < count; i++, rr = dns_get_rrs_next(packet, rr)) {
+		char owner[DNS_MAX_CNAME_LEN];
+		struct dns_soa soa;
+		int ttl;
+		if (rr->type != DNS_T_SOA || dns_get_SOA(rr, owner, sizeof(owner), &ttl, &soa) ||
+			dns_add_SOA(output, DNS_RRS_NS, domain, ttl, &soa)) return -1;
+	}
+	return dns_encode(wire, DNS_IN_PACKSIZE, output);
+}
+
 static void reply(struct dns_request *request, const unsigned char *data, int len, int cached)
 {
 	unsigned char wire[DNS_IN_PACKSIZE], packet_buf[DNS_PACKSIZE];
@@ -262,14 +370,30 @@ static void finish_aggregate(struct any_operation *op)
 {
 	unsigned char wire[DNS_IN_PACKSIZE];
 	struct dns_any_input input[DNS_ANY_MAX_TYPES] = {{0}};
+	int count = 0;
 	for (int i = 0; i < op->key.config.type_count; i++) {
 		struct any_child *child = &op->children[i + 1];
-		input[i].qtype = child->type;
+		/* A native policy may deliberately suppress a family. It is not an
+		 * upstream absence claim and must not constrain the other alias chain.
+		 * Missing/error children are still retained and fail the strict join. */
+		if (op->key.config.aggregate == DNS_ANY_ADDRESS && child->policy_negative) continue;
+		input[count].qtype = child->type;
 		if (child->has_result) {
-			input[i].data = child->data; input[i].len = child->len; input[i].age = elapsed(child->received);
+			input[count].data = child->data; input[count].len = child->len; input[count].age = elapsed(child->received);
 		} else tlog(TLOG_DEBUG, "ANY aggregate has no result for configured type %d", child->type);
+		count++;
 	}
-	int len = dns_any_merge(op->key.domain, input, op->key.config.type_count, op->key.config.partial, wire, sizeof(wire));
+	if (!count) {
+		/* Both families were explicitly blocked by native policy. Return its
+		 * coherent SOA response rather than converting the block to SERVFAIL. */
+		for (int i = 1; i <= op->key.config.type_count; i++) {
+			struct any_child *child = &op->children[i];
+			input[count++] = (struct dns_any_input){child->data, child->len, child->type, elapsed(child->received)};
+		}
+	}
+	int len = dns_any_merge(op->key.domain, input, count, op->key.config.partial, wire, sizeof(wire));
+	if (len > 0 && op->key.config.aggregate == DNS_ANY_ADDRESS && op->key.conf->dns_force_no_cname)
+		len = _dns_server_any_flatten_addresses(op->key.domain, DNS_T_ANY, wire, len);
 	if (len < 0) {
 		tlog(TLOG_DEBUG, "ANY aggregate failed validation or has no usable configured result");
 		len = dns_any_empty_response(op->key.domain, DNS_RC_SERVFAIL, 0, wire, sizeof(wire));
@@ -417,10 +541,12 @@ static void address_callback(void *arg, enum dns_address_child_result result,
 	if (!final_release && !child->reported) {
 		child->reported = 1; op->completed++;
 		if (!op->terminal && (result == DNS_ADDRESS_CHILD_POSITIVE ||
-			result == DNS_ADDRESS_CHILD_NODATA || result == DNS_ADDRESS_CHILD_NXDOMAIN) &&
+			result == DNS_ADDRESS_CHILD_NODATA || result == DNS_ADDRESS_CHILD_NXDOMAIN ||
+			result == DNS_ADDRESS_CHILD_POLICY_NODATA) &&
 			wire && len >= 12 && len <= DNS_IN_PACKSIZE) {
 			memcpy(child->data, wire, len); child->len = len;
 			child->received = get_tick_count(); child->has_result = 1;
+			child->policy_negative = result == DNS_ADDRESS_CHILD_POLICY_NODATA;
 		}
 		wake = !op->terminal;
 	}
@@ -486,7 +612,9 @@ int _dns_server_process_any(struct dns_request *request, const char *group_name)
 	struct dns_query_budget *budget = NULL;
 	const char *route = group_name ? group_name : DNS_SERVER_GROUP_DEFAULT;
 	if (request->qtype != DNS_T_ANY) return -1;
-	if (!_dns_server_any_plain_context(request, route)) {
+	int plain = _dns_server_any_plain_context(request, route);
+	if (request->conf->any.aggregate == DNS_ANY_ADDRESS ?
+		!_dns_server_any_address_context(request, route) : !plain) {
 		if (request->conf->any.aggregate != DNS_ANY_ADDRESS) return -1;
 		reply(request, NULL, -1, 0); return 0;
 	}
@@ -519,7 +647,11 @@ int _dns_server_process_any(struct dns_request *request, const char *group_name)
 	if (!cached_len && client_index >= 0) {
 		for (int i = 0; i < ANY_ACTIVE_MAX; i++) {
 			if (!operations[i]) { if (free_slot < 0) free_slot = i; continue; }
-			if (same_key(&operations[i]->key, &key)) { op = operations[i]; operation_get(op); break; }
+			/* Non-plain native policy can depend on client identity. Do not
+			 * coalesce it under a legacy key that does not attest that context. */
+			if (plain && operations[i]->shareable && same_key(&operations[i]->key, &key)) {
+				op = operations[i]; operation_get(op); break;
+			}
 		}
 		if (!op && budget && free_slot >= 0 && atomic_read(&any_allocated) < ANY_ACTIVE_MAX &&
 			clients[client_index].operations < ANY_CLIENT_OPERATIONS) {
@@ -530,7 +662,7 @@ int _dns_server_process_any(struct dns_request *request, const char *group_name)
 				pthread_mutexattr_init(&attr); pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
 				pthread_mutex_init(&op->lock, &attr); pthread_mutexattr_destroy(&attr);
 				atomic_set(&op->refs, 2); /* table plus this call */
-				op->key = key; op->table_slot = free_slot;
+				op->key = key; op->table_slot = free_slot; op->shareable = plain;
 				op->budget = budget; budget = NULL;
 				for (int j = 0; j <= key.config.type_count; j++) {
 					op->children[j].owner = op;

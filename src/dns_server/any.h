@@ -8,6 +8,9 @@ extern "C" {
 int _dns_server_process_any(struct dns_request *request, const char *group_name);
 /* Conservative context predicate also used to attest ordinary cache origins. */
 int _dns_server_any_plain_context(struct dns_request *request, const char *group_name);
+int _dns_server_any_address_context(struct dns_request *request, const char *group_name);
+int _dns_server_any_flatten_addresses(const char *domain, int qtype, unsigned char *wire, int len);
+void _dns_server_any_wire_context(struct dns_request *request, const unsigned char *wire, int len);
 void _dns_server_any_period(void);
 void _dns_server_any_destroy(void);
 void _dns_server_any_cancel_connection(struct dns_server_conn_head *conn);

@@ -27,13 +27,22 @@ SmartDNS text configuration settings; no control API is added.
 
 Address mode directly resolves A and AAAA through the ordinary address pipeline;
 it never sends an initial ANY probe and does not inspect HINFO strings. Both
-families must complete coherently. Two positive results return both families;
-one positive plus genuine upstream SOA-backed NODATA returns a single family.
-Timeout, transport failure, policy-generated SOA, malformed/incomplete data, or
-an unsupported context cannot stand in for an absent family: the result is
-SERVFAIL. Consistent NXDOMAIN remains distinct from NODATA; conflicting aliases
-or positive/NXDOMAIN results fail. This represents DNS addresses supplied by the
-configured resolver and supported rules, not reachability or all zone records.
+families must complete coherently under the existing native policy. Two positive
+results return both families; genuine upstream SOA-backed NODATA or an explicit
+local family suppression may leave one family. These are distinct sources: only
+the native local-address/SOA decision sites attest policy results. Errors,
+timeouts, stale negatives, malformed/incomplete upstream data and unknown
+absence are never promoted to policy suppression. Native whole-name blocks keep
+NXDOMAIN, and explicit QTYPE-255 SOA policy retains precedence over aggregation.
+Consistent upstream NXDOMAIN remains distinct from NODATA; conflicting aliases
+or positive/NXDOMAIN results fail. This represents the configured resolver and
+its selected native policy, not reachability or all zone records.
+
+Query AD is accepted as a capability hint (RFC 6840 section 5.7), never as proof
+of authentication. Generated AD/AA remain clear. Cookies, padding and TCP
+keepalive may be ignored/handled per hop without changing the DNS view; they do
+not attest safe legacy cache provenance. Other unknown contexts remain bounded
+failures. See https://www.rfc-editor.org/rfc/rfc6840.html#section-5.7 .
 
 The family set is always A+AAAA, concurrency is two, and partial results are
 always disabled. Valid `any-aggregate-types`, `any-aggregate-concurrency`, and
@@ -76,14 +85,22 @@ suppress recursive cross-family preference checks, so a preferred-family policy
 cannot masquerade as an absent family. Ordinary A/AAAA client requests retain
 their existing behavior.
 
-The conservative context restrictions below also apply to address mode, but an
-unsupported address request fails explicitly instead of falling through to an
-upstream minimal ANY answer. In particular, ECS, DO/CD/AD, DNS64, local address
-rewrites and unsupported policy contexts are not claimed as supported.
-Address admission runs before early parent policy replies; forcing SOA for
-QTYPE 255 or configuring a local address block cannot manufacture a completed
-NOERROR address result.
-Capacity exhaustion is a bounded failure in this opt-in mode.
+Native policy admission is separate from conservative cache/coalescing
+eligibility. CNAME suppression, domain speed/dualstack flags, local addresses,
+IPv4/IPv6 suppression, route groups, ipset/nftset and no-cache binds pass through
+the ordinary typed pipeline. Non-plain requests neither join a plain operation
+nor import its native cache entries. The native typed finalization retains
+routing-set effects; the parent does not repeat them. Alias evidence is rebased
+for configured local CNAMEs. Visible CNAME answers retain a coherent selected
+path across both families. Explicit force-no-CNAME instead combines independently
+validated native address selections at the original owner, including different
+upstream alias paths. Local policy negatives are not mistaken for upstream
+absence and do not constrain the other family's alias chain.
+
+DO/CD, ECS, DNS64 and unsupported EDNS view semantics are still not synthesized;
+those explicit address requests fail boundedly rather than forge DNSSEC or ECS
+context. Passthrough and finite aggregate retain their existing transparent
+fallback behavior. Capacity exhaustion remains a bounded opt-in failure.
 
 Apply changed settings by restarting SmartDNS through the deployment's service
 manager. A universal live-reload mechanism is not promised. The previously
@@ -165,15 +182,17 @@ bypass this feature.
 
 ## Conservative context and resource boundaries
 
-Sharing/aggregation is limited to IN, RD=1, no client DO/CD/AD, no ECS, and no
-unrecognized EDNS options/flags. Configured endpoint/fallback ECS and rule-group
-ECS also disable it. Existing policy rewrites, IP rules, parent/CNAME processing,
-DNS64, forced CNAME suppression, cache-disabled requests and unsupported contexts
-use the normal transparent path in passthrough/aggregate modes; address mode
-returns a bounded failure. Original ANY DO/CD are propagated even though
-legacy non-ANY parsing treats AD/DO differently. Non-IN remains unsupported.
-Some clients enable AD/cookies by default; such queries deliberately bypass this
-first conservative implementation rather than sharing an unproven context.
+Passthrough and finite fallback only coordinate/share plain IN, RD=1 requests
+without DO/CD/AD, ECS, unrecognized EDNS options/flags or unsupported policy.
+Configured endpoint/fallback ECS and rule-group ECS also disable that optional
+coordination. Native policy/CNAME work, DNS64 and no-cache requests keep their
+ordinary transparent path in those modes. Original ANY DO/CD are propagated.
+
+Address mode instead uses the native-policy admission described above, accepting
+AD capability hints, benign per-hop options and the supported native policies.
+It shares operations/imports native cache origins only for the strict plain
+context; all other supported requests own independent operations and refetch.
+This is required because the legacy key does not attest every client's policy.
 
 Keys include canonical name, route, rule-group identity, bind flags, qtype, and the
 entire configured aggregate policy/type list. Configuration restarts clear the
@@ -230,3 +249,16 @@ They are authored regression cases, not evidence of execution until the combined
 batch's build/test report is available. Independent review of the final diff,
 actual-send accounting, race/cancellation handling and sanitizer results is still
 required. No production-provider interoperability or performance claim is made.
+
+
+Address completion retains at most eight coherent upstream evidence paths per
+native typed child (32 KiB of wire evidence). Native speed selection can receive
+different valid aliases from different upstreams or protocols; an unused path is
+not a conflict. Visible CNAME output still requires a coherent selected path and
+a coherent cross-family join. With explicit `force-no-CNAME yes`, each selected
+native address is checked against the validated candidate paths and emitted at
+the original owner, respecting the native alias-suppression policy. This can
+combine independently selected A and AAAA canonical paths without exposing an
+inconsistent CNAME. Alias TTL bounds remain conservative. Evidence-pool overflow,
+unproven selected addresses and genuinely inconsistent negative results fail
+closed; this does not expand the shared transport-attempt or alias-depth budgets.

@@ -2386,11 +2386,13 @@ log-level debug
 	// Query from HTTP/2 server
 	ASSERT_TRUE(client.Query("h2-domain.com", 61053));
 	EXPECT_EQ(client.GetStatus(), "NOERROR");
+	ASSERT_EQ(client.GetAnswer().size(), 1u);
 	EXPECT_EQ(client.GetAnswer()[0].GetData(), "1.1.1.1");
 	
 	// Query from HTTP/1.1 server
 	ASSERT_TRUE(client.Query("http1-domain.com", 61053));
 	EXPECT_EQ(client.GetStatus(), "NOERROR");
+	ASSERT_EQ(client.GetAnswer().size(), 1u);
 	EXPECT_EQ(client.GetAnswer()[0].GetData(), "2.2.2.2");
 }
 

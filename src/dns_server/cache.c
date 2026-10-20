@@ -277,6 +277,9 @@ static int _dns_server_process_cache_packet(struct dns_request *request, struct 
 	}
 
 	if (request->address_child) {
+		/* Reuse an entry only when this request is also a plain context.
+		 * A plain-origin entry cannot attest a different client's policy. */
+		if (!_dns_server_address_child_cache_allowed(request)) goto out;
 		/* Snapshot the provenance, packet and its age/TTL under one cache
 		 * lock. A concurrent replacement cannot authenticate a new unsafe
 		 * packet with an old flag or extend an old packet with new metadata. */

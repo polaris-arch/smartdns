@@ -17,6 +17,7 @@
  */
 
 #include "soa.h"
+#include "address_child.h"
 #include "context.h"
 #include "dns_server.h"
 #include "request.h"
@@ -143,6 +144,7 @@ int _dns_server_qtype_soa(struct dns_request *request)
 		}
 	}
 
+	_dns_server_address_child_local_result(request);
 	_dns_server_reply_SOA(DNS_RC_NOERROR, request);
 	tlog(TLOG_DEBUG, "force qtype %d soa", request->qtype);
 	return 0;
@@ -150,7 +152,9 @@ int _dns_server_qtype_soa(struct dns_request *request)
 
 int _dns_server_is_return_soa(struct dns_request *request)
 {
-	return _dns_server_is_return_soa_qtype(request, request->qtype);
+	int result = _dns_server_is_return_soa_qtype(request, request->qtype);
+	if (result) _dns_server_address_child_local_result(request);
+	return result;
 }
 
 void _dns_server_setup_soa(struct dns_request *request)

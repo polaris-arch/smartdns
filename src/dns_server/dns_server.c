@@ -278,12 +278,11 @@ int _dns_server_do_query(struct dns_request *request, int skip_notify_event)
 		goto errout;
 	}
 
-	/* Explicit address completion owns the parent before any local policy
-	 * can synthesize an ANY answer (notably force-qtype-SOA 255). Children
-	 * still traverse the ordinary typed policy/cache/selection pipeline. */
-	if (request->qtype == DNS_T_ANY && request->conf->any.aggregate == DNS_ANY_ADDRESS &&
-		_dns_server_process_any(request, server_group_name) == 0) {
-		goto clean_exit;
+	/* Explicit QTYPE policy retains precedence. Other address rules are
+	 * evaluated independently by the two native typed children. */
+	if (request->qtype == DNS_T_ANY && request->conf->any.aggregate == DNS_ANY_ADDRESS) {
+		if (_dns_server_pre_process_rule_flags(request) == 0 || _dns_server_qtype_soa(request) == 0 ||
+			_dns_server_process_any(request, server_group_name) == 0) goto clean_exit;
 	}
 
 	if (_dns_server_process_cname_pre(request) != 0) {
@@ -501,6 +500,7 @@ int _dns_server_recv(struct dns_server_conn_head *conn, unsigned char *inpacket,
 		ret = RECV_ERROR_INVALID_PACKET;
 		goto errout;
 	}
+	_dns_server_any_wire_context(request, inpacket, inpacket_len);
 
 	tlog(TLOG_DEBUG, "query %s from %s, qtype: %d, id: %d, query-num: %ld", request->domain, name, request->qtype,
 		 request->id, atomic_read(&server.request_num));

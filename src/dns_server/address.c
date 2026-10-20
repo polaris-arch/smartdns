@@ -17,6 +17,7 @@
  */
 
 #include "address.h"
+#include "address_child.h"
 #include "context.h"
 #include "dns_server.h"
 #include "ptr.h"
@@ -133,6 +134,7 @@ int _dns_server_process_address(struct dns_request *request)
 	context.do_audit = 1;
 	context.do_ipset = 1;
 	context.select_all_best_ip = 1;
+	_dns_server_address_child_local_result(request);
 	_dns_request_post(&context);
 
 	return 0;

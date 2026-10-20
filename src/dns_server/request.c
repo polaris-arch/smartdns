@@ -1396,6 +1396,7 @@ int _dns_server_parser_request(struct dns_request *request, struct dns_packet *p
 		request->any_ad = packet->head.ad;
 		request->any_rd = packet->head.rd;
 		request->any_unknown_context = !!(opts & ~DNS_OPT_FLAG_DO);
+		request->any_unsupported_context = request->any_unknown_context;
 		int payload = dns_get_OPT_payload_size(packet);
 		request->any_udp_size = payload < DNS_DEFAULT_PACKET_SIZE ? DNS_DEFAULT_PACKET_SIZE :
 			(payload > DNS_IN_PACKSIZE ? DNS_IN_PACKSIZE : payload);
@@ -1417,6 +1418,10 @@ int _dns_server_parser_request(struct dns_request *request, struct dns_packet *p
 
 	for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(packet, rrs)) {
 		request->any_unknown_context = 1;
+		/* Per-hop cookies, padding and keepalive do not select a DNS view.
+		 * They still disqualify legacy cache/coalescing provenance. */
+		if (rrs->type != DNS_OPT_T_COOKIE && rrs->type != DNS_OPT_T_PADDING &&
+			rrs->type != DNS_OPT_T_TCP_KEEPALIVE) request->any_unsupported_context = 1;
 		switch (rrs->type) {
 		case DNS_OPT_T_TCP_KEEPALIVE: {
 			unsigned short idle_timeout = 0;

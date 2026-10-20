@@ -93,7 +93,8 @@ std::string cname_rr(const std::string &owner, const std::string &target)
 
 ::testing::AssertionResult response_is(const Wire &wire, int rcode, std::vector<std::string> answers,
 	int authority = 0, uint16_t id = kQueryId, int qtype = DNS_T_ANY, const std::string &domain = kDomain,
-	uint32_t min_address_ttl = 1, uint32_t max_address_ttl = UINT32_MAX, const Wire &expected_options = {})
+	uint32_t min_address_ttl = 1, uint32_t max_address_ttl = UINT32_MAX, const Wire &expected_options = {},
+	bool local_soa = false)
 {
 	if (wire.size() < 12) return ::testing::AssertionFailure() << "missing DNS response: " << wire.size() << " bytes";
 	/* All bits are checked: QR, opcode, AA, TC, RD, RA, Z, AD, CD and rcode. */
@@ -159,11 +160,14 @@ std::string cname_rr(const std::string &owner, const std::string &target)
 				size_t at = offset;
 				std::string mname, rname;
 				if (owner != kDomain || !wire_name(wire, at, mname) || !wire_name(wire, at, rname) ||
-					at + 20 != end || mname != "ns.address-mode.test" ||
-					rname != "hostmaster.address-mode.test" || u32(wire, at) != 7 ||
-					u32(wire, at + 4) != 60 || u32(wire, at + 8) != 60 ||
-					u32(wire, at + 12) != 600 || u32(wire, at + 16) != 60)
-					return ::testing::AssertionFailure() << "SOA is not the fixture's genuine negative proof";
+					at + 20 != end || mname != (local_soa ? "a.gtld-servers.net" : "ns.address-mode.test") ||
+					rname != (local_soa ? "nstld.verisign-grs.com" : "hostmaster.address-mode.test") ||
+					u32(wire, at) != (local_soa ? 1800u : 7u) ||
+					u32(wire, at + 4) != (local_soa ? 1800u : 60u) ||
+					u32(wire, at + 8) != (local_soa ? 900u : 60u) ||
+					u32(wire, at + 12) != (local_soa ? 604800u : 600u) ||
+					u32(wire, at + 16) != (local_soa ? 86400u : 60u))
+					return ::testing::AssertionFailure() << "SOA differs from its expected policy/upstream source";
 				++soa_count;
 			} else {
 				return ::testing::AssertionFailure() << "unexpected RR type " << type << " in section " << section;
@@ -233,6 +237,10 @@ public:
 		bool do_bit = false, bool cd = false, bool ecs = false, bool ad = false)
 	{
 		Wire wire = query_wire(type, id, domain, do_bit, cd, ecs, ad);
+		return send_wire(wire);
+	}
+	bool send_wire(const Wire &wire)
+	{
 		if (fd_ < 0 || wire.empty()) return false;
 		if (tcp_) {
 			Wire framed{static_cast<unsigned char>(wire.size() >> 8), static_cast<unsigned char>(wire.size())};
@@ -316,6 +324,7 @@ struct Family {
 class AddressUpstream {
 public:
 	Family ipv4, ipv6;
+	std::string expected_domain = kDomain;
 	Gate gate = Gate::None;
 	bool authoritative_authenticated = false;
 	std::atomic<int> a{0}, aaaa{0}, any{0}, other{0}, marker{0};
@@ -333,13 +342,13 @@ public:
 		if (fd_ >= 0) close(fd_);
 		for (int fd : wake_) if (fd >= 0) close(fd);
 	}
-	bool start()
+	bool start(int port = kUpstreamPort)
 	{
 		fd_ = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 		if (fd_ < 0 || pipe2(wake_, O_CLOEXEC)) return false;
 		sockaddr_in address{};
 		address.sin_family = AF_INET;
-		address.sin_port = htons(kUpstreamPort);
+		address.sin_port = htons(port);
 		address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 		if (bind(fd_, reinterpret_cast<sockaddr *>(&address), sizeof(address))) return false;
 		thread_ = std::thread([this] { run(); });
@@ -459,7 +468,7 @@ private:
 				pending.wire = response(u16(request, 0), type, domain, Family{});
 				if (!pending.wire.empty()) send_response(pending);
 			} else {
-				if (domain != kDomain) ++invalid;
+				if (domain != expected_domain) ++invalid;
 				if (type == DNS_T_A) ++a;
 				else if (type == DNS_T_AAAA) ++aaaa;
 				else if (type == DNS_T_ANY) ++any;
@@ -594,29 +603,31 @@ TEST(AnyAddress, DoAndCdFailClosedWithoutAnyProbe)
 	expect_workload(upstream, 0, 0);
 }
 
-TEST(AnyAddress, ParentForcedSoaCannotBypassStrictCompletion)
+TEST(AnyAddress, ParentForcedSoaRetainsNativePolicyPrecedence)
 {
 	AddressUpstream upstream;
 	smartdns::Server server;
 	ASSERT_TRUE(upstream.start());
 	ASSERT_TRUE(server.Start(config("force-qtype-SOA 255\n")));
 	for (bool tcp : {false, true})
-		EXPECT_TRUE(response_is(query(DNS_T_ANY, tcp), DNS_RC_SERVFAIL, {}));
+		EXPECT_TRUE(response_is(query(DNS_T_ANY, tcp), DNS_RC_NOERROR, {}, 1, kQueryId,
+			DNS_T_ANY, kDomain, 1, UINT32_MAX, {}, true));
 	expect_workload(upstream, 0, 0);
 }
 
-TEST(AnyAddress, ParentLocalPolicyCannotBypassStrictCompletion)
+TEST(AnyAddress, ParentLocalBlockRetainsNativeNxdomain)
 {
 	AddressUpstream upstream;
 	smartdns::Server server;
 	ASSERT_TRUE(upstream.start());
 	ASSERT_TRUE(server.Start(config("address /address-mode.test/#\n")));
 	for (bool tcp : {false, true})
-		EXPECT_TRUE(response_is(query(DNS_T_ANY, tcp), DNS_RC_SERVFAIL, {}));
+		EXPECT_TRUE(response_is(query(DNS_T_ANY, tcp), DNS_RC_NXDOMAIN, {}, 1, kQueryId,
+			DNS_T_ANY, kDomain, 1, UINT32_MAX, {}, true));
 	expect_workload(upstream, 0, 0);
 }
 
-TEST(AnyAddress, ChildForcedSoaCannotMasqueradeAsGenuineNodata)
+TEST(AnyAddress, ChildForcedSoaRetainsPolicyWithoutClaimingUpstreamNodata)
 {
 	AddressUpstream upstream;
 	smartdns::Server server;
@@ -627,8 +638,8 @@ TEST(AnyAddress, ChildForcedSoaCannotMasqueradeAsGenuineNodata)
 	ASSERT_TRUE(response_is(query(DNS_T_A), DNS_RC_NOERROR, {address_rr(DNS_T_A)},
 		0, kQueryId, DNS_T_A));
 	expect_workload(upstream, 1, 0);
-	/* A policy-generated SOA cannot justify a positive A-only ANY result. */
-	EXPECT_TRUE(response_is(query(), DNS_RC_SERVFAIL, {}));
+	/* An explicit policy suppression is distinct from upstream absence. */
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A)}));
 	expect_workload(upstream, 1, 0);
 }
 
@@ -1082,4 +1093,296 @@ TEST(AnyAddress, LastTcpWaiterCancellationReleasesNativeChildrenWithoutPoisoning
 		{address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}, 0, kQueryId + 21));
 	expect_workload(upstream, 2, 2, 1);
 	EXPECT_TRUE(server.IsRunning());
+}
+
+TEST(AnyAddress, DefaultDigAdHintCompletesOverUdpAndTcpWithoutAssertingAd)
+{
+	AddressUpstream upstream;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("cache-size 0\n")));
+	for (bool tcp : {false, true})
+		EXPECT_TRUE(response_is(query(DNS_T_ANY, tcp, kClientPort, false, false, false, true),
+			DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream, 2, 2);
+}
+
+TEST(AnyAddress, CookieAndPaddingDoNotSelectAnUnprovenDnsView)
+{
+	AddressUpstream upstream;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config()));
+	for (bool tcp : {false, true}) {
+		for (int option : {int(DNS_OPT_T_COOKIE), int(DNS_OPT_T_PADDING), int(DNS_OPT_T_TCP_KEEPALIVE), 65001}) {
+			Wire wire = query_wire(DNS_T_ANY, kQueryId, kDomain, false, false, false, true);
+			wire[11] = 1;
+			/* One root OPT: payload 1232 and a benign hop option or an unknown option. */
+			int size = option == DNS_OPT_T_TCP_KEEPALIVE ? 2 : 8;
+			Wire opt{0, 0, 41, 4, 208, 0, 0, 0, 0, 0, static_cast<unsigned char>(size + 4),
+				static_cast<unsigned char>(option >> 8), static_cast<unsigned char>(option), 0, static_cast<unsigned char>(size)};
+			opt.resize(opt.size() + size, 0);
+			wire.insert(wire.end(), opt.begin(), opt.end());
+			LocalConnection client(tcp);
+			ASSERT_TRUE(client.send_wire(wire));
+			EXPECT_TRUE(response_is(client.receive(), option == 65001 ? DNS_RC_SERVFAIL : DNS_RC_NOERROR,
+				option == 65001 ? std::vector<std::string>{} :
+				std::vector<std::string>{address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+		}
+	}
+	expect_workload(upstream, 6, 6);
+}
+
+TEST(AnyAddress, GlobalCnameSuppressionPreservesBothFamiliesAfterAliasValidation)
+{
+	AddressUpstream upstream;
+	upstream.ipv4.aliases = upstream.ipv6.aliases = {"hop.address-mode.test", "target.address-mode.test"};
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("force-no-CNAME yes\n")));
+	for (bool tcp : {false, true})
+		EXPECT_TRUE(response_is(query(DNS_T_ANY, tcp), DNS_RC_NOERROR,
+			{address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream, 2, 2);
+}
+
+TEST(AnyAddress, CnameSuppressionComposesIndependentValidatedNativeAliases)
+{
+	AddressUpstream upstream;
+	upstream.ipv4.aliases = {"one.address-mode.test"};
+	upstream.ipv6.aliases = {"two.address-mode.test"};
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("force-no-CNAME yes\n")));
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream, 1, 1);
+}
+
+TEST(AnyAddress, ProductionDualstackAndSpeedFlagsComposeWithAddressMode)
+{
+	AddressUpstream upstream;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("force-no-CNAME yes\n"
+		"domain-rules /address-mode.test/ -dualstack-ip-selection yes -speed-check-mode none\n")));
+	EXPECT_TRUE(response_is(query(DNS_T_ANY, false, kClientPort, false, false, false, true),
+		DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream, 1, 1);
+}
+
+TEST(AnyAddress, Ipv6PolicySuppressionComposesWithAnIpv4Alias)
+{
+	AddressUpstream upstream;
+	upstream.ipv4.aliases = {"target.address-mode.test"};
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("domain-rules /address-mode.test/ -address #6\n")));
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR,
+		{cname_rr(kDomain, "target.address-mode.test"), address_rr(DNS_T_A, "target.address-mode.test")}));
+	expect_workload(upstream, 1, 0);
+}
+
+TEST(AnyAddress, ProductionIpv6SuppressionAndCnameFlatteningCompose)
+{
+	AddressUpstream upstream;
+	upstream.ipv4.aliases = {"target.address-mode.test"};
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("force-no-CNAME yes\n"
+		"domain-rules /address-mode.test/ -address #6 -dualstack-ip-selection no -speed-check-mode none\n")));
+	EXPECT_TRUE(response_is(query(DNS_T_ANY, true, kClientPort, false, false, false, true),
+		DNS_RC_NOERROR, {address_rr(DNS_T_A)}));
+	expect_workload(upstream, 1, 0);
+}
+
+TEST(AnyAddress, Ipv4PolicySuppressionPreservesIpv6)
+{
+	AddressUpstream upstream;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("address /address-mode.test/#4\n")));
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream, 0, 1);
+}
+
+TEST(AnyAddress, LocalDualFamilyAddressesDoNotRequireUpstreamProof)
+{
+	AddressUpstream upstream;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("address /address-mode.test/192.0.2.17,2001:db8::17\n")));
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream, 0, 0);
+}
+
+TEST(AnyAddress, LocalSingleFamilyAddressRetainsNativeMissingFamilyPolicy)
+{
+	AddressUpstream upstream;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("address /address-mode.test/192.0.2.17\n")));
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A)}));
+	expect_workload(upstream, 0, 0);
+}
+
+TEST(AnyAddress, ConfiguredAliasRebasesTargetEvidenceWithoutLosingItsBudget)
+{
+	AddressUpstream upstream;
+	upstream.expected_domain = "target.address-mode.test";
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("cname /address-mode.test/target.address-mode.test\n")));
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR,
+		{cname_rr(kDomain, "target.address-mode.test"), address_rr(DNS_T_A, "target.address-mode.test"),
+			address_rr(DNS_T_AAAA, "target.address-mode.test")}));
+	expect_workload(upstream, 1, 1);
+}
+
+TEST(AnyAddress, ConfiguredAliasAlsoHonorsGlobalCnameSuppression)
+{
+	AddressUpstream upstream;
+	upstream.expected_domain = "target.address-mode.test";
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("force-no-CNAME yes\ncname /address-mode.test/target.address-mode.test\n")));
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream, 1, 1);
+}
+
+TEST(AnyAddress, NftsetPolicyUsesTheNativeTypedPipeline)
+{
+	AddressUpstream upstream;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("domain-rules /address-mode.test/ "
+		"-nftset #4:inet#smartdns_any_test#v4,#6:inet#smartdns_any_test#v6\n")));
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream, 1, 1);
+}
+
+TEST(AnyAddress, NoCacheBindFlagStillAllowsIndependentTypedResolution)
+{
+	AddressUpstream upstream;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	std::string cfg = config();
+	const std::string bind = "bind 127.0.0.1:" + std::to_string(kClientPort);
+	cfg.replace(cfg.find(bind), bind.size(), bind + " -no-cache");
+	ASSERT_TRUE(server.Start(cfg));
+	for (int n = 0; n < 2; n++)
+		EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream, 2, 2);
+}
+
+TEST(AnyAddress, PolicySuppressionCannotTurnARealTransportFailureIntoSuccess)
+{
+	AddressUpstream upstream;
+	upstream.ipv4.outcome = Outcome::Servfail;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("force-no-CNAME yes\naddress /address-mode.test/#6\nany-aggregate-max-attempts 1\n")));
+	EXPECT_TRUE(response_is(query(), DNS_RC_SERVFAIL, {}));
+	expect_workload(upstream, 1, 0);
+}
+
+TEST(AnyAddress, APlainCallerCannotJoinANonplainOperation)
+{
+	AddressUpstream upstream;
+	upstream.gate = Gate::BothFamiliesAndMarker;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("cache-size 0\n")));
+	LocalConnection hinted(true), plain(true), marker(true);
+	ASSERT_TRUE(hinted.send_query(DNS_T_ANY, kQueryId, kDomain, false, false, false, true));
+	ASSERT_TRUE(upstream.wait_for_families(1, 1));
+	ASSERT_TRUE(plain.send_query(DNS_T_ANY, kQueryId + 1));
+	ASSERT_TRUE(upstream.wait_for_families(2, 2));
+	ASSERT_TRUE(marker.send_query(DNS_T_A, kQueryId + 2, kMarker));
+	EXPECT_TRUE(response_is(marker.receive(), DNS_RC_NOERROR, {address_rr(DNS_T_A, kMarker)},
+		0, kQueryId + 2, DNS_T_A, kMarker));
+	EXPECT_TRUE(response_is(hinted.receive(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	EXPECT_TRUE(response_is(plain.receive(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)},
+		0, kQueryId + 1));
+	expect_workload(upstream, 2, 2, 1);
+}
+
+TEST(AnyAddress, CnameSuppressionRetainsGenuineUpstreamNodata)
+{
+	AddressUpstream upstream;
+	upstream.ipv4.aliases = upstream.ipv6.aliases = {"target.address-mode.test"};
+	upstream.ipv6.outcome = Outcome::Nodata;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("force-no-CNAME yes\n")));
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A)}));
+	expect_workload(upstream, 1, 1);
+}
+
+TEST(AnyAddress, ConfiguredAliasRetainsTheTargetsFurtherUpstreamAliases)
+{
+	AddressUpstream upstream;
+	upstream.expected_domain = "target.address-mode.test";
+	upstream.ipv4.aliases = upstream.ipv6.aliases = {"canonical.address-mode.test"};
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config("cname /address-mode.test/target.address-mode.test\n")));
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR,
+		{cname_rr(kDomain, "target.address-mode.test"),
+			cname_rr("target.address-mode.test", "canonical.address-mode.test"),
+			address_rr(DNS_T_A, "canonical.address-mode.test"), address_rr(DNS_T_AAAA, "canonical.address-mode.test")}));
+	expect_workload(upstream, 1, 1);
+}
+
+TEST(AnyAddress, UnknownEdnsOriginCannotSupplyPlainAddressCompletion)
+{
+	AddressUpstream upstream;
+	smartdns::Server server;
+	ASSERT_TRUE(upstream.start());
+	ASSERT_TRUE(server.Start(config()));
+	Wire wire = query_wire(DNS_T_A);
+	wire[11] = 1;
+	Wire opt{0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 4, 253, 233, 0, 0};
+	wire.insert(wire.end(), opt.begin(), opt.end());
+	LocalConnection client(false);
+	ASSERT_TRUE(client.send_wire(wire));
+	ASSERT_TRUE(response_is(client.receive(), DNS_RC_NOERROR, {address_rr(DNS_T_A)}, 0, kQueryId, DNS_T_A));
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	expect_workload(upstream, 2, 1);
+}
+
+TEST(AnyAddress, MultipleUpstreamAliasesFollowTheNativeSelectedAddress)
+{
+	AddressUpstream first, second;
+	first.ipv4.aliases = {"first.address-mode.test"};
+	second.ipv4.aliases = {"second.address-mode.test"};
+	first.ipv4.add_slower_address = second.ipv4.add_slower_address = true;
+	smartdns::Server server;
+	ASSERT_TRUE(first.start()); ASSERT_TRUE(second.start(kUpstreamPort + 1));
+	server.MockPing(PING_TYPE_ICMP, kIPv4, 60, 30);
+	server.MockPing(PING_TYPE_ICMP, kSlowIPv4, 60, 1000);
+	ASSERT_TRUE(server.Start(config("server 127.0.0.1:"+std::to_string(kUpstreamPort+1)+"\n"
+		"domain-rules /address-mode.test/ -address #6\nspeed-check-mode ping\nresponse-mode first-ping\n")));
+	Wire result = query();
+	EXPECT_TRUE(response_is(result, DNS_RC_NOERROR, {cname_rr(kDomain, "first.address-mode.test"), address_rr(DNS_T_A, "first.address-mode.test")}) ||
+		response_is(result, DNS_RC_NOERROR, {cname_rr(kDomain, "second.address-mode.test"), address_rr(DNS_T_A, "second.address-mode.test")}));
+	expect_workload(first, 1, 0); expect_workload(second, 1, 0);
+}
+
+TEST(AnyAddress, CnameSuppressionPreservesNativeSelectionAcrossMultipleUpstreams)
+{
+	AddressUpstream first, second;
+	first.ipv4.aliases = first.ipv6.aliases = {"first.address-mode.test"};
+	second.ipv4.aliases = second.ipv6.aliases = {"second.address-mode.test"};
+	first.ipv4.add_slower_address = first.ipv6.add_slower_address = true;
+	second.ipv4.add_slower_address = second.ipv6.add_slower_address = true;
+	smartdns::Server server;
+	ASSERT_TRUE(first.start()); ASSERT_TRUE(second.start(kUpstreamPort + 1));
+	server.MockPing(PING_TYPE_ICMP, kIPv4, 60, 30);
+	server.MockPing(PING_TYPE_ICMP, kIPv6, 60, 30);
+	server.MockPing(PING_TYPE_ICMP, kSlowIPv4, 60, 1000);
+	server.MockPing(PING_TYPE_ICMP, kSlowIPv6, 60, 1000);
+	ASSERT_TRUE(server.Start(config("server 127.0.0.1:"+std::to_string(kUpstreamPort+1)+"\n"
+		"force-no-CNAME yes\nany-aggregate-max-attempts 4\nspeed-check-mode ping\nresponse-mode first-ping\n")));
+	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)}));
+	expect_workload(first, 1, 1); expect_workload(second, 1, 1);
 }

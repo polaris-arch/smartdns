@@ -13,6 +13,8 @@ enum dns_address_child_result {
 	DNS_ADDRESS_CHILD_POSITIVE,
 	DNS_ADDRESS_CHILD_NODATA,
 	DNS_ADDRESS_CHILD_NXDOMAIN,
+	/* A completed native local-policy NODATA, not upstream absence. */
+	DNS_ADDRESS_CHILD_POLICY_NODATA,
 	DNS_ADDRESS_CHILD_POLICY,
 	DNS_ADDRESS_CHILD_FAILURE,
 };
@@ -37,6 +39,8 @@ int _dns_server_address_child_inherit(struct dns_request *child, const struct dn
 void _dns_server_address_child_copy(struct dns_request *request, struct dns_request *from);
 void _dns_server_address_child_release(struct dns_request *request);
 int _dns_server_address_child_check_context(struct dns_request *request, const char *route);
+int _dns_server_address_child_cache_allowed(struct dns_request *request);
+void _dns_server_address_child_local_result(struct dns_request *request);
 void _dns_server_address_child_upstream(struct dns_request *request, const unsigned char *wire, int len);
 void _dns_server_address_child_post(struct dns_server_post_context *context);
 int _dns_server_address_child_cache_positive(struct dns_request *request, unsigned char *wire, int *len, int ttl_cap);

@@ -1,8 +1,10 @@
 /* Bounded adapter for two independent ordinary A/AAAA requests. This is not the
  * public dns_result API and does not use the single CNAME parent/child slot. */
 #include "address_child.h"
+#include "any.h"
 #include "dns_server.h"
 #include "request.h"
+#include "rules.h"
 #include "smartdns/dns_any.h"
 #include "smartdns/dns_client.h"
 
@@ -11,15 +13,22 @@
 #include <string.h>
 #include <strings.h>
 
+#define ADDRESS_EVIDENCE_MAX 8
+struct dns_address_evidence {
+	int len;
+	enum dns_address_child_result result;
+	unsigned long received;
+	unsigned char data[DNS_IN_PACKSIZE];
+};
+
 struct dns_address_child_state {
 	pthread_mutex_t lock;
 	dns_address_child_callback callback;
 	void *arg;
-	int reported, policy, conflict, upstream_seen, cache_positive;
-	enum dns_address_child_result result, evidence_result;
-	unsigned long received;
-	int evidence_len;
-	unsigned char evidence[DNS_IN_PACKSIZE];
+	int reported, policy, evidence_overflow, upstream_seen, cache_positive, plain, local_result, rebased;
+	enum dns_address_child_result result;
+	int evidence_count;
+	struct dns_address_evidence evidence[ADDRESS_EVIDENCE_MAX];
 };
 
 /* A small fixed-size proof set, distinct from address-child observer custody.
@@ -134,7 +143,6 @@ static struct dns_address_child_state *state_new(void)
 	if (!state) return NULL;
 	pthread_mutex_init(&state->lock, NULL);
 	state->result = DNS_ADDRESS_CHILD_FAILURE;
-	state->evidence_result = DNS_ADDRESS_CHILD_FAILURE;
 	return state;
 }
 
@@ -158,6 +166,7 @@ static void copy_context(struct dns_request *child, const struct dns_request *pa
 	child->any_ad = parent->any_ad;
 	child->any_rd = parent->any_rd;
 	child->any_unknown_context = parent->any_unknown_context;
+	child->any_unsupported_context = parent->any_unsupported_context;
 }
 
 int _dns_server_address_child_inherit(struct dns_request *child, const struct dns_request *parent)
@@ -215,21 +224,34 @@ int _dns_server_address_child_check_context(struct dns_request *request, const c
 {
 	struct dns_address_child_state *state = request->address_child;
 	if (!state) return 0;
-	if (request->qclass != DNS_C_IN || request->has_ecs || request->edns0_do ||
-		request->any_do || request->any_cd || request->any_ad || request->any_unknown_context || request->is_mdns_lookup ||
-		request->conf->dns_dns64.prefix_len || request->conf->dns_force_no_cname ||
-		request->conf->ipv4_ecs.enable || request->conf->ipv6_ecs.enable ||
-		dns_client_group_has_ecs(route)) {
+	state->plain = _dns_server_any_plain_context(request, route);
+	if (!_dns_server_any_address_context(request, route)) {
 		state->policy = 1;
 		return -1;
 	}
 	return 0;
 }
 
+int _dns_server_address_child_cache_allowed(struct dns_request *request)
+{
+	return request->address_child && request->address_child->plain;
+}
+
+/* Called only at native local-address / explicit SOA policy decisions, never
+ * by transport errors, negative caches or synthesized timeout fallbacks. */
+void _dns_server_address_child_local_result(struct dns_request *request)
+{
+	struct dns_address_child_state *state = request->address_child;
+	if (!state) return;
+	pthread_mutex_lock(&state->lock);
+	state->local_result = 1;
+	pthread_mutex_unlock(&state->lock);
+}
+
 void _dns_server_address_child_upstream(struct dns_request *request, const unsigned char *wire, int len)
 {
 	struct dns_address_child_state *state = request->address_child;
-	unsigned char normalized[DNS_IN_PACKSIZE];
+	unsigned char normalized[DNS_IN_PACKSIZE], combined[DNS_IN_PACKSIZE];
 	enum dns_address_child_result result;
 	if (!state) return;
 	pthread_mutex_lock(&state->lock);
@@ -238,22 +260,80 @@ void _dns_server_address_child_upstream(struct dns_request *request, const unsig
 	int size = normalize_one(request, wire, len, normalized, &result);
 	if (size < 0) return; /* failures/truncation never establish negative proof */
 	pthread_mutex_lock(&state->lock);
-	if (state->evidence_len) {
+	for (int i = 0; i < state->evidence_count; i++) {
+		struct dns_address_evidence *proof = &state->evidence[i];
 		struct dns_any_input input[2] = {
-			{ .data = state->evidence, .len = state->evidence_len, .qtype = request->qtype,
-			  .age = age_seconds(state->received) },
-			{ .data = wire, .len = len, .qtype = request->qtype, .age = 0 },
+			{proof->data, proof->len, request->qtype, age_seconds(proof->received)},
+			{normalized, size, request->qtype, 0},
 		};
-		size = normalize(request, input, 2, normalized, &result);
-		if (size < 0) state->conflict = 1;
+		enum dns_address_child_result merged_result;
+		int merged = normalize(request, input, 2, combined, &merged_result);
+		if (merged < 0) continue;
+		memcpy(proof->data, combined, merged);
+		proof->len = merged; proof->result = merged_result; proof->received = get_tick_count();
+		pthread_mutex_unlock(&state->lock);
+		return;
 	}
-	if (size > 0) {
-		memcpy(state->evidence, normalized, size);
-		state->evidence_len = size;
-		state->evidence_result = result;
-		state->received = get_tick_count();
+	if (state->evidence_count == ADDRESS_EVIDENCE_MAX) state->evidence_overflow = 1;
+	else {
+		struct dns_address_evidence *proof = &state->evidence[state->evidence_count++];
+		memcpy(proof->data, normalized, size);
+		proof->len = size; proof->result = result; proof->received = get_tick_count();
 	}
 	pthread_mutex_unlock(&state->lock);
+}
+
+/* A native configured alias is trusted policy, but the target's upstream
+ * evidence must keep its original full chain and negative authority. */
+static int rebase_evidence(struct dns_request *request, struct dns_request *from,
+						   const struct dns_address_evidence *source, struct dns_address_evidence *dest)
+{
+	unsigned char wire[DNS_IN_PACKSIZE], packet_buf[DNS_PACKSIZE], output_buf[DNS_PACKSIZE];
+	struct dns_packet *packet = (struct dns_packet *)packet_buf;
+	struct dns_packet *output = (struct dns_packet *)output_buf;
+	memcpy(wire, source->data, source->len);
+	if (request->qtype != from->qtype ||
+		dns_any_wire_age(wire, source->len, age_seconds(source->received), NULL) ||
+		dns_decode(packet, sizeof(packet_buf), wire, source->len)) return -1;
+	struct dns_head head = packet->head;
+	if (dns_packet_init(output, sizeof(output_buf), &head) ||
+		dns_add_domain(output, request->domain, request->qtype, request->qclass) ||
+		dns_add_CNAME(output, DNS_RRS_AN, request->domain,
+			_dns_server_get_conf_ttl(request, from->ip_ttl), from->domain)) return -1;
+	int count = 0;
+	struct dns_rrs *rr = dns_get_rrs_start(packet, DNS_RRS_AN, &count);
+	for (int i = 0; rr && i < count; i++, rr = dns_get_rrs_next(packet, rr)) {
+		char owner[DNS_MAX_CNAME_LEN], target[DNS_MAX_CNAME_LEN];
+		unsigned char address[DNS_RR_AAAA_LEN];
+		int ttl, ret;
+		if (rr->type == DNS_T_CNAME) {
+			if (dns_get_CNAME(rr, owner, sizeof(owner), &ttl, target, sizeof(target)) ||
+				dns_add_CNAME(output, DNS_RRS_AN, owner, ttl, target)) return -1;
+			continue;
+		}
+		if (rr->type != request->qtype) return -1;
+		ret = rr->type == DNS_T_A ? dns_get_A(rr, owner, sizeof(owner), &ttl, address) :
+			dns_get_AAAA(rr, owner, sizeof(owner), &ttl, address);
+		if (ret) return -1;
+		ret = rr->type == DNS_T_A ? dns_add_A(output, DNS_RRS_AN, owner, ttl, address) :
+			dns_add_AAAA(output, DNS_RRS_AN, owner, ttl, address);
+		if (ret) return -1;
+	}
+	rr = dns_get_rrs_start(packet, DNS_RRS_NS, &count);
+	for (int i = 0; rr && i < count; i++, rr = dns_get_rrs_next(packet, rr)) {
+		char owner[DNS_MAX_CNAME_LEN];
+		struct dns_soa soa;
+		int ttl;
+		if (rr->type != DNS_T_SOA || dns_get_SOA(rr, owner, sizeof(owner), &ttl, &soa) ||
+			dns_add_SOA(output, DNS_RRS_NS, owner, ttl, &soa)) return -1;
+	}
+	int len = dns_encode(wire, sizeof(wire), output);
+	if (len < 0) return -1;
+	len = normalize_one(request, wire, len, dest->data, &dest->result);
+	if (len <= 0) { dest->len = 0; return -1; }
+	dest->len = len;
+	dest->received = get_tick_count();
+	return dest->len > 0 ? 0 : -1;
 }
 
 void _dns_server_address_child_copy(struct dns_request *request, struct dns_request *from)
@@ -264,20 +344,25 @@ void _dns_server_address_child_copy(struct dns_request *request, struct dns_requ
 	pthread_mutex_lock(&source->lock);
 	pthread_mutex_lock(&dest->lock);
 	dest->policy |= source->policy;
-	dest->conflict |= source->conflict;
+	dest->evidence_overflow |= source->evidence_overflow;
 	dest->upstream_seen |= source->upstream_seen;
-	if (source->evidence_len) {
-		/* A configured local CNAME changes the question and cannot inherit a
-		 * correlated upstream negative for the old name. Fail closed rather
-		 * than fabricate provenance. The budget is still inherited. */
-		if (strcasecmp(request->domain, from->domain)) {
-			dest->policy = 1;
-		} else {
-			memcpy(dest->evidence, source->evidence, source->evidence_len);
-			dest->evidence_len = source->evidence_len;
-			dest->evidence_result = source->evidence_result;
-			dest->received = source->received;
+	dest->local_result |= source->local_result;
+	if (source->evidence_count) {
+		int rebase = strcasecmp(request->domain, from->domain) != 0;
+		struct dns_cname_rule *alias = _dns_server_get_dns_rule(request, DOMAIN_RULE_CNAME);
+		if (rebase && (!alias || strcasecmp(alias->cname, from->domain))) dest->policy = 1;
+		else {
+			dest->evidence_count = source->evidence_count;
+			for (int i = 0; i < source->evidence_count; i++) {
+				if (rebase) {
+     if (rebase_evidence(request, from, &source->evidence[i], &dest->evidence[i])) dest->policy = 1;
+     dest->rebased = 1;
+				} else dest->evidence[i] = source->evidence[i];
+			}
 		}
+	} else if (source->cache_positive) {
+		/* A local alias cannot import an unattested cached target as wire proof. */
+		dest->policy = 1;
 	}
 	pthread_mutex_unlock(&dest->lock);
 	pthread_mutex_unlock(&source->lock);
@@ -391,11 +476,26 @@ static int address_in_evidence(struct dns_packet *evidence, dns_type_t qtype, co
 	return 0;
 }
 
+static int chain_contains(struct dns_packet *packet, const char *name, const char *domain)
+{
+	if (!strcasecmp(name, domain)) return 1;
+	int count = 0;
+	struct dns_rrs *rr = dns_get_rrs_start(packet, DNS_RRS_AN, &count);
+	for (int i = 0; rr && i < count; i++, rr = dns_get_rrs_next(packet, rr)) {
+		char owner[DNS_MAX_CNAME_LEN], target[DNS_MAX_CNAME_LEN];
+		int ttl;
+		if (rr->type == DNS_T_CNAME &&
+			!dns_get_CNAME(rr, owner, sizeof(owner), &ttl, target, sizeof(target)) &&
+			(!strcasecmp(owner, name) || !strcasecmp(target, name))) return 1;
+	}
+	return 0;
+}
+
 /* Native speed selection may collapse CNAMEs and rewrite SOA owners. Retain
  * the ordinary selected addresses and finalized address TTLs, but reconstruct
  * their proven full chain / original negative SOA, never raw unselected IPs. */
 static int preserve_evidence(struct dns_request *request, const unsigned char *wire, int len,
-							 unsigned char *out, enum dns_address_child_result *result)
+							 unsigned char *out, enum dns_address_child_result *result, const struct dns_address_evidence *proof)
 {
 	struct dns_address_child_state *state = request->address_child;
 	unsigned char native_wire[DNS_IN_PACKSIZE], evidence_wire[DNS_IN_PACKSIZE];
@@ -407,7 +507,7 @@ static int preserve_evidence(struct dns_request *request, const unsigned char *w
 	int native_cname_ttl, evidence_cname_ttl;
 	int native_len = normalize_one(request, wire, len, native_wire, result);
 	if (native_len < 0) return -1;
-	if (!state->evidence_len) {
+	if (!proof) {
 		if (state->upstream_seen) return -1;
 		if (!state->cache_positive || *result != DNS_ADDRESS_CHILD_POSITIVE) {
 			*result = DNS_ADDRESS_CHILD_POLICY;
@@ -416,14 +516,18 @@ static int preserve_evidence(struct dns_request *request, const unsigned char *w
 		memcpy(out, wire, len);
 		return len;
 	}
-	if (*result != state->evidence_result) return -1;
-	memcpy(evidence_wire, state->evidence, state->evidence_len);
-	if (dns_any_wire_age(evidence_wire, state->evidence_len, age_seconds(state->received), NULL) ||
+	if (*result != proof->result) return -1;
+	memcpy(evidence_wire, proof->data, proof->len);
+	if (dns_any_wire_age(evidence_wire, proof->len, age_seconds(proof->received), NULL) ||
 		dns_decode(native, sizeof(native_buf), native_wire, native_len) ||
-		dns_decode(evidence, sizeof(evidence_buf), evidence_wire, state->evidence_len) ||
+		dns_decode(evidence, sizeof(evidence_buf), evidence_wire, proof->len) ||
 		terminal_name(native, request->domain, native_terminal, &native_cname_ttl) ||
-		terminal_name(evidence, request->domain, evidence_terminal, &evidence_cname_ttl) ||
-		strcasecmp(native_terminal, evidence_terminal)) return -1;
+		terminal_name(evidence, request->domain, evidence_terminal, &evidence_cname_ttl)) return -1;
+	/* Native configured-CNAME callbacks may collapse the target's subsequent
+	 * aliases too. Only map a selected address through the proven chain. */
+	int flattened = (request->conf->dns_force_no_cname && !strcasecmp(native_terminal, request->domain)) ||
+		(state->rebased && chain_contains(evidence, native_terminal, request->domain));
+	if (!flattened && strcasecmp(native_terminal, evidence_terminal)) return -1;
 	struct dns_head head = native->head;
 	head.id = request->id;
 	head.aa = head.ad = head.cd = 0;
@@ -440,9 +544,10 @@ static int preserve_evidence(struct dns_request *request, const unsigned char *w
 			if (rr->type != request->qtype) continue;
 			ret = request->qtype == DNS_T_A ? dns_get_A(rr, owner, sizeof(owner), &ttl, address) :
 				dns_get_AAAA(rr, owner, sizeof(owner), &ttl, address);
-			if (ret || !address_in_evidence(evidence, request->qtype, owner, address)) return -1;
-			ret = request->qtype == DNS_T_A ? dns_add_A(output, DNS_RRS_AN, owner, ttl, address) :
-				dns_add_AAAA(output, DNS_RRS_AN, owner, ttl, address);
+			const char *proven_owner = flattened ? evidence_terminal : owner;
+			if (ret || !address_in_evidence(evidence, request->qtype, proven_owner, address)) return -1;
+			ret = request->qtype == DNS_T_A ? dns_add_A(output, DNS_RRS_AN, proven_owner, ttl, address) :
+				dns_add_AAAA(output, DNS_RRS_AN, proven_owner, ttl, address);
 			if (ret) return -1;
 		}
 	} else {
@@ -462,6 +567,49 @@ static int preserve_evidence(struct dns_request *request, const unsigned char *w
 	return dns_encode(out, DNS_IN_PACKSIZE, output);
 }
 
+static int flattened_positive(struct dns_request *request, const unsigned char *wire, int len,
+                              unsigned char *out, enum dns_address_child_result *result)
+{
+	struct dns_address_child_state *state = request->address_child;
+	unsigned char native_wire[DNS_IN_PACKSIZE], native_buf[DNS_PACKSIZE], output_buf[DNS_PACKSIZE];
+	struct dns_packet *native = (struct dns_packet *)native_buf, *output = (struct dns_packet *)output_buf;
+	int size = normalize_one(request, wire, len, native_wire, result);
+	if (size < 0 || *result != DNS_ADDRESS_CHILD_POSITIVE || dns_decode(native, sizeof(native_buf), native_wire, size)) return -1;
+	struct dns_head head = native->head;
+	if (dns_packet_init(output, sizeof(output_buf), &head) ||
+		dns_add_domain(output, request->domain, request->qtype, request->qclass)) return -1;
+	int count = 0;
+	struct dns_rrs *rr = dns_get_rrs_start(native, DNS_RRS_AN, &count);
+	for (int i = 0; rr && i < count; i++, rr = dns_get_rrs_next(native, rr)) {
+		char owner[DNS_MAX_CNAME_LEN]; unsigned char address[DNS_RR_AAAA_LEN]; int ttl;
+		if (rr->type != request->qtype) return -1;
+		int ret = rr->type == DNS_T_A ? dns_get_A(rr, owner, sizeof(owner), &ttl, address) :
+			dns_get_AAAA(rr, owner, sizeof(owner), &ttl, address);
+		if (ret || strcasecmp(owner, request->domain)) return -1;
+		int proven = 0, alias_bound = INT_MAX;
+		for (int j = 0; j < state->evidence_count; j++) {
+			const struct dns_address_evidence *proof = &state->evidence[j];
+			unsigned char evidence_wire[DNS_IN_PACKSIZE], evidence_buf[DNS_PACKSIZE];
+			struct dns_packet *evidence = (struct dns_packet *)evidence_buf;
+			char terminal[DNS_MAX_CNAME_LEN]; int cname_ttl;
+			if (proof->result != DNS_ADDRESS_CHILD_POSITIVE) continue;
+			memcpy(evidence_wire, proof->data, proof->len);
+			if (dns_any_wire_age(evidence_wire, proof->len, age_seconds(proof->received), NULL) ||
+				dns_decode(evidence, sizeof(evidence_buf), evidence_wire, proof->len) ||
+				terminal_name(evidence, request->domain, terminal, &cname_ttl) ||
+				!address_in_evidence(evidence, request->qtype, terminal, address)) continue;
+			proven = 1;
+			if (cname_ttl < alias_bound) alias_bound = cname_ttl;
+		}
+		if (!proven) return -1;
+		if (ttl > alias_bound) ttl = alias_bound;
+		ret = rr->type == DNS_T_A ? dns_add_A(output, DNS_RRS_AN, request->domain, ttl, address) :
+			dns_add_AAAA(output, DNS_RRS_AN, request->domain, ttl, address);
+		if (ret) return -1;
+	}
+	return dns_encode(out, DNS_IN_PACKSIZE, output);
+}
+
 void _dns_server_address_child_post(struct dns_server_post_context *context)
 {
 	struct dns_request *request = context->request;
@@ -476,10 +624,23 @@ void _dns_server_address_child_post(struct dns_server_post_context *context)
 		return;
 	}
 	state->reported = 1;
-	if (state->policy || context->do_force_soa || request->force_soa ||
+	if (state->policy) result = DNS_ADDRESS_CHILD_POLICY;
+	else if (state->local_result) {
+		len = normalize_one(request, context->inpacket, context->inpacket_len, wire, &result);
+		if (len < 0) result = DNS_ADDRESS_CHILD_FAILURE;
+		else if (result == DNS_ADDRESS_CHILD_NODATA) result = DNS_ADDRESS_CHILD_POLICY_NODATA;
+	}
+	else if (context->do_force_soa || request->force_soa ||
 		request->dualstack_selection_force_soa) result = DNS_ADDRESS_CHILD_POLICY;
-	else if (!state->conflict) {
-		len = preserve_evidence(request, context->inpacket, context->inpacket_len, wire, &result);
+	else if (!state->evidence_overflow) {
+		if (request->conf->dns_force_no_cname)
+			len = flattened_positive(request, context->inpacket, context->inpacket_len, wire, &result);
+		for (int i = 0; len < 0 && i < (state->evidence_count ? state->evidence_count : 1); i++) {
+			len = preserve_evidence(request, context->inpacket, context->inpacket_len, wire, &result,
+				state->evidence_count ? &state->evidence[i] : NULL);
+		}
+		if (len > 0 && request->conf->dns_force_no_cname)
+			len = _dns_server_any_flatten_addresses(request->domain, request->qtype, wire, len);
 		if (len < 0 && result != DNS_ADDRESS_CHILD_POLICY) result = DNS_ADDRESS_CHILD_FAILURE;
 	}
 	state->result = result;

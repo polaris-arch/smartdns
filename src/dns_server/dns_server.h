@@ -325,7 +325,7 @@ struct dns_request {
 	int edns0_do;
 	/* Original wire context, also needed to attest native cache provenance.
 	 * Capturing it does not change ordinary non-ANY forwarding behavior. */
-	unsigned char any_do, any_cd, any_ad, any_rd, any_unknown_context;
+	unsigned char any_do, any_cd, any_ad, any_rd, any_unknown_context, any_unsupported_context;
 	unsigned short any_udp_size;
 	/* Set only when this request enters a compatible native upstream lookup. */
 	unsigned char cache_origin_plain;
