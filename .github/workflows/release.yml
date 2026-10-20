@@ -2,18 +2,34 @@ name: Build and Release Artifacts
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  BUILD_TARGET: ${{ inputs.target || 'all' }}
 
 on:
   release:
     types: [published]
   schedule:
     - cron: '0 18 * * *' # Daily at 18:00 UTC (02:00 AM Beijing Time)
-  workflow_dispatch: # Allows manual trigger from GitHub UI for testing
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Release architectures'
+        type: choice
+        options: [x86_64, all]
+        default: x86_64
+      release_tag:
+        description: 'Existing tag at this commit for a stable release; empty creates nightly'
+        type: string
+        default: ''
 
 permissions:
   contents: write
 
 jobs:
+  validate:
+    uses: ./.github/workflows/c-cpp.yml
+    with:
+      release_validation: true
+
   check_updates:
     name: Check for updates (Schedule only)
     runs-on: ubuntu-latest
@@ -50,7 +66,7 @@ jobs:
 
   build-release:
     name: Build Cross-Compiled Artifacts
-    needs: check_updates
+    needs: [check_updates, validate]
     if: needs.check_updates.outputs.should_run == 'true'
     runs-on: ubuntu-22.04
 
@@ -58,6 +74,16 @@ jobs:
       # 1. Checkout the repository
       - name: Checkout Code
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify stable release identity
+        if: inputs.release_tag != ''
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^Release[0-9]+\.[0-9]+\.[0-9]+-polaris\.[0-9]+$ ]]
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$GITHUB_SHA"
 
       # 2. Setup Node.js (needed for webui compilation)
       - name: Setup Node.js
@@ -116,7 +142,7 @@ jobs:
         id: cache-toolchain
         with:
           path: ~/toolchain
-          key: ${{ runner.os }}-toolchains-openssl-3.5.4-v2
+          key: ${{ runner.os }}-${{ env.BUILD_TARGET }}-toolchains-openssl-3.5.4-v2
 
       # 9. Link Cached Toolchains to /opt/toolchain (Runs always so paths match)
       - name: Link Cached Toolchains
@@ -169,6 +195,7 @@ jobs:
           )
           
           for arch in "${!toolchains[@]}"; do
+            if [ "$BUILD_TARGET" != all ] && [ "$arch" != "$BUILD_TARGET" ]; then continue; fi
             read -r url dir_name target_name <<< "${toolchains[$arch]}"
             echo "==========================================="
             echo "Installing $arch toolchain..."
@@ -226,12 +253,17 @@ jobs:
           }
           
           # Compile OpenSSL for each target in parallel or sequence
-          build_openssl "/opt/toolchain/mips-unknown-linux-musl/bin/mips-unknown-linux-musl-gcc" "linux-generic32"
-          build_openssl "/opt/toolchain/mipsel-unknown-linux-musl/bin/mipsel-unknown-linux-musl-gcc" "linux-generic32"
-          build_openssl "/opt/toolchain/arm-unknown-linux-musleabi/bin/arm-unknown-linux-musleabi-gcc" "linux-armv4"
-          build_openssl "/opt/toolchain/aarch64-unknown-linux-musl/bin/aarch64-unknown-linux-musl-gcc" "linux-aarch64"
-          build_openssl "/opt/toolchain/x86_64-unknown-linux-musl/bin/x86_64-unknown-linux-musl-gcc" "linux-x86_64"
-          build_openssl "/opt/toolchain/i686-unknown-linux-musl/bin/i686-unknown-linux-musl-gcc" "linux-elf"
+          for arch in mips mipsel arm aarch64 x86_64 i686; do
+            if [ "$BUILD_TARGET" != all ] && [ "$arch" != "$BUILD_TARGET" ]; then continue; fi
+            case "$arch" in
+              mips|mipsel) ssl_target=linux-generic32 ;;
+              arm) ssl_target=linux-armv4 ;;
+              aarch64) ssl_target=linux-aarch64 ;;
+              x86_64) ssl_target=linux-x86_64 ;;
+              i686) ssl_target=linux-elf ;;
+            esac
+            build_openssl "/opt/toolchain/$arch-unknown-linux-musl/bin/$arch-unknown-linux-musl-gcc" "$ssl_target"
+          done
 
       # 9. Run the build script
       - name: Build All Targets
@@ -300,6 +332,7 @@ jobs:
           export STATIC=yes
           export CFLAGS="-DFEATURE_CHECK_EDNS -O2 -g -Wall -Wstrict-prototypes -fno-omit-frame-pointer -Wstrict-aliasing -funwind-tables -Wmissing-prototypes -Wshadow -Wextra -Wno-unused-parameter -Wno-implicit-fallthrough"
 
+          if [ "$BUILD_TARGET" = all ]; then
           build all luci nobuild
           build all luci-lite nobuild
           build all luci-compat nobuild
@@ -340,6 +373,7 @@ jobs:
           unset CC
 
           # x86-64
+          fi
           export CC=/opt/toolchain/x86_64-unknown-linux-musl/bin/x86_64-unknown-linux-musl-gcc
           build x86_64 optware 
           build x86_64 openwrt "" ui
@@ -348,12 +382,14 @@ jobs:
           clean
 
           # x86
+          if [ "$BUILD_TARGET" = all ]; then
           export CC=/opt/toolchain/i686-unknown-linux-musl/bin/i686-unknown-linux-musl-gcc
           build x86 optware 
           build x86 openwrt "" ui
           build x86 debian nobuild ui
           build x86 linux nobuild ui
           clean
+          fi
 
           make -C $CODE_DIR/src clean || true
           EOF
@@ -378,6 +414,14 @@ jobs:
           mv *.apk release-assets/ 2>/dev/null || true
           mv *.deb release-assets/ 2>/dev/null || true
           mv *.tar.gz release-assets/ 2>/dev/null || true
+
+          # Rename only distribution files. Package contents and executable paths stay smartdns.
+          for asset in release-assets/smartdns*; do
+            [ -f "$asset" ] || continue
+            name=$(basename "$asset")
+            mv "$asset" "release-assets/smartdns-polaris${name#smartdns}"
+          done
+          (cd release-assets && sha256sum * > SHA256SUMS)
           
           echo "=== List of all files in release-assets ==="
           ls -la release-assets/
@@ -386,15 +430,24 @@ jobs:
       # 10. Upload all packages and binaries individually to the GitHub Release (only on release event)
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v3
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || inputs.release_tag != ''
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ inputs.release_tag || github.ref_name }}
+          body: |
+            Polaris SmartDNS, built from `${{ github.sha }}` on `${{ github.ref_name }}`.
+            Native system/QUIC suites, ASan/UBSan and offline comparison must pass before packaging.
+            Distribution filenames use smartdns-polaris; installed binaries and package identity remain smartdns.
+          prerelease: false
+          make_latest: true
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # 11. Clean up Nightly Release to prevent stale files
       - name: Clean up Nightly Release
-        if: github.event_name != 'release'
+        if: github.event_name != 'release' && inputs.release_tag == ''
         run: |
           gh release delete nightly --cleanup-tag --yes || true
         env:
@@ -403,7 +456,7 @@ jobs:
       # 12. Upload all packages and binaries individually to the GitHub Nightly Release (on non-release events like schedule/workflow_dispatch)
       - name: Upload Nightly Release Assets
         uses: softprops/action-gh-release@v3
-        if: github.event_name != 'release'
+        if: github.event_name != 'release' && inputs.release_tag == ''
         with:
           tag_name: nightly
           name: "SmartDNS Nightly Build"
