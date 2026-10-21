@@ -43,11 +43,26 @@ TEST(Http3Control, DuplicateCriticalStreamsAndPushRejected) {
     EXPECT_LT(push.Feed(0, {1}), 0);
 }
 TEST(Http3Control, ZeroCapacityEncoderAndLegalDecoderCancellation) {
-    { Control c; EXPECT_EQ(c.Feed(0, {2}), 0); EXPECT_LT(c.Feed(0, {0x20}), 0); }
+    { Control c; EXPECT_EQ(c.Feed(0, {2}), 0); EXPECT_EQ(c.Feed(0, {0x20}), 0); }
     { Control c; EXPECT_EQ(c.Feed(0, {3,0x40}), 0); }
     { Control c; EXPECT_EQ(c.Feed(0, {3,0x7f}), 0); EXPECT_EQ(c.Feed(0, {1}), 0); }
     { Control c; EXPECT_LT(c.Feed(0, {3,0x80}), 0); }
     { Control c; EXPECT_LT(c.Feed(0, {3,1}), 0); }
+}
+TEST(Http3Control, GoogleZeroCapacityIsIdempotentAndDoesNotAllowDynamicInstructions) {
+    const std::vector<unsigned char> bytes = {2,0x20,0x20};
+    for (size_t split = 0; split <= bytes.size(); split++) {
+        Control c;
+        EXPECT_EQ(c.Feed(0, {bytes.begin(), bytes.begin()+split}), 0);
+        EXPECT_EQ(c.Feed(0, {bytes.begin()+split, bytes.end()}), 0);
+        EXPECT_EQ(_dns_http3_error(&c.server), 0U);
+        EXPECT_TRUE(_dns_http3_request_allowed(&c.server, 0, 0));
+    }
+    for (unsigned char instruction : {0x00,0x1f,0x21,0x3f,0x40,0x80,0xc0}) {
+        Control c;
+        EXPECT_LT(c.Feed(0, {2,0x20,instruction}), 0);
+        EXPECT_EQ(_dns_http3_error(&c.server), 0x201U);
+    }
 }
 TEST(Http3Control, GoawayStopsNewAndClassifiesAlreadyStarted) {
     Control c;

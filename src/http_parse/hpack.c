@@ -1,4 +1,5 @@
 #include "hpack.h"
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,6 +82,7 @@ static const struct hpack_static_entry hpack_static_table[] = {
 
 static int hpack_encode_integer(uint64_t value, int prefix_bits, uint8_t *buf, int buf_size)
 {
+	if (prefix_bits < 1 || prefix_bits > 8) return -1;
 	int max_prefix = (1 << prefix_bits) - 1;
 	int offset = 0;
 
@@ -115,6 +117,7 @@ static int hpack_encode_integer(uint64_t value, int prefix_bits, uint8_t *buf, i
 
 static int hpack_decode_integer(const uint8_t *data, int data_len, int prefix_bits, uint64_t *value)
 {
+	if (prefix_bits < 1 || prefix_bits > 8) return -1;
 	int max_prefix = (1 << prefix_bits) - 1;
 	int offset = 0;
 	uint64_t result;
@@ -132,15 +135,14 @@ static int hpack_decode_integer(const uint8_t *data, int data_len, int prefix_bi
 
 	while (offset < data_len) {
 		uint8_t byte = data[offset++];
-		result += (uint64_t)(byte & 0x7F) << shift;
-		shift += 7;
+		uint64_t chunk = byte & 0x7F;
+		if (shift >= 64 || chunk > (UINT64_MAX - result) >> shift) return -1;
+		result += chunk << shift;
 		if ((byte & 0x80) == 0) {
 			*value = result;
 			return offset;
 		}
-		if (shift > 63) {
-			return -1;
-		}
+		shift += 7;
 	}
 
 	return -1;
@@ -150,11 +152,11 @@ static int hpack_decode_integer(const uint8_t *data, int data_len, int prefix_bi
 
 static int hpack_encode_string(const char *str, uint8_t *buf, int buf_size)
 {
-	int len = strlen(str);
+	size_t len = strlen(str);
 	int offset = 0;
 	int ret;
 
-	if (buf_size < 1) {
+	if (buf_size < 1 || len > (size_t)buf_size) {
 		return -1;
 	}
 
@@ -165,12 +167,12 @@ static int hpack_encode_string(const char *str, uint8_t *buf, int buf_size)
 	}
 	offset += ret;
 
-	if (offset + len > buf_size) {
+	if (len > (size_t)(buf_size - offset)) {
 		return -1;
 	}
 
 	memcpy(buf + offset, str, len);
-	offset += len;
+	offset += (int)len;
 
 	return offset;
 }
@@ -519,14 +521,16 @@ static int hpack_decode_string(const uint8_t *data, int data_len, char **str)
 	}
 	offset += ret;
 
-	if (offset + (int)len > data_len) {
+	if (len > (uint64_t)(data_len - offset) || len > SIZE_MAX - 1) {
 		return -1;
 	}
 
 	if (huffman) {
 		/* Huffman decoding */
 
-		/* Allocate buffer for decoded string (worst case: same size as encoded) */
+		/* Five-bit minimum codes need less than twice the input size. Bound
+		 * arithmetic and the decoder's int return before allocating. */
+		if (len > ((size_t)INT_MAX - 1) / 2 || len > (SIZE_MAX - 1) / 2) return -1;
 		uint8_t *decoded = malloc(len * 2 + 1); /* Extra space for safety */
 		if (!decoded) {
 			return -1;
@@ -558,7 +562,7 @@ static int hpack_decode_string(const uint8_t *data, int data_len, char **str)
 		(*str)[len] = '\0';
 	}
 
-	offset += len;
+	offset += (int)len;
 
 	return offset;
 }
@@ -569,7 +573,9 @@ void hpack_init_context(struct hpack_context *hpack)
 {
 	hpack->dynamic_table = NULL;
 	hpack->dynamic_table_size = 0;
-	hpack->max_dynamic_table_size = 65536; /* Default size */
+	hpack->max_dynamic_table_size = 4096; /* RFC 7541 initial capacity */
+	hpack->pending_size_update = 0;
+	hpack->pending_min_size = hpack->pending_final_size = 0;
 	hpack->entry_count = 0;
 }
 
@@ -724,7 +730,7 @@ static int hpack_find_index(struct hpack_context *hpack, const char *name, const
 
 /* HPACK encoding */
 
-int hpack_encode_header(struct hpack_context *hpack, const char *name, const char *value, uint8_t *buf, int buf_size)
+static int hpack_encode_field(struct hpack_context *hpack, const char *name, const char *value, uint8_t *buf, int buf_size)
 {
 	int index, name_only_index;
 	int offset = 0;
@@ -763,7 +769,7 @@ int hpack_encode_header(struct hpack_context *hpack, const char *name, const cha
 		}
 		offset += ret;
 
-		hpack_add_dynamic_entry(hpack, name, value);
+		if (hpack_add_dynamic_entry(hpack, name, value) < 0) return -1;
 		return offset;
 	}
 
@@ -785,11 +791,39 @@ int hpack_encode_header(struct hpack_context *hpack, const char *name, const cha
 	}
 	offset += ret;
 
-	hpack_add_dynamic_entry(hpack, name, value);
+	if (hpack_add_dynamic_entry(hpack, name, value) < 0) return -1;
 	return offset;
 }
 
-/* HPACK decoding */
+void hpack_set_encoder_table_size(struct hpack_context *hpack, size_t new_size)
+{
+	if (new_size == hpack->max_dynamic_table_size) return;
+	if (!hpack->pending_size_update || new_size < hpack->pending_min_size)
+		hpack->pending_min_size = new_size;
+	hpack->pending_final_size = new_size;
+	hpack->pending_size_update = 1;
+	hpack_resize_dynamic_table(hpack, new_size);
+}
+
+int hpack_encode_header(struct hpack_context *hpack, const char *name, const char *value, uint8_t *buf, int buf_size)
+{
+	int offset = 0;
+	if (hpack->pending_size_update) {
+		size_t sizes[] = {hpack->pending_min_size, hpack->pending_final_size};
+		int count = sizes[0] == sizes[1] ? 1 : 2;
+		for (int i = 0; i < count; i++) {
+			if (offset >= buf_size) return -1;
+			buf[offset] = 0x20;
+			int ret = hpack_encode_integer(sizes[i], 5, buf + offset, buf_size - offset);
+			if (ret < 0) return -1;
+			offset += ret;
+		}
+	}
+	int ret = hpack_encode_field(hpack, name, value, buf + offset, buf_size - offset);
+	if (ret < 0) return -1;
+	hpack->pending_size_update = 0;
+	return offset + ret;
+}
 
 void hpack_resize_dynamic_table(struct hpack_context *hpack, size_t new_size)
 {
@@ -886,8 +920,10 @@ int hpack_decode_headers(struct hpack_context *hpack, const uint8_t *data, int d
 			offset += ret;
 			value = allocated_value;
 
-			if (name && value) {
-				hpack_add_dynamic_entry(hpack, name, value);
+			if (name && value && hpack_add_dynamic_entry(hpack, name, value) < 0) {
+				free(allocated_name);
+				free(allocated_value);
+				return -1;
 			}
 			header_field_seen = 1;
 		} else if ((data[offset] & 0x20) != 0) {
@@ -901,6 +937,7 @@ int hpack_decode_headers(struct hpack_context *hpack, const uint8_t *data, int d
 				return -1;
 			}
 			offset += ret;
+			if (new_size > HPACK_MAX_TABLE_SIZE) return -1;
 			hpack_resize_dynamic_table(hpack, new_size);
 			continue; /* Continue to next field */
 		} else {

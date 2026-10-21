@@ -1,5 +1,6 @@
 /* HTTP/3 connection control. Static-only QPACK; no additional QUIC connection. */
 #include "client_http3_control.h"
+#include "smartdns/util.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,8 +84,20 @@ static int h3_parse(struct dns_http3_control *c, struct h3_peer_stream *p)
         c->seen |= bit;
     }
     if (p->type == 2) {
-        /* RFC 9204: advertising maximum capacity zero forbids encoder instructions. */
-        return p->used ? h3_fail(c, 0x201) : 0;
+        /* RFC 9204 forbids instructions with maximum capacity zero. Google
+         * nevertheless sends Set Dynamic Table Capacity(0). Tolerate only
+         * that idempotent instruction, never inserts or a positive capacity.
+         * Handle fragmented streams within the existing work budget. */
+        while (p->used) {
+            if (c->transitions >= 64) return 0;
+            if ((p->data[0] & 0xe0) != 0x20) return h3_fail(c, 0x201);
+            /* Zero has exactly this representation; a saturated five-bit
+             * prefix is already positive, even before continuation bytes. */
+            if (p->data[0] != 0x20) return h3_fail(c, 0x201);
+            h3_consume(p, 1);
+            c->transitions++;
+        }
+        return 0;
     }
     if (p->type == 3) {
         while (p->used) {
@@ -257,6 +270,8 @@ int _dns_http3_control_shutdown(struct dns_server_info *s)
     if (!c) return 0;
     if (c->transport_fatal) return 1;
     if (!c->fatal) return 0;
+    tlog(TLOG_DEBUG, "http3 protocol error from %s:%d: 0x%llx", s->ip, s->port,
+         (unsigned long long)c->fatal);
     SSL_SHUTDOWN_EX_ARGS args = {0};
     args.quic_error_code = c->fatal;
     args.quic_reason = "HTTP/3 connection protocol error";
