@@ -75,7 +75,7 @@ struct any_child {
 	int type, started, ended, has_result, reported, policy_negative;
 	unsigned long received;
 	int len;
-	unsigned char data[DNS_IN_PACKSIZE];
+	unsigned char *data;
 };
 struct any_operation {
 	atomic_t refs;
@@ -90,6 +90,8 @@ struct any_operation {
 	unsigned long finished;
 	unsigned char final_wire[DNS_IN_PACKSIZE];
 	struct any_child children[DNS_ANY_MAX_TYPES + 1];
+	/* Payloads share the operation lifetime; unused child slots own no buffer. */
+	unsigned char child_wire[];
 };
 struct any_cache {
 	struct any_key key;
@@ -654,7 +656,15 @@ int _dns_server_process_any(struct dns_request *request, const char *group_name)
 		}
 		if (!op && budget && free_slot >= 0 && atomic_read(&any_allocated) < ANY_ACTIVE_MAX &&
 			clients[client_index].operations < ANY_CLIENT_OPERATIONS) {
-			op = calloc(1, sizeof(*op));
+			/* Keep stable child indices and a single allocation/free. Address mode
+			 * never probes child 0; passthrough never launches typed children. */
+			int first = key.config.aggregate == DNS_ANY_ADDRESS ? 1 : 0;
+			int last = key.config.aggregate ? key.config.type_count : 0;
+			if (key.config.type_count >= 0 && key.config.type_count <= DNS_ANY_MAX_TYPES && last >= first) {
+				size_t count = (size_t)(last - first + 1);
+				if (count <= (SIZE_MAX - sizeof(*op)) / DNS_IN_PACKSIZE)
+					op = calloc(1, sizeof(*op) + count * DNS_IN_PACKSIZE);
+			}
 			if (op) {
 				atomic_inc(&any_allocated);
 				pthread_mutexattr_t attr;
@@ -667,6 +677,8 @@ int _dns_server_process_any(struct dns_request *request, const char *group_name)
 					op->children[j].owner = op;
 					op->children[j].type = j ? key.config.types[j - 1] : DNS_T_ANY;
 				}
+				for (int j = first; j <= last; j++)
+					op->children[j].data = op->child_wire + (size_t)(j - first) * DNS_IN_PACKSIZE;
 				op->owner_client = client_index; clients[client_index].operations++;
 				operations[free_slot] = op; atomic_inc(&any_active);
 			}

@@ -191,6 +191,35 @@ TEST(AnyOffline, RefusedExpandsExactlyConfiguredTypesAndCaches)
 	EXPECT_EQ(any, 1); EXPECT_EQ(a, 1); EXPECT_EQ(txt, 1); EXPECT_EQ(other, 0);
 }
 
+/* Exercise the last bounded payload slot as well as passthrough with dormant
+ * configured types. The coordinator must not allocate/use typed buffers there. */
+TEST(AnyOffline, PayloadStorageCoversMaximumTypesAndPassthrough)
+{
+	for (bool expand : {false, true}) {
+		SCOPED_TRACE(expand ? "eight typed payloads" : "one probe payload");
+		std::atomic<int> probes{0}, typed{0}; smartdns::MockServer upstream; smartdns::Server server;
+		ASSERT_TRUE(upstream.Start("udp://127.0.0.1:61053", [&](smartdns::ServerRequestContext *r) {
+			response_question(r);
+			if (r->qtype == DNS_T_ANY) { probes++; r->response_packet->head.rcode = DNS_RC_REFUSED; }
+			else {
+				typed++; r->response_packet->head.rcode = DNS_RC_NXDOMAIN;
+				dns_soa soa{};
+				std::strcpy(soa.mname, "ns.any-offline.test");
+				std::strcpy(soa.rname, "hostmaster.any-offline.test");
+				soa.serial = 1; soa.minimum = 60;
+				EXPECT_EQ(dns_add_SOA(r->response_packet, DNS_RRS_NS, "any-offline.test", 60, &soa), 0);
+			}
+			return smartdns::SERVER_REQUEST_OK;
+		}));
+		ASSERT_TRUE(server.Start(configuration(std::string("cache-size 0\nany-response-mode ") +
+			(expand ? "aggregate" : "passthrough") +
+			"\nany-aggregate-types A,AAAA,NS,SOA,PTR,MX,TXT,SRV\n"
+			"any-aggregate-max-attempts 16\nany-aggregate-concurrency 8\nany-aggregate-timeout-ms 950\n")));
+		EXPECT_TRUE(response_is(local_query(DNS_T_ANY), expand ? DNS_RC_NXDOMAIN : DNS_RC_REFUSED, 0));
+		EXPECT_EQ(probes, 1); EXPECT_EQ(typed, expand ? 8 : 0);
+	}
+}
+
 TEST(AnyOffline, CacheSizeZeroRepeatsPassthroughUpstreamLookup)
 {
 	std::atomic<int> any{0}, other{0}; smartdns::MockServer upstream; smartdns::Server server;
@@ -606,4 +635,37 @@ TEST(AnyOffline, DefaultDuplicateBurstFallsBackToNativeWhenCoordinatorFull)
 TEST(AnyOffline, DefaultUniqueBurstFallsBackToNativeWhenCoordinatorFull)
 {
 	default_passthrough_burst(true);
+}
+
+TEST(UpstreamRoundRobinWire, TwoBackendSerialFairnessAndLegacyFanout) {
+    for (int cap : {0, 1, 2}) {
+        SCOPED_TRACE(cap);
+        std::atomic<int> a{0}, b{0};
+        smartdns::MockServer first, second;
+        smartdns::Server server;
+        auto reply = [&](smartdns::ServerRequestContext *r, std::atomic<int> &counter) {
+            counter++;
+            response_question(r);
+            unsigned char ip[4] = {192, 0, 2, 9};
+            EXPECT_EQ(dns_add_A(r->response_packet, DNS_RRS_AN, r->domain.c_str(), 60, ip), 0);
+            return smartdns::SERVER_REQUEST_OK;
+        };
+        ASSERT_TRUE(first.Start("udp://127.0.0.1:61053", [&](smartdns::ServerRequestContext *r) { return reply(r, a); }));
+        ASSERT_TRUE(second.Start("udp://127.0.0.1:61054", [&](smartdns::ServerRequestContext *r) { return reply(r, b); }));
+        std::string options = " -quota-group wire-rr";
+        if (cap) options += " -upstream-round-robin -max-upstream-connections " + std::to_string(cap);
+        ASSERT_TRUE(server.Start("bind 127.0.0.1:60053\ncache-size 0\nprefetch-domain no\n"
+            "speed-check-mode none\ndualstack-ip-selection no\n"
+            "server 127.0.0.1:61053" + options + "\nserver 127.0.0.1:61054" + options + "\n"));
+        for (int i = 0; i < 6; i++) {
+            auto name = "rr-" + std::to_string(i) + ".test";
+            auto answer = local_query(DNS_T_A, false, false, false, false, false, 60053, name.c_str());
+            ASSERT_TRUE(response_is(answer, DNS_RC_NOERROR, 1, false, DNS_T_A, name.c_str()));
+            if (cap) {
+                EXPECT_EQ(a + b, i + 1);
+                EXPECT_LE(abs(a.load() - b.load()), 1);
+            } else ASSERT_TRUE(wait_until([&] { return a == i + 1 && b == i + 1; }));
+        }
+        EXPECT_EQ(a, cap ? 3 : 6); EXPECT_EQ(b, cap ? 3 : 6);
+    }
 }

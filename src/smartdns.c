@@ -244,6 +244,8 @@ static int _smartdns_prepare_server_flags(struct client_dns_server_flags *flags,
 	flags->max_query_rate = server->max_query_rate;
 	flags->query_burst = server->query_burst;
 	flags->max_concurrent_queries = server->max_concurrent_queries;
+	flags->upstream_round_robin = server->upstream_round_robin;
+	flags->max_upstream_connections = server->max_upstream_connections;
 	safe_strncpy(flags->quota_group, server->quota_group, sizeof(flags->quota_group));
 	flags->subnet_all_query_types = server->subnet_all_query_types;
 	flags->fallback = server->fallback;

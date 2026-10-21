@@ -1,6 +1,8 @@
 #include "gtest/gtest.h"
 extern "C" {
 #include "dns_client/upstream_policy.h"
+#include "dns_client/query.h"
+#include "smartdns/util.h"
 #include "dns_client/client_tcp.h"
 #include "dns_client/client_https.h"
 #include "dns_client/conn_stream.h"
@@ -10,6 +12,8 @@ extern "C" {
 #include <cstring>
 #include <climits>
 #include <sys/socket.h>
+#include <poll.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 #include <string>
 #include <vector>
@@ -403,4 +407,319 @@ TEST(UpstreamPolicy, Http1ProductionWriteOwnerBecomesCancellationTombstone) {
     _dns_client_conn_stream_put(stream);
     EXPECT_EQ(e.Retire(), 1);
     close(sockets[0]); close(sockets[1]); e.server.fd = -1;
+}
+
+// Recovery uses no provider-specific QPS and never opens all queued owners
+// merely because their shared cooldown has expired.
+TEST(UpstreamPolicy, RecoverySerializesPrebufferedSharedEndpointsUntilAcceptedReply) {
+    Endpoint a(0, 0, "recover-buffered"), b(0, 0, "recover-buffered"), healthy;
+    ASSERT_EQ(a.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(b.Begin(), DNS_ADMIT_OK);
+    _dns_policy_http_error(&a.server, 429, "0");
+    EXPECT_EQ(a.Wire(), DNS_ADMIT_WAIT);
+    EXPECT_EQ(b.Wire(), DNS_ADMIT_WAIT);
+    ASSERT_EQ(healthy.Begin(), DNS_ADMIT_OK);
+    EXPECT_EQ(healthy.Wire(), DNS_ADMIT_OK);
+    usleep(150000);
+    ASSERT_EQ(a.Wire(), DNS_ADMIT_OK);
+    // WANT_WRITE may continue its own lease before positive progress.
+    EXPECT_EQ(a.Wire(), DNS_ADMIT_OK);
+    EXPECT_EQ(b.Wire(), DNS_ADMIT_WAIT);
+    a.Progress();
+    ASSERT_EQ(a.Retire(), 1);
+    _dns_attempt_replied(&a.query, &a.server);
+    EXPECT_EQ(b.Wire(), DNS_ADMIT_OK);
+}
+TEST(UpstreamPolicy, RecoveryRetirementPermitsOneNextProbeWithoutOpeningPolicy) {
+    Endpoint a(0, 0, "recover-retire"), b(0, 0, "recover-retire"), c(0, 0, "recover-retire");
+    ASSERT_EQ(a.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(b.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(c.Begin(), DNS_ADMIT_OK);
+    _dns_policy_http_error(&a.server, 503, "0");
+    usleep(150000);
+    ASSERT_EQ(a.Wire(), DNS_ADMIT_OK); a.Progress();
+    EXPECT_EQ(_dns_attempt_retire(&a.query, &a.server,
+        _dns_attempt_generation(&a.query, &a.server) + 1), 0);
+    EXPECT_EQ(b.Wire(), DNS_ADMIT_WAIT);
+    ASSERT_EQ(a.Retire(), 1);
+    EXPECT_EQ(a.Retire(), 0);
+    ASSERT_EQ(b.Wire(), DNS_ADMIT_OK);
+    EXPECT_EQ(c.Wire(), DNS_ADMIT_WAIT);
+    b.Progress(); ASSERT_EQ(b.Retire(), 1);
+    _dns_attempt_replied(&b.query, &b.server);
+    EXPECT_EQ(c.Wire(), DNS_ADMIT_OK);
+}
+TEST(UpstreamPolicy, NewBackpressureEpochRejectsOldProbeCompletion) {
+    Endpoint a(0, 0, "recover-epoch"), b(0, 0, "recover-epoch"), c(0, 0, "recover-epoch");
+    ASSERT_EQ(a.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(b.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(c.Begin(), DNS_ADMIT_OK);
+    _dns_policy_http_error(&a.server, 429, "0");
+    usleep(150000);
+    ASSERT_EQ(a.Wire(), DNS_ADMIT_OK); a.Progress();
+    _dns_policy_http_error(&a.server, 429, "0");
+    ASSERT_EQ(a.Retire(), 1);
+    _dns_attempt_replied(&a.query, &a.server); // prior epoch is stale
+    EXPECT_EQ(b.Wire(), DNS_ADMIT_WAIT);
+    usleep(150000);
+    ASSERT_EQ(b.Wire(), DNS_ADMIT_OK); b.Progress();
+    _dns_attempt_replied(&a.query, &a.server); // cannot release b's lease
+    EXPECT_EQ(c.Wire(), DNS_ADMIT_WAIT);
+    ASSERT_EQ(b.Retire(), 1);
+    _dns_attempt_replied(&b.query, &b.server);
+    EXPECT_EQ(c.Wire(), DNS_ADMIT_OK);
+}
+TEST(UpstreamPolicy, RecoveryCancellationAndDestructionReleaseLease) {
+    Endpoint next(0, 0, "recover-free"), sibling(0, 0, "recover-free");
+    ASSERT_EQ(next.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(sibling.Begin(), DNS_ADMIT_OK);
+    {
+        Endpoint canceled(0, 0, "recover-free");
+        canceled.query.budget = dns_query_budget_new(4, 10000);
+        ASSERT_EQ(canceled.Begin(), DNS_ADMIT_OK);
+        _dns_policy_http_error(&canceled.server, 429, "0");
+        usleep(150000);
+        ASSERT_EQ(canceled.Wire(), DNS_ADMIT_OK);
+        dns_query_budget_cancel(canceled.query.budget);
+        EXPECT_EQ(canceled.Wire(), DNS_ADMIT_DONE);
+        EXPECT_EQ(next.Wire(), DNS_ADMIT_WAIT);
+    }
+    ASSERT_EQ(next.Wire(), DNS_ADMIT_OK);
+    EXPECT_EQ(sibling.Wire(), DNS_ADMIT_WAIT);
+    next.Progress(); ASSERT_EQ(next.Retire(), 1);
+    _dns_attempt_replied(&next.query, &next.server);
+    EXPECT_EQ(sibling.Wire(), DNS_ADMIT_OK);
+}
+TEST(UpstreamPolicy, RecoveryProbeTimeoutReleasesOnlyItsLease) {
+    Endpoint a(0, 0, "recover-timeout"), b(0, 0, "recover-timeout"), c(0, 0, "recover-timeout");
+    ASSERT_EQ(a.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(b.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(c.Begin(), DNS_ADMIT_OK);
+    _dns_policy_http_error(&a.server, 429, "0");
+    usleep(150000);
+    ASSERT_EQ(a.Wire(), DNS_ADMIT_OK); a.Progress();
+    _dns_attempt_expire(&a.query, ULONG_MAX);
+    EXPECT_EQ(atomic_read(&a.query.dns_request_sent), 0);
+    ASSERT_EQ(b.Wire(), DNS_ADMIT_OK);
+    EXPECT_EQ(c.Wire(), DNS_ADMIT_WAIT);
+}
+TEST(UpstreamPolicy, DatagramAndStreamShareRecoveryLease) {
+    Endpoint udp(0, 0, "recover-mixed"), https(0, 0, "recover-mixed");
+    udp.server.type = DNS_SERVER_UDP;
+    ASSERT_EQ(https.Begin(), DNS_ADMIT_OK);
+    _dns_policy_http_error(&https.server, 429, "0");
+    usleep(150000);
+    ASSERT_EQ(udp.Begin(), DNS_ADMIT_OK);
+    EXPECT_EQ(https.Wire(), DNS_ADMIT_WAIT);
+    ASSERT_EQ(udp.Retire(), 1);
+    _dns_attempt_replied(&udp.query, &udp.server);
+    EXPECT_EQ(https.Wire(), DNS_ADMIT_OK);
+}
+TEST(UpstreamPolicy, RecoveryPreservesExplicitRateAndRetryAfterMinimum) {
+    Endpoint a(1, 1, "recover-rate"), b(1, 1, "recover-rate");
+    _dns_policy_http_error(&a.server, 429, "1");
+    usleep(150000);
+    EXPECT_EQ(a.Begin(), DNS_ADMIT_WAIT); // server minimum is not local 100ms
+    // Separate policy lets the fast recovery fixture stay bounded.
+    Endpoint probe(1, 1, "recover-rate-fast"), next(1, 1, "recover-rate-fast");
+    _dns_policy_http_error(&probe.server, 429, "0");
+    usleep(150000);
+    ASSERT_EQ(probe.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(probe.Wire(), DNS_ADMIT_OK); probe.Progress();
+    ASSERT_EQ(probe.Retire(), 1);
+    _dns_attempt_replied(&probe.query, &probe.server);
+    EXPECT_EQ(next.Begin(), DNS_ADMIT_WAIT); // successful probe does not refill rate tokens
+}
+TEST(UpstreamPolicy, RecoveryGatesProductionTcpWritesAcrossSharedEndpoints) {
+    Endpoint a(0, 0, "recover-wire"), b(0, 0, "recover-wire");
+    int x[2], y[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, x), 0);
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, y), 0);
+    a.server.type = b.server.type = DNS_SERVER_TCP;
+    a.server.fd = x[0]; b.server.fd = y[0];
+    a.server.status = b.server.status = DNS_SERVER_STATUS_CONNECTING;
+    unsigned char dns[12] = {0x12, 0x34}, received[32];
+    ASSERT_EQ(a.Begin(), DNS_ADMIT_OK); ASSERT_EQ(b.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(_dns_client_send_framed(&a.server, &a.query, dns, sizeof(dns)), 0);
+    ASSERT_EQ(_dns_client_send_framed(&b.server, &b.query, dns, sizeof(dns)), 0);
+    _dns_policy_http_error(&a.server, 429, "0");
+    a.server.status = b.server.status = DNS_SERVER_STATUS_CONNECTED;
+    EXPECT_EQ(_dns_client_process_stream_writes(&a.server), 0);
+    EXPECT_EQ(_dns_client_process_stream_writes(&b.server), 0);
+    EXPECT_EQ(recv(x[1], received, sizeof(received), 0), -1); EXPECT_EQ(errno, EAGAIN);
+    EXPECT_EQ(recv(y[1], received, sizeof(received), 0), -1); EXPECT_EQ(errno, EAGAIN);
+    usleep(150000);
+    ASSERT_EQ(_dns_client_process_stream_writes(&a.server), 0);
+    EXPECT_EQ(recv(x[1], received, sizeof(received), 0), 14);
+    EXPECT_EQ(_dns_client_process_stream_writes(&b.server), 0);
+    EXPECT_EQ(recv(y[1], received, sizeof(received), 0), -1); EXPECT_EQ(errno, EAGAIN);
+    ASSERT_EQ(a.Retire(), 1); _dns_attempt_replied(&a.query, &a.server);
+    ASSERT_EQ(_dns_client_process_stream_writes(&b.server), 0);
+    EXPECT_EQ(recv(y[1], received, sizeof(received), 0), 14);
+    EXPECT_EQ(b.Retire(), 1);
+    close(x[0]); close(x[1]); close(y[0]); close(y[1]);
+    a.server.fd = b.server.fd = -1;
+}
+
+// The production receive path must not infer a UDP wire generation from the
+// current attempt: retries keep the query's SID on the wire.
+namespace {
+struct ReceiveQuery {
+    Endpoint &endpoint;
+    int action, calls = 0, rcode = -1;
+    dns_server_group group{};
+    dns_server_group_member member{};
+    ReceiveQuery(Endpoint &e, int result = DNS_CLIENT_ACTION_OK) : endpoint(e), action(result) {
+        pthread_mutex_init(&client.domain_map_lock, nullptr);
+        pthread_mutex_init(&client.server_list_lock, nullptr);
+        for (auto &bucket : client.domain_map) INIT_HLIST_HEAD(&bucket);
+        for (auto &bucket : client.group) INIT_HLIST_HEAD(&bucket);
+        INIT_LIST_HEAD(&client.dns_request_list);
+        INIT_LIST_HEAD(&group.head); INIT_LIST_HEAD(&member.list);
+        member.server = &e.server; list_add(&member.list, &group.head);
+        e.query.server_group = &group;
+        INIT_LIST_HEAD(&e.query.dns_request_list);
+        INIT_HLIST_NODE(&e.query.domain_node);
+        for (auto &bucket : e.query.replied_map) INIT_HLIST_HEAD(&bucket);
+        strcpy(e.query.domain, "recovery.mock.example"); e.query.qtype = DNS_T_A;
+        e.query.created_tick = get_tick_count();
+        e.query.budget = dns_query_budget_new(4, DNS_QUERY_RETRY * DNS_QUERY_TIMEOUT);
+        // One explicit owner plus the query-list owner; receive may retire the
+        // latter, but this stack fixture must never enter heap destruction.
+        atomic_set(&e.query.refcnt, 2);
+        e.query.callback = Callback; e.query.user_ptr = this;
+        EXPECT_EQ(_dns_client_add_hashmap(&e.query), 0);
+    }
+    ~ReceiveQuery() {
+        if (!endpoint.query.terminal) _dns_client_query_remove(&endpoint.query);
+        _dns_replied_check_remove(&endpoint.query, &endpoint.server);
+        EXPECT_EQ(atomic_read(&endpoint.query.refcnt), 1);
+        list_del_init(&member.list);
+        pthread_mutex_destroy(&client.server_list_lock);
+        pthread_mutex_destroy(&client.domain_map_lock);
+    }
+    static int Callback(const char *, dns_result_type type, dns_server_info *,
+                        dns_packet *packet, unsigned char *, int, void *opaque) {
+        auto *self = static_cast<ReceiveQuery *>(opaque);
+        if (type == DNS_QUERY_RESULT) { self->calls++; self->rcode = packet->head.rcode; }
+        return self->action;
+    }
+    std::vector<unsigned char> Reply(int rcode = DNS_RC_NOERROR) {
+        unsigned char storage[DNS_PACKSIZE], wire[DNS_IN_PACKSIZE];
+        auto *packet = reinterpret_cast<dns_packet *>(storage);
+        dns_head head{}; head.id = endpoint.query.sid; head.qr = DNS_QR_ANSWER;
+        head.rd = 1; head.ra = 1; head.rcode = rcode;
+        EXPECT_EQ(dns_packet_init(packet, sizeof(storage), &head), 0);
+        EXPECT_EQ(dns_add_domain(packet, endpoint.query.domain, DNS_T_A, DNS_C_IN), 0);
+        int len = dns_encode(wire, sizeof(wire), packet);
+        EXPECT_GT(len, 0);
+        return len > 0 ? std::vector<unsigned char>(wire, wire + len) : std::vector<unsigned char>{};
+    }
+    int Deliver(std::vector<unsigned char> wire) {
+        return _dns_client_recv(&endpoint.server, wire.data(), wire.size(),
+                                &endpoint.server.addr, endpoint.server.ai_addrlen);
+    }
+};
+struct LoopbackDatagram {
+    Endpoint &endpoint;
+    int peer = -1;
+    sockaddr_in client_address{};
+    LoopbackDatagram(Endpoint &e) : endpoint(e) {
+        peer = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        e.server.fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        EXPECT_GE(peer, 0); EXPECT_GE(e.server.fd, 0);
+        sockaddr_in address{}; address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        EXPECT_EQ(bind(peer, reinterpret_cast<sockaddr *>(&address), sizeof(address)), 0);
+        socklen_t len = sizeof(address);
+        EXPECT_EQ(getsockname(peer, reinterpret_cast<sockaddr *>(&address), &len), 0);
+        EXPECT_EQ(connect(e.server.fd, reinterpret_cast<sockaddr *>(&address), len), 0);
+        e.server.type = DNS_SERVER_UDP; e.server.ai_family = AF_INET;
+        e.server.ai_addrlen = len; memcpy(&e.server.addr, &address, len);
+        e.server.status = DNS_SERVER_STATUS_CONNECTED;
+    }
+    ~LoopbackDatagram() { close(peer); close(endpoint.server.fd); endpoint.server.fd = -1; }
+    std::vector<unsigned char> Capture() {
+        pollfd p{peer, POLLIN, 0};
+        EXPECT_EQ(poll(&p, 1, 250), 1);
+        unsigned char wire[DNS_IN_PACKSIZE]; socklen_t len = sizeof(client_address);
+        int n = recvfrom(peer, wire, sizeof(wire), 0,
+                         reinterpret_cast<sockaddr *>(&client_address), &len);
+        EXPECT_GT(n, 0);
+        return n > 0 ? std::vector<unsigned char>(wire, wire + n) : std::vector<unsigned char>{};
+    }
+    int Deliver(const std::vector<unsigned char> &wire) {
+        EXPECT_EQ(sendto(peer, wire.data(), wire.size(), 0,
+                         reinterpret_cast<sockaddr *>(&client_address), sizeof(client_address)),
+                  static_cast<ssize_t>(wire.size()));
+        pollfd p{endpoint.server.fd, POLLIN, 0}; EXPECT_EQ(poll(&p, 1, 250), 1);
+        unsigned char response[DNS_IN_PACKSIZE]; sockaddr_storage from{}; socklen_t len = sizeof(from);
+        int n = recvfrom(endpoint.server.fd, response, sizeof(response), 0,
+                         reinterpret_cast<sockaddr *>(&from), &len);
+        EXPECT_GT(n, 0);
+        return n > 0 ? _dns_client_recv(&endpoint.server, response, n,
+                         reinterpret_cast<sockaddr *>(&from), len) : -1;
+    }
+};
+}
+
+TEST(UpstreamPolicy, Pre429UdpReplyCannotProveRetriedProbeEpochThroughReceive) {
+    Endpoint udp(0, 0, "udp-retry-proof"), https(0, 0, "udp-retry-proof"),
+             sibling(0, 0, "udp-retry-proof");
+    ReceiveQuery registered(udp); LoopbackDatagram wire(udp);
+    ASSERT_EQ(_dns_client_send_query(&udp.query), 0);
+    auto first = wire.Capture(); ASSERT_FALSE(first.empty());
+    auto old_reply = registered.Reply();
+    unsigned first_generation = _dns_attempt_generation(&udp.query, &udp.server);
+    ASSERT_EQ(https.Begin(), DNS_ADMIT_OK); ASSERT_EQ(sibling.Begin(), DNS_ADMIT_OK);
+    _dns_policy_http_error(&https.server, 429, "0");
+    // Remain within the original two-second budget while genuinely expiring gen1.
+    usleep((DNS_QUERY_TIMEOUT + 40) * 1000);
+    _dns_attempt_expire(&udp.query, get_tick_count());
+    ASSERT_EQ(atomic_read(&udp.query.dns_request_sent), 0);
+    ASSERT_EQ(_dns_client_send_query(&udp.query), 0);
+    auto second = wire.Capture();
+    ASSERT_EQ(first, second); // Same domain/type/SID, no wire-generation discriminator.
+    ASSERT_GT(_dns_attempt_generation(&udp.query, &udp.server), first_generation);
+    ASSERT_GT(dns_query_budget_remaining_ms(udp.query.budget), 0u);
+    ASSERT_EQ(wire.Deliver(old_reply), 0);
+    EXPECT_EQ(registered.calls, 1); EXPECT_EQ(registered.rcode, DNS_RC_NOERROR);
+    EXPECT_TRUE(udp.query.terminal); EXPECT_TRUE(udp.query.has_result);
+    // Ordinary delivery succeeds, but only one sibling may now probe recovery.
+    ASSERT_EQ(https.Wire(), DNS_ADMIT_OK);
+    EXPECT_EQ(sibling.Wire(), DNS_ADMIT_WAIT);
+}
+
+TEST(UpstreamPolicy, FirstSendUdpQueryAfterCooldownCanStillProveRecoveryThroughReceive) {
+    Endpoint udp(0, 0, "udp-first-proof"), https(0, 0, "udp-first-proof"),
+             sibling(0, 0, "udp-first-proof");
+    ReceiveQuery registered(udp); LoopbackDatagram wire(udp);
+    ASSERT_EQ(https.Begin(), DNS_ADMIT_OK); ASSERT_EQ(sibling.Begin(), DNS_ADMIT_OK);
+    _dns_policy_http_error(&https.server, 429, "0"); usleep(150000);
+    ASSERT_EQ(_dns_client_send_query(&udp.query), 0); ASSERT_FALSE(wire.Capture().empty());
+    ASSERT_EQ(wire.Deliver(registered.Reply()), 0);
+    EXPECT_EQ(registered.calls, 1); EXPECT_TRUE(udp.query.terminal);
+    EXPECT_EQ(https.Wire(), DNS_ADMIT_OK); EXPECT_EQ(sibling.Wire(), DNS_ADMIT_OK);
+}
+
+TEST(UpstreamPolicy, RecoveryExchangeCallbackContractIsSeparateFromDnsBusinessSuccess) {
+    for (int action : {DNS_CLIENT_ACTION_OK, DNS_CLIENT_ACTION_MAY_RETRY,
+                       DNS_CLIENT_ACTION_UNDEFINE, DNS_CLIENT_ACTION_RETRY, DNS_CLIENT_ACTION_DROP}) {
+        for (int rcode : {DNS_RC_NOERROR, DNS_RC_NXDOMAIN, DNS_RC_SERVFAIL, DNS_RC_REFUSED}) {
+            SCOPED_TRACE(::testing::Message() << "action=" << action << " rcode=" << rcode);
+            Endpoint probe(0, 0, "callback-proof"), a(0, 0, "callback-proof"), b(0, 0, "callback-proof");
+            ReceiveQuery registered(probe, action);
+            ASSERT_EQ(probe.Begin(), DNS_ADMIT_OK);
+            ASSERT_EQ(a.Begin(), DNS_ADMIT_OK); ASSERT_EQ(b.Begin(), DNS_ADMIT_OK);
+            _dns_policy_http_error(&probe.server, 429, "0"); usleep(150000);
+            ASSERT_EQ(probe.Wire(), DNS_ADMIT_OK); probe.Progress();
+            ASSERT_EQ(registered.Deliver(registered.Reply(rcode)), 0);
+            EXPECT_EQ(registered.calls, 1); EXPECT_EQ(registered.rcode, rcode);
+            EXPECT_EQ(probe.query.has_result, action == DNS_CLIENT_ACTION_OK);
+            bool accepted = action != DNS_CLIENT_ACTION_RETRY && action != DNS_CLIENT_ACTION_DROP;
+            EXPECT_EQ(probe.query.terminal, accepted && action != DNS_CLIENT_ACTION_MAY_RETRY);
+            ASSERT_EQ(a.Wire(), DNS_ADMIT_OK);
+            EXPECT_EQ(b.Wire(), accepted ? DNS_ADMIT_OK : DNS_ADMIT_WAIT);
+        }
+    }
 }

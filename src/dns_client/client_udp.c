@@ -193,120 +193,75 @@ errout:
 	return -1;
 }
 
+/* Called under server->lock: producer records and the drain are indivisible.
+ * No server-list lock is acquired here, and no DNS callback runs in this scope. */
 static int _dns_client_process_send_udp_buffer(struct dns_server_info *server_info, struct epoll_event *event,
-											   unsigned long now)
+                                              unsigned long now)
 {
-	int send_len = 0;
-	if (server_info->send_buff.len <= 0 || server_info->status != DNS_SERVER_STATUS_CONNECTED) {
-		return 0;
-	}
-
-	while (server_info->send_buff.len - send_len > 0) {
-		int ret = 0;
-		int packet_len = 0;
-		packet_len = *(int *)(server_info->send_buff.data + send_len);
-		send_len += sizeof(packet_len);
-		if (packet_len > server_info->send_buff.len - 1) {
-			goto errout;
-		}
-
-		ret = _dns_client_send_udp(server_info, server_info->send_buff.data + send_len, packet_len);
-		if (ret < 0) {
-			tlog(TLOG_ERROR, "sendto failed, %s", strerror(errno));
-			goto errout;
-		}
-		send_len += packet_len;
-	}
-
-	server_info->send_buff.len -= send_len;
-	if (server_info->send_buff.len < 0) {
-		server_info->send_buff.len = 0;
-	}
-
-	return 0;
-
+    int send_len = 0;
+    if (server_info->send_buff.len <= 0 || server_info->status != DNS_SERVER_STATUS_CONNECTED) return 0;
+    while (send_len < server_info->send_buff.len) {
+        int packet_len = 0;
+        if (server_info->send_buff.len - send_len < (int)sizeof(packet_len)) goto errout;
+        memcpy(&packet_len, server_info->send_buff.data + send_len, sizeof(packet_len));
+        send_len += sizeof(packet_len);
+        if (packet_len <= 0 || packet_len > server_info->send_buff.len - send_len) goto errout;
+        /* The connected proxy cannot be closed/replaced while this lock is held.
+         * Send directly: reconnect/requeue must not mutate a buffer being drained. */
+        if (!server_info->proxy || proxy_conn_sendto(server_info->proxy,
+                server_info->send_buff.data + send_len, packet_len, 0,
+                &server_info->addr, server_info->ai_addrlen) != packet_len) goto errout;
+        send_len += packet_len;
+    }
+    server_info->send_buff.len = 0;
+    return 0;
 errout:
-	pthread_mutex_lock(&client.server_list_lock);
-	server_info->recv_buff.len = 0;
-	server_info->send_buff.len = 0;
-	_dns_client_close_socket(server_info);
-	pthread_mutex_unlock(&client.server_list_lock);
-	return -1;
+    server_info->recv_buff.len = 0;
+    server_info->send_buff.len = 0;
+    _dns_client_close_socket(server_info);
+    return -1;
 }
 
 static int _dns_client_process_udp_proxy(struct dns_server_info *server_info, struct epoll_event *event,
-										 unsigned long now)
+                                         unsigned long now)
 {
-	struct sockaddr_storage from;
-	socklen_t from_len = sizeof(from);
-	char from_host[DNS_MAX_CNAME_LEN];
-	unsigned char inpacket[DNS_IN_PACKSIZE];
-	int len = 0;
-	int ret = 0;
-
-	_dns_client_process_send_udp_buffer(server_info, event, now);
-
-	if (!(event->events & EPOLLIN)) {
-		return 0;
-	}
-
-	len = proxy_conn_recvfrom(server_info->proxy, inpacket, sizeof(inpacket), 0, (struct sockaddr *)&from, &from_len);
-	if (len < 0) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
-			return 0;
-		}
-
-		if (errno == ECONNREFUSED || errno == ENETUNREACH || errno == EHOSTUNREACH) {
-			tlog(TLOG_DEBUG, "recvfrom %s failed, %s\n", server_info->ip, strerror(errno));
-			goto errout;
-		}
-
-		tlog(TLOG_ERROR, "recvfrom %s failed, %s\n", server_info->ip, strerror(errno));
-		goto errout;
-	} else if (len == 0) {
-		pthread_mutex_lock(&server_info->lock);
-		_dns_client_close_socket(server_info);
-		server_info->recv_buff.len = 0;
-		if (server_info->send_buff.len > 0) {
-			/* still remain request data, reconnect and send*/
-			ret = _dns_client_create_socket(server_info);
-		} else {
-			ret = 0;
-		}
-		pthread_mutex_unlock(&server_info->lock);
-		tlog(TLOG_DEBUG, "peer close, %s:%d", server_info->ip, server_info->port);
-		return ret;
-	}
-
-	int latency = get_tick_count() - server_info->send_tick;
-	tlog(TLOG_DEBUG, "recv udp packet from %s, len: %d, latency: %d",
-		 get_host_by_addr(from_host, sizeof(from_host), (struct sockaddr *)&from), len, latency);
-
-	if (latency < server_info->drop_packet_latency_ms) {
-		tlog(TLOG_DEBUG, "drop packet from %s, latency: %d", from_host, latency);
-		return 0;
-	}
-
-	if (server_info->status == DNS_SERVER_STATUS_CONNECTING) {
-		server_info->status = DNS_SERVER_STATUS_CONNECTED;
-	}
-
-	/* update recv time */
-	time(&server_info->last_recv);
-
-	/* processing dns packet */
-	if (_dns_client_recv(server_info, inpacket, len, (struct sockaddr *)&from, from_len) != 0) {
-		return -1;
-	}
-
-	return 0;
-errout:
-	pthread_mutex_lock(&server_info->lock);
-	server_info->recv_buff.len = 0;
-	server_info->send_buff.len = 0;
-	_dns_client_close_socket(server_info);
-	pthread_mutex_unlock(&server_info->lock);
-	return -1;
+    struct sockaddr_storage from;
+    socklen_t from_len = sizeof(from);
+    unsigned char inpacket[DNS_IN_PACKSIZE];
+    int len, latency;
+    pthread_mutex_lock(&server_info->lock);
+    if (!server_info->proxy || _dns_client_process_send_udp_buffer(server_info, event, now) != 0) {
+        pthread_mutex_unlock(&server_info->lock);
+        return -1;
+    }
+    if (!(event->events & EPOLLIN)) {
+        pthread_mutex_unlock(&server_info->lock);
+        return 0;
+    }
+    len = proxy_conn_recvfrom(server_info->proxy, inpacket, sizeof(inpacket), 0,
+                             (struct sockaddr *)&from, &from_len);
+    if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        pthread_mutex_unlock(&server_info->lock);
+        return 0;
+    }
+    if (len <= 0) {
+        server_info->recv_buff.len = server_info->send_buff.len = 0;
+        _dns_client_close_socket(server_info);
+        pthread_mutex_unlock(&server_info->lock);
+        return len < 0 ? -1 : 0;
+    }
+    latency = get_tick_count() - server_info->send_tick;
+    int drop = latency < server_info->drop_packet_latency_ms;
+    if (!drop) {
+        if (server_info->status == DNS_SERVER_STATUS_CONNECTING)
+            server_info->status = DNS_SERVER_STATUS_CONNECTED;
+        time(&server_info->last_recv);
+    }
+    pthread_mutex_unlock(&server_info->lock);
+    /* Receive bytes/from are stack-owned; business callbacks may acquire the
+     * group lock, select another service, or destroy a query, so run unlocked. */
+    if (drop) return 0;
+    return _dns_client_recv(server_info, inpacket, len, (struct sockaddr *)&from, from_len);
 }
 
 int _dns_client_process_udp(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now)
@@ -322,9 +277,10 @@ int _dns_client_process_udp(struct dns_server_info *server_info, struct epoll_ev
 	int ttl = 0;
 	struct cmsghdr *cmsg = NULL;
 
-	if (server_info->proxy) {
-		return _dns_client_process_udp_proxy(server_info, event, now);
-	}
+    pthread_mutex_lock(&server_info->lock);
+    int has_proxy = server_info->proxy != NULL;
+    pthread_mutex_unlock(&server_info->lock);
+    if (has_proxy) return _dns_client_process_udp_proxy(server_info, event, now);
 
 	memset(&msg, 0, sizeof(msg));
 	iov.iov_base = (char *)inpacket;
@@ -403,7 +359,7 @@ errout:
 	return -1;
 }
 
-int _dns_client_send_udp(struct dns_server_info *server_info, void *packet, int len)
+static int _dns_client_send_udp_locked(struct dns_server_info *server_info, void *packet, int len)
 {
 	int send_len = 0;
 	const struct sockaddr *addr = &server_info->addr;
@@ -416,9 +372,12 @@ int _dns_client_send_udp(struct dns_server_info *server_info, void *packet, int 
 
 	if (server_info->proxy) {
 		if (server_info->status != DNS_SERVER_STATUS_CONNECTED) {
-			/*set packet len*/
-			_dns_client_copy_data_to_buffer(server_info, &len, sizeof(len));
-			return _dns_client_copy_data_to_buffer(server_info, packet, len);
+            /* Reserve the complete record before changing either length or data. */
+            if (len <= 0 || len > DNS_TCP_BUFFER - (int)sizeof(len) - server_info->send_buff.len) {
+                errno = ENOMEM; return -1;
+            }
+            _dns_client_copy_data_to_buffer(server_info, &len, sizeof(len));
+            return _dns_client_copy_data_to_buffer(server_info, packet, len);
 		}
 
 		send_len = proxy_conn_sendto(server_info->proxy, packet, len, 0, addr, addrlen);
@@ -436,8 +395,12 @@ int _dns_client_send_udp(struct dns_server_info *server_info, void *packet, int 
 				return -1;
 			}
 
-			_dns_client_copy_data_to_buffer(server_info, &len, sizeof(len));
-			return _dns_client_copy_data_to_buffer(server_info, packet, len);
+            /* Reserve the complete record before changing either length or data. */
+            if (len <= 0 || len > DNS_TCP_BUFFER - (int)sizeof(len) - server_info->send_buff.len) {
+                errno = ENOMEM; return -1;
+            }
+            _dns_client_copy_data_to_buffer(server_info, &len, sizeof(len));
+            return _dns_client_copy_data_to_buffer(server_info, packet, len);
 		}
 
 		return 0;
@@ -452,6 +415,14 @@ int _dns_client_send_udp(struct dns_server_info *server_info, void *packet, int 
 
 errout:
 	return -1;
+}
+
+int _dns_client_send_udp(struct dns_server_info *server_info, void *packet, int len)
+{
+    pthread_mutex_lock(&server_info->lock);
+    int ret = _dns_client_send_udp_locked(server_info, packet, len);
+    pthread_mutex_unlock(&server_info->lock);
+    return ret;
 }
 
 void _dns_client_check_udp_nat(struct dns_query_struct *query)

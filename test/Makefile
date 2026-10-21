@@ -52,6 +52,8 @@ endif
 
 CXXFLAGS += $(ZLIB_CXXFLAGS)
 LDFLAGS += -lssl -lcrypto -lpthread -ldl -lgtest -lstdc++ -lm -rdynamic
+# Checkpoint fixture mocks process/file side effects only while its scope is active.
+LDFLAGS += -Wl,--wrap=time,--wrap=fork,--wrap=waitpid,--wrap=kill,--wrap=close,--wrap=dns_cache_save,--wrap=_exit
 LDFLAGS += $(ZLIB_LDFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
 

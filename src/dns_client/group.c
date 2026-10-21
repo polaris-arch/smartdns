@@ -86,6 +86,7 @@ int _dns_client_add_to_group(const char *group_name, struct dns_server_info *ser
 	group_member->server = server_info;
 	dns_client_server_info_get(server_info);
 	list_add(&group_member->list, &group->head);
+    if (server_info->flags.upstream_round_robin) group->round_robin_members++;
 
 	return 0;
 errout:
@@ -130,6 +131,7 @@ static int _dns_client_remove_from_group(struct dns_server_group *group, struct 
 			continue;
 		}
 
+		if (server_info->flags.upstream_round_robin) group->round_robin_members--;
 		_dns_client_remove_member(group_member);
 	}
 

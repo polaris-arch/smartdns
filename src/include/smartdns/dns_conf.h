@@ -424,6 +424,8 @@ struct dns_servers {
 	unsigned int max_query_rate;
 	unsigned int query_burst;
 	unsigned int max_concurrent_queries;
+	unsigned int upstream_round_robin;
+	unsigned int max_upstream_connections;
 	char quota_group[DNS_MAX_CNAME_LEN];
 	int fallback;
 	int subnet_all_query_types;

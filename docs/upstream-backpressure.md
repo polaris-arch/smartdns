@@ -116,3 +116,127 @@ all configured queries and the original zero-failure requirement remain mandator
 These changes and their added ownership/budget regressions are source-authored,
 not native-validated. Full system/QUIC suites and the observed H2 stress cases must
 complete successfully; no failure or missing result is converted to a skip.
+
+## Backpressure recovery and counter scope
+
+After an actual HTTP 429/503, expiry of the shared monotonic cooldown opens one
+recovery probe per policy. Buffered transport owners also pass this gate, so
+pre-existing handshake queues cannot all start DNS requests at expiry. Recovery
+means a correlated, live DNS exchange whose callback does not return RETRY or
+DROP; it is not a promise of a successful DNS answer or query completion. Thus
+OK, MAY_RETRY and UNDEFINE can end recovery even for SERVFAIL/REFUSED, while only
+OK sets `query.has_result`. MAY_RETRY can leave the query open for other results;
+UNDEFINE is not business success. Existing query/counter semantics are retained.
+A retired, canceled,
+expired or destroyed probe releases its recovery lease and permits one next
+probe; it does not open the whole policy. A new 429/503 advances the epoch, so
+an older probe completion cannot reopen it. Explicit quota groups share this
+gate across endpoints/transports; unrelated policies remain usable.
+
+This temporary gate is not a provider-specific QPS default, a per-domain quota
+implementation or a guarantee of no later 429. An accepted probe returns to the
+configured normal rate/burst/concurrency policy. Zero-rate behavior remains
+unrestricted before backpressure and after accepted recovery. Already spent
+wire/rate budget is not refunded on cancellation; only the recovery lease is
+released. Absolute query deadlines and per-destination retry limits still apply.
+
+The WebUI upstream `total_query_count` is incremented on entering the endpoint
+send function, before transport queueing or positive wire progress. Admission
+skips do not increment it; subsequent admitted retries can. `total_query_success`
+counts matched DNS responses that pass the client receive checks, including
+some callback RETRY/DROP outcomes; it is not a final NOERROR/selected-answer
+counter. These are server-object lifetime counters, retained across socket
+reconnects, not synchronized per-window QPS or unique client-query counts.
+
+Cache checkpoint scheduling uses the configured interval (default 24 hours,
+minimum positive scheduled interval 120 seconds) and defers while the request
+list is nonempty. A cache file older than an eight-hour process does not by
+itself show a missed default checkpoint.
+
+## Datagram recovery proof across retries
+
+UDP/mDNS retries reuse the logical query SID and cannot authenticate a wire
+generation from a received DNS packet. A late packet sent before an HTTP 429/503
+from an explicitly shared quota group must not inherit a retried attempt's newer
+recovery epoch. Conservatively, only the first send to a datagram destination
+may establish recovery; any retried datagram response still follows normal DNS
+delivery, callback and query-termination rules but cannot reopen the policy.
+This also declines proof from an ambiguous retry whose sends were all in one
+epoch. The lease still retires, allowing one next probe; a fresh first-send query
+or a correlated stream probe can finish recovery. No SID/answer/fanout/deadline
+or configured-rate changes are introduced.
+
+The callback contract is covered through the real client DNS decoder/lookup/
+retirement path with OK, MAY_RETRY, UNDEFINE, RETRY and DROP across NOERROR,
+NXDOMAIN, SERVFAIL and REFUSED. The datagram regression captures two actual
+loopback UDP sends from the same query under its original deadline, confirms
+identical wire identity, then replays the pre-429 reply through normal receive.
+Cache checkpoint fixtures remain side-effect mocks; they do not prove a real
+fork or a durable on-disk checkpoint.
+
+## Opt-in logical-service round robin
+
+Ordinary server groups still fan out exactly as before. A `-quota-group` alone
+continues to share only rate/burst/backpressure; it does **not** opt into routing.
+For interchangeable backends, set `-upstream-round-robin` on every member of one
+named quota group:
+
+```conf
+server-https https://192.0.2.10/dns-query -host-name resolver.example -http-host resolver.example -tls-host-verify resolver.example -quota-group resolver -upstream-round-robin -max-query-rate 7 -query-burst 2
+server-https https://192.0.2.11/dns-query -host-name resolver.example -http-host resolver.example -tls-host-verify resolver.example -quota-group resolver -upstream-round-robin -max-query-rate 7 -query-burst 2
+```
+
+The addresses above are documentation-only. Use your own authorized backends;
+no public probe is required. All member flags, including transport, SNI,
+certificate verification, HTTP Host/path/ALPN, proxy/interface, ECS, fallback and
+answer-processing flags, must agree. Only the endpoint address/port may differ.
+An incompatible service is rejected rather than silently mixing query semantics.
+A group intersection may route only a subset of the service; selection never
+escapes the query's configured DNS group. Duplicate group memberships do not
+create additional sends or additional turns.
+
+`-max-upstream-connections N` is optional, defaults to **2**, and accepts **1–4**.
+It is valid only with round robin and must agree across the quota group. This is
+one **total physical transport limit for the logical service**, including sockets
+being created or handshaken—not a per-IP multiplier and not a per-query limit.
+Existing per-endpoint single-connection reuse remains; HTTP/2/HTTP/3 streams are
+not additional physical connections. No extra connection pool or work queue is
+introduced. If addresses outnumber slots, only fully idle connected transports
+may be closed to allow a later endpoint's turn. Connecting/busy transports are
+never evicted to force fairness. QPS and burst remain user-configured and shared;
+there is no fixed provider QPS or extra allowance for another address.
+
+A per-service dispatch mutex serializes cursor selection and admission. Healthy,
+currently admissible peers alternate in stable attachment order; with two equally
+available peers, serial accepted-dispatch counts differ by at most one. Admission
+advances the cursor. A subsequent setup/send failure or cancellation consumes
+that turn: there is no rollback that could overwrite a concurrent selection.
+Unavailable peers are skipped, and recovered/new peers join future rotations
+without accumulating catch-up credit. One query can have only one active attempt
+in a round-robin service; unrelated configured services retain group fanout.
+The global server-list lock is held only to snapshot/pin group members, not across
+round-robin socket setup or transport IO.
+
+A 429/503 still stops new sends throughout the shared service. After cooldown,
+exactly one RR-selected probe reserves the recovery lease **before** handshake.
+An unsent owner admitted before a newer backpressure epoch cannot steal that
+probe; it retires through the existing transport path. Already-started requests
+may finish but their old responses cannot clear the new epoch. Probe retirement,
+cancellation or timeout releases only its lease. The original query deadline,
+per-destination retry cap and shared parent send budget remain authoritative.
+
+### Bounded resource changes
+
+- UDP/mDNS have no transport streams: the 100 ms transport-maintenance pass skips
+  their empty stream-prune operation. Query cancellation/deadline scans and the
+  wake cadence are unchanged; QUIC control maintenance is unchanged.
+- The ANY coordinator keeps one allocation and stable child indices, but allocates
+  response payloads only for the selected mode. ANY ADDRESS mode uses two child
+  payloads plus the final response instead of nine plus final (about 28 KiB less,
+  excluding pointer overhead). Passthrough uses one child; maximum eight-type
+  aggregation still has nine. This is **not** a saving on ordinary A/AAAA queries,
+  which do not enter that coordinator. No callback-time allocations were added.
+
+These are source-proven avoided operations/allocations, not measured performance
+claims. Correctness fixtures are bounded and use loopback or in-memory state;
+CPU/memory benchmarks and stress tests are not part of this change's cloud run.

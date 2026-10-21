@@ -120,6 +120,8 @@ struct dns_server_info {
 	int prohibit;
 	struct dns_upstream_policy *policy;
 	unsigned int active_attempts;
+	uint64_t rr_member_id;
+	int policy_connection_held;
 	atomic_t is_alive;
 	int is_already_prohibit;
 
@@ -204,6 +206,7 @@ struct dns_server_group_member {
 
 /* upstream server groups */
 struct dns_server_group {
+    unsigned int round_robin_members;
 	char group_name[DNS_GROUP_NAME_LEN];
 	struct hlist_node node;
 	struct list_head head;

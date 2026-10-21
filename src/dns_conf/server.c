@@ -78,6 +78,8 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		{"query-burst", required_argument, NULL, 268},
 		{"max-concurrent-queries", required_argument, NULL, 269},
 		{"quota-group", required_argument, NULL, 270},
+		{"upstream-round-robin", no_argument, NULL, 271},
+		{"max-upstream-connections", required_argument, NULL, 272},
 		{NULL, no_argument, NULL, 0}
 	};
 	/* clang-format on */
@@ -103,6 +105,8 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 	server->drop_packet_latency_ms = drop_packet_latency_ms;
 	server->tcp_keepalive = tcp_keepalive;
 	server->subnet_all_query_types = 0;
+	server->upstream_round_robin = 0;
+	server->max_upstream_connections = 0;
 
 	if (parse_uri(ip, scheme, server->server, &port, server->path) != 0) {
 		return -1;
@@ -292,6 +296,15 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 			else server->max_concurrent_queries = value;
 			break;
 		}
+		case 271:
+			server->upstream_round_robin = 1;
+			break;
+		case 272:
+			/* A single decimal digit is the complete supported range: no signs,
+			 * whitespace, suffixes, overflow, or silent clamping. */
+			if (optarg[0] < '1' || optarg[0] > '4' || optarg[1] != '\0') return -1;
+			server->max_upstream_connections = optarg[0] - '0';
+			break;
 		case 270:
 			if (!*optarg || strlen(optarg) >= sizeof(server->quota_group)) return -1;
 			safe_strncpy(server->quota_group, optarg, sizeof(server->quota_group));
@@ -301,6 +314,8 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 			break;
 		}
 		default:
+			/* Do not silently turn malformed opt-in options into defaults. */
+			if (optopt == 271 || optopt == 272) return -1;
 			if (optind > optind_last) {
 				tlog(TLOG_WARN, "unknown server option: %s at '%s:%d'.", argv[optind - 1], conf_get_conf_file(),
 					 conf_get_current_lineno());
@@ -311,14 +326,22 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		optind_last = optind;
 	}
 
+	if (server->upstream_round_robin) {
+		if (!server->quota_group[0]) return -1;
+		if (!server->max_upstream_connections) server->max_upstream_connections = 2;
+	} else if (server->max_upstream_connections) {
+		return -1;
+	}
 	if (server->query_burst && !server->max_query_rate) return -1;
 	if (server->max_query_rate && !server->query_burst) server->query_burst = 1;
 	if (server->quota_group[0]) {
 		for (int n = 0; n < index; n++) {
 			struct dns_servers *other = &dns_conf.servers[n];
 			if (strcmp(other->quota_group, server->quota_group) == 0 &&
-				(other->max_query_rate != server->max_query_rate || other->query_burst != server->query_burst)) {
-				tlog(TLOG_ERROR, "conflicting rate/burst for quota group %s", server->quota_group);
+				(other->max_query_rate != server->max_query_rate || other->query_burst != server->query_burst ||
+				 other->upstream_round_robin != server->upstream_round_robin ||
+				 other->max_upstream_connections != server->max_upstream_connections)) {
+				tlog(TLOG_ERROR, "conflicting rate/burst/round-robin/connection limit for quota group %s", server->quota_group);
 				return -1;
 			}
 		}
