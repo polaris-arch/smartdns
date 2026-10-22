@@ -102,6 +102,10 @@ jobs:
       run: |
         set -euo pipefail
         make -C src WITH_ZLIB=yes EXTRA_CFLAGS=-fPIC libsmartdns-test.a -j2
+        (cd plugin/smartdns-ui; sha256sum -c ../../ci-webui/Cargo.lock.sha256)
+        (cd plugin/smartdns-ui; rustc +1.89.0 -vV) > ci-webui/check-rustc.txt
+        (cd plugin/smartdns-ui; timeout -k 15 1200 cargo +1.89.0 check --locked --tests) 2>&1 | tee ci-webui/rust-msrv-check.log
+        (cd plugin/smartdns-ui; sha256sum -c ../../ci-webui/Cargo.lock.sha256)
         (cd plugin/smartdns-ui; timeout -k 15 1200 cargo test --locked -- --test-threads=1) 2>&1 | tee ci-webui/rust-rest.log
         (cd plugin/smartdns-ui; sha256sum -c ../../ci-webui/Cargo.lock.sha256)
         grep -F 'test test_rest_api_https_server ... ok' ci-webui/rust-rest.log
@@ -168,10 +172,9 @@ jobs:
         [[ "$source" =~ ^[0-9a-f]{40}$ && "$hash" =~ ^[0-9a-f]{64}$ ]]
         grep -Fx 'PKG_SOURCE_URL:=https://codeload.github.com/polaris-arch/smartdns/tar.gz' "$recipe"
         git merge-base --is-ancestor "$source" HEAD
-        # Only these exact packaging/CI/test paths may differ from the pinned
-        # product archive. The updated wire fixture runs from HEAD in native CI;
-        # it is not claimed to be in the SDK archive. No product/prepare drift.
-        test -z "$(git diff --name-only "$source" HEAD -- . ':!package/openwrt/Makefile' ':!.github/workflows/webui.yml' ':!test/cases/test-any-offline.cc')"
+        # The source commit includes all product, CI and test fixes. Only the
+        # recipe containing its real commit/archive pin may differ from HEAD.
+        test -z "$(git diff --name-only "$source" HEAD -- . ':!package/openwrt/Makefile')"
         printf '%s\n' "$source" > ci-sdk/core-commit.txt
         cp "$recipe" ci-sdk/Makefile
         cd "$RUNNER_TEMP/smartdns-sdk"

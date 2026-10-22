@@ -105,10 +105,18 @@ impl DataStatsItem {
         {
             // Observational counter only: saturation prevents a full counter wrapping
             // back to a misleading zero. Match the non-atomic implementation.
-            let _ = self.request_dropped.fetch_update(
-                Ordering::Relaxed, Ordering::Relaxed,
-                |value| Some(value.saturating_add(count)),
-            );
+            // Use the stable CAS primitive: fetch_update is deprecated in Rust
+            // 1.99, while its replacement is unavailable in the SDK's Rust 1.89.
+            let mut value = self.request_dropped.load(Ordering::Relaxed);
+            loop {
+                match self.request_dropped.compare_exchange_weak(
+                    value, value.saturating_add(count),
+                    Ordering::Relaxed, Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => value = current,
+                }
+            }
         }
 
         #[cfg(not(target_has_atomic = "64"))]
@@ -580,6 +588,58 @@ mod regression_tests {
         for worker in workers { worker.join().unwrap(); }
         assert_eq!(data.get_request_drop(), 256);
         assert_eq!(*fallback.lock().unwrap(), 256);
+    }
+
+    #[test]
+    fn request_drop_parallel_saturation_does_not_wrap() {
+        let data = Arc::new(DataStatsItem::new());
+        let fallback = Arc::new(Mutex::new(u64::MAX - 128));
+        data.add_request_drop(u64::MAX - 128);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let data = data.clone();
+            let fallback = fallback.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..32 {
+                    data.add_request_drop(2);
+                    add_locked_drop_count(&fallback, 2);
+                }
+            }));
+        }
+        for worker in workers { worker.join().unwrap(); }
+        assert_eq!(data.get_request_drop(), u64::MAX);
+        assert_eq!(*fallback.lock().unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn request_drop_persistent_initialization_accumulates_without_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drop-init.db");
+        let db = Arc::new(DB::new());
+        db.open(path.to_str().unwrap()).unwrap();
+        db.set_status_data("request_drop", &(u64::MAX - 4).to_string()).unwrap();
+        let conf = Arc::new(RwLock::new(DataServerConfig {
+            data_path: dir.path().to_str().unwrap().to_owned(),
+            db_file: path.to_str().unwrap().to_owned(),
+            max_log_age_ms: 30 * DAY_MS,
+        }));
+        let stats = DataStats::new(db.clone(), conf.clone());
+        assert_eq!(stats.get_request_drop(), 0);
+        stats.add_request_drop(2);
+        stats.load_status_data().unwrap();
+        assert_eq!(stats.get_request_drop(), u64::MAX - 2);
+        stats.add_request_drop(1);
+        stats.save_status_data().unwrap();
+        let restarted = DataStats::new(db.clone(), conf);
+        assert_eq!(restarted.get_request_drop(), 0);
+        restarted.load_status_data().unwrap();
+        assert_eq!(restarted.get_request_drop(), u64::MAX - 1);
+        restarted.add_request_drop(2);
+        restarted.save_status_data().unwrap();
+        assert_eq!(db.get_status_data_list().unwrap()["request_drop"], u64::MAX.to_string());
     }
 
     #[test]
