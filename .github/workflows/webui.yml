@@ -13,12 +13,30 @@ on:
         default: false
         type: boolean
 
+      sdk_cache_validation:
+        description: 'SDK-only cache validation against an accepted exact reference; never repeats ordinary/native builds'
+        type: choice
+        options: [disabled, cold, warm]
+        default: disabled
+      reference_run:
+        description: 'Exact accepted WebUI reference run ID (required for SDK-only)'
+        type: string
+        default: ''
+      reference_attempt:
+        description: 'Exact accepted reference attempt (required for SDK-only)'
+        type: string
+        default: ''
+      reference_head:
+        description: 'Full accepted reference commit SHA (required for SDK-only)'
+        type: string
+        default: ''
+
 permissions:
   contents: read
 
 jobs:
   build:
-    if: ${{ !inputs.full_validation }}
+    if: ${{ !inputs.full_validation && (inputs.sdk_cache_validation || 'disabled') == 'disabled' }}
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -34,13 +52,13 @@ jobs:
         EXTRA_CFLAGS=-fPIC make -C plugin/smartdns-ui test -j8
 
   native-full:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_validation }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_validation && (inputs.sdk_cache_validation || 'disabled') == 'disabled' }}
     uses: ./.github/workflows/c-cpp.yml
     with:
       release_validation: true
 
   plugin-webui-full:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_validation }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_validation && (inputs.sdk_cache_validation || 'disabled') == 'disabled' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -144,9 +162,49 @@ jobs:
         path: ci-webui/
         if-no-files-found: error
 
+  reference-check:
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.sdk_cache_validation == 'cold' || inputs.sdk_cache_validation == 'warm') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+    - name: Reject conflicting full and SDK-only modes
+      env:
+        FULL_VALIDATION: ${{ inputs.full_validation }}
+      run: test "$FULL_VALIDATION" != true
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Verify exact reference attempt, required jobs and bounded source equivalence
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REFERENCE_RUN: ${{ inputs.reference_run }}
+        REFERENCE_ATTEMPT: ${{ inputs.reference_attempt }}
+        REFERENCE_HEAD: ${{ inputs.reference_head }}
+      run: |
+        set -euo pipefail
+        python3 .github/scripts/sdk-host-cache.py reference \
+          --repository "$GITHUB_REPOSITORY" --run "$REFERENCE_RUN" \
+          --attempt "$REFERENCE_ATTEMPT" --head "$REFERENCE_HEAD" \
+          --checkout "$GITHUB_WORKSPACE" --evidence "$GITHUB_WORKSPACE/ci-sdk-reference"
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: sdk-reference-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ci-sdk-reference/
+        if-no-files-found: warn
+
   openwrt-sdk:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_validation }}
-    needs: plugin-webui-full
+    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && ((inputs.full_validation && (inputs.sdk_cache_validation || 'disabled') == 'disabled' && needs.plugin-webui-full.result == 'success') || (!inputs.full_validation && (inputs.sdk_cache_validation == 'cold' || inputs.sdk_cache_validation == 'warm') && needs.reference-check.result == 'success')) }}
+    needs: [plugin-webui-full, reference-check]
+    permissions:
+      contents: read
+    env:
+      HOST_CACHE_MODE: ${{ inputs.sdk_cache_validation == 'cold' && 'cold' || inputs.sdk_cache_validation == 'warm' && 'warm' || 'auto' }}
+      SDK_ARCHIVE: openwrt-sdk-24.10.4-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+      SDK_SHA256: 229e871f734a2cee5ce3ad6a3e98d3836b0899bfdeaea4d9c2c5cc7b1fce1407
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -158,21 +216,86 @@ jobs:
       with:
         node-version: '24.21.0'
     - name: Retrieve the dependency lock already tested and packaged by this run
+      if: inputs.full_validation
       uses: actions/download-artifact@v4
       with:
         name: plugin-webui-${{ github.sha }}
         path: ${{ runner.temp }}/validated-webui
-    - name: Prepare ordinary SDK dependencies and verified official SDK
+    - name: Use the tracked reference-equivalent lock for SDK-only
+      if: ${{ !inputs.full_validation }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/validated-webui"
+        cp plugin/smartdns-ui/Cargo.lock "$RUNNER_TEMP/validated-webui/Cargo.lock"
+        (cd "$RUNNER_TEMP/validated-webui"; sha256sum Cargo.lock > Cargo.lock.sha256)
+
+    - name: Prepare ordinary SDK dependencies
       run: |
         set -euo pipefail
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev flex bison gawk gettext git libncurses-dev libssl-dev python3 python3-setuptools rsync swig unzip zlib1g-dev file wget curl zstd cmake ninja-build libelf-dev liblzma-dev
         mkdir -p ci-sdk "$RUNNER_TEMP/smartdns-sdk"
         git rev-parse HEAD > ci-sdk/recipe-commit.txt
-        sdk=openwrt-sdk-24.10.4-x86-64_gcc-13.3.0_musl.Linux-x86_64
-        curl --fail --location --retry 3 "https://downloads.openwrt.org/releases/24.10.4/targets/x86/64/$sdk.tar.zst" -o "$RUNNER_TEMP/$sdk.tar.zst"
-        printf '%s  %s\n' 229e871f734a2cee5ce3ad6a3e98d3836b0899bfdeaea4d9c2c5cc7b1fce1407 "$RUNNER_TEMP/$sdk.tar.zst" | sha256sum -c - | tee ci-sdk/sdk-hash.txt
-        tar --zstd -xf "$RUNNER_TEMP/$sdk.tar.zst" -C "$RUNNER_TEMP/smartdns-sdk" --strip-components=1
+    - name: Mark official archive restore start
+      run: date +%s > ci-sdk/sdk-archive-restore-start.txt
+
+    - name: Restore only the fixed official SDK archive
+      id: sdk_tar
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: ${{ runner.temp }}/${{ env.SDK_ARCHIVE }}
+        key: smartdns-sdk-archive-v1-${{ env.SDK_SHA256 }}
+
+    - name: Verify official archive bytes and extract fresh SDK
+      id: sdk_tar_verify
+      run: |
+        set -euo pipefail
+        start=$(date +%s)
+        printf '%s\n' "$start" > ci-sdk/sdk-archive-restore-end.txt
+        archive="$RUNNER_TEMP/$SDK_ARCHIVE"
+        downloaded=false
+        if ! printf '%s  %s\n' "$SDK_SHA256" "$archive" | sha256sum -c -; then
+          # An immutable bad cache entry is not repaired by this download.
+          rm -f "$archive"
+          curl --fail --location --retry 3 "https://downloads.openwrt.org/releases/24.10.4/targets/x86/64/$SDK_ARCHIVE" -o "$archive"
+          downloaded=true
+        fi
+        printf '%s  %s\n' "$SDK_SHA256" "$archive" | sha256sum -c - | tee ci-sdk/sdk-hash.txt
+        tar --zstd -xf "$archive" -C "$RUNNER_TEMP/smartdns-sdk" --strip-components=1
+        echo "downloaded=$downloaded" >> "$GITHUB_OUTPUT"
+        printf 'start=%s\nend=%s\ndownloaded=%s\n' "$start" "$(date +%s)" "$downloaded" > ci-sdk/sdk-archive-timing.txt
+
+    - name: Mark official archive save start
+      if: steps.sdk_tar_verify.outputs.downloaded == 'true'
+      run: date +%s > ci-sdk/sdk-archive-save-start.txt
+
+    - name: Save verified official SDK archive only
+      id: sdk_tar_save
+      if: steps.sdk_tar_verify.outputs.downloaded == 'true'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: ${{ runner.temp }}/${{ env.SDK_ARCHIVE }}
+        key: smartdns-sdk-archive-v1-${{ env.SDK_SHA256 }}
+
+    - name: Record official archive save observation
+      if: always()
+      run: |
+        mkdir -p ci-sdk
+        date +%s > ci-sdk/sdk-archive-save-observed-end.txt
+        if test -f "$RUNNER_TEMP/$SDK_ARCHIVE"; then
+          stat -c '%s' "$RUNNER_TEMP/$SDK_ARCHIVE" > ci-sdk/sdk-archive-bytes.txt
+        fi
+
+    - name: Run bounded host-cache contracts against the verified SDK rules
+      run: |
+        set -euo pipefail
+        timeout -k 10 180 python3 .github/scripts/test-sdk-host-cache.py \
+          --sdk-source-dir "$RUNNER_TEMP/smartdns-sdk" \
+          --helper "$GITHUB_WORKSPACE/.github/scripts/sdk-host-cache.py" -v \
+          2>&1 | tee ci-sdk/cache-contracts.log
+
     - name: Pin feeds, install candidate recipe and validate reachable source identity
       run: |
         set -euo pipefail
@@ -226,12 +349,15 @@ jobs:
         (evidence / 'rust-feed.sha256').write_text(''.join(hashlib.sha256(data).hexdigest() + '  ' + name + '\n' for name, data in [('rust-feed.before', before), ('rust-feed.after', after)]))
         path.write_bytes(after)
         PY
-        cp .config feeds.conf "$GITHUB_WORKSPACE/ci-sdk/"
+        cp .config "$GITHUB_WORKSPACE/ci-sdk/sdk.config"
+        cp feeds.conf "$GITHUB_WORKSPACE/ci-sdk/"
         cp include/package.mk "$GITHUB_WORKSPACE/ci-sdk/sdk-package.mk"
         cp rules.mk "$GITHUB_WORKSPACE/ci-sdk/sdk-rules.mk"
-    - name: Actual SDK download, preparation and both package builds
+    - name: Download current source and validate complete archive identity
       run: |
         set -euo pipefail
+        (cd "$RUNNER_TEMP/validated-webui"; sha256sum -c Cargo.lock.sha256)
+        cmp "$GITHUB_WORKSPACE/plugin/smartdns-ui/Cargo.lock" "$RUNNER_TEMP/validated-webui/Cargo.lock"
         cd "$RUNNER_TEMP/smartdns-sdk"
         make package/feeds/packages/smartdns/download V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/download.log"
         source=$(cat "$GITHUB_WORKSPACE/ci-sdk/core-commit.txt")
@@ -240,17 +366,49 @@ jobs:
         tar -tzf "dl/smartdns-$source.tar.gz" > "$GITHUB_WORKSPACE/ci-sdk/source-inventory.txt"
         grep -Fx "smartdns-$source/package/webui/prepare-source.sh" "$GITHUB_WORKSPACE/ci-sdk/source-inventory.txt"
         grep -Fx "smartdns-$source/plugin/smartdns-ui/Cargo.lock" "$GITHUB_WORKSPACE/ci-sdk/source-inventory.txt"
-        make package/feeds/packages/smartdns/prepare V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/prepare.log"
-        (cd "$RUNNER_TEMP/validated-webui"; sha256sum -c Cargo.lock.sha256)
-        mapfile -t plugin_dirs < <(find build_dir -type d -path "*/smartdns-$source/plugin/smartdns-ui")
-        test "${#plugin_dirs[@]}" -eq 1
-        plugin_dir=${plugin_dirs[0]}
-        # The archive must contain the exact source lock already validated.
-        # Do not repair a missing or divergent archive by injecting CI bytes.
-        cmp "$GITHUB_WORKSPACE/plugin/smartdns-ui/Cargo.lock" "$RUNNER_TEMP/validated-webui/Cargo.lock"
-        cmp "$RUNNER_TEMP/validated-webui/Cargo.lock" "$plugin_dir/Cargo.lock"
-        cp "$RUNNER_TEMP/validated-webui/"Cargo.lock* "$GITHUB_WORKSPACE/ci-sdk/"
-        (cd "$plugin_dir"; sha256sum -c "$GITHUB_WORKSPACE/ci-sdk/Cargo.lock.sha256")
+        python3 "$GITHUB_WORKSPACE/.github/scripts/sdk-host-cache.py" source \
+          --checkout "$GITHUB_WORKSPACE" --archive "$PWD/dl/smartdns-$source.tar.gz" \
+          --source "$source" --archive-sha256 "$hash" \
+          --lock "$RUNNER_TEMP/validated-webui/Cargo.lock" --evidence "$GITHUB_WORKSPACE/ci-sdk"
+
+    - name: Compute exact host input key before any cached configuration
+      id: host_inputs
+      run: |
+        set -euo pipefail
+        python3 .github/scripts/sdk-host-cache.py inputs \
+          --sdk-root "$RUNNER_TEMP/smartdns-sdk" --evidence "$GITHUB_WORKSPACE/ci-sdk" \
+          --github-output "$GITHUB_OUTPUT"
+        date +%s > ci-sdk/host-restore-start.txt
+
+    - name: Restore quarantined host capsule by exact key only
+      id: host_cache
+      if: env.HOST_CACHE_MODE != 'cold'
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: ${{ runner.temp }}/sdk-host-capsule
+        key: ${{ steps.host_inputs.outputs.cache_key }}
+
+    - name: Validate exact hit and safely restore or select one cold fallback
+      id: host_restore
+      env:
+        CACHE_HIT: ${{ steps.host_cache.outputs.cache-hit }}
+        MATCHED_KEY: ${{ steps.host_cache.outputs.cache-matched-key }}
+        REQUESTED_KEY: ${{ steps.host_inputs.outputs.cache_key }}
+      run: |
+        set -euo pipefail
+        python3 .github/scripts/sdk-host-cache.py restore \
+          --sdk-root "$RUNNER_TEMP/smartdns-sdk" --evidence "$GITHUB_WORKSPACE/ci-sdk" \
+          --capsule-dir "$RUNNER_TEMP/sdk-host-capsule" --mode "$HOST_CACHE_MODE" \
+          --cache-hit "$CACHE_HIT" --matched-key "$MATCHED_KEY" --key "$REQUESTED_KEY" \
+          --github-output "$GITHUB_OUTPUT"
+        date +%s > ci-sdk/host-restore-end.txt
+
+    - name: Configure cold host and capture genuine pre-AUTOREMOVE provenance
+      if: steps.host_restore.outputs.origin == 'cold'
+      run: |
+        set -euo pipefail
+        cd "$RUNNER_TEMP/smartdns-sdk"
         make package/feeds/packages/rust/host/configure V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/rust-host-configure.log"
         cp build_dir/target-x86_64_musl/host/rustc-1.89.0-src/bootstrap.toml "$GITHUB_WORKSPACE/ci-sdk/rust-bootstrap.toml"
         python3 - <<'PY'
@@ -265,6 +423,17 @@ jobs:
         assert config['llvm']['link-jobs'] == 1
         assert config['llvm']['targets'] == 'X86' and config['llvm']['experimental-targets'] == ''
         PY
+        python3 "$GITHUB_WORKSPACE/.github/scripts/sdk-host-cache.py" capture \
+          --sdk-root "$PWD" --evidence "$GITHUB_WORKSPACE/ci-sdk"
+
+    - name: Execute official host compile and installation entrypoint
+      env:
+        HOST_ORIGIN: ${{ steps.host_restore.outputs.origin }}
+      run: |
+        set -euo pipefail
+        [[ "$HOST_ORIGIN" == cold || "$HOST_ORIGIN" == cache ]]
+        date +%s > ci-sdk/host-compile-start.txt
+        cd "$RUNNER_TEMP/smartdns-sdk"
         make package/feeds/packages/rust/host/compile V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/rust-host-compile.log"
         # The pinned feed installs to target staging/host, not hostpkg/bin.
         sdk_rustc="$PWD/staging_dir/target-x86_64_musl/host/bin/rustc"
@@ -275,6 +444,80 @@ jobs:
         sdk_cargo="$PWD/staging_dir/target-x86_64_musl/host/bin/cargo"
         "$sdk_cargo" -vV | tee "$GITHUB_WORKSPACE/ci-sdk/cargo.txt"
         sha256sum "$sdk_cargo" > "$GITHUB_WORKSPACE/ci-sdk/cargo.sha256"
+        python3 "$GITHUB_WORKSPACE/.github/scripts/sdk-host-cache.py" probe \
+          --sdk-root "$PWD" --evidence "$GITHUB_WORKSPACE/ci-sdk" --origin "$HOST_ORIGIN"
+        date +%s > "$GITHUB_WORKSPACE/ci-sdk/host-compile-end.txt"
+
+    - name: Snapshot only the verified installed cold host closure
+      id: host_snapshot
+      if: steps.host_restore.outputs.origin == 'cold'
+      run: |
+        set -euo pipefail
+        python3 .github/scripts/sdk-host-cache.py snapshot \
+          --sdk-root "$RUNNER_TEMP/smartdns-sdk" --evidence "$GITHUB_WORKSPACE/ci-sdk" \
+          --capsule-dir "$RUNNER_TEMP/sdk-host-capsule" --github-output "$GITHUB_OUTPUT"
+
+    - name: Mark host save attempt before application compilation
+      if: steps.host_snapshot.outputs.save_ready == 'true'
+      run: date +%s > ci-sdk/host-save-start.txt
+
+    - name: Save completed host independently of later application result
+      id: host_save
+      if: steps.host_snapshot.outputs.save_ready == 'true'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: ${{ runner.temp }}/sdk-host-capsule
+        key: ${{ steps.host_inputs.outputs.cache_key }}
+
+    - name: Record cache action outcomes without claiming persistence
+      if: always()
+      env:
+        TAR_RESTORE_OUTCOME: ${{ steps.sdk_tar.outcome }}
+        TAR_HIT: ${{ steps.sdk_tar.outputs.cache-hit }}
+        TAR_MATCHED_KEY: ${{ steps.sdk_tar.outputs.cache-matched-key }}
+        TAR_SAVE_OUTCOME: ${{ steps.sdk_tar_save.outcome }}
+        HOST_RESTORE_OUTCOME: ${{ steps.host_cache.outcome }}
+        HOST_HIT: ${{ steps.host_cache.outputs.cache-hit }}
+        HOST_MATCHED_KEY: ${{ steps.host_cache.outputs.cache-matched-key }}
+        HOST_REQUESTED_KEY: ${{ steps.host_inputs.outputs.cache_key }}
+        HOST_ORIGIN: ${{ steps.host_restore.outputs.origin }}
+        HOST_SAVE_READY: ${{ steps.host_snapshot.outputs.save_ready }}
+        HOST_SAVE_OUTCOME: ${{ steps.host_save.outcome }}
+      run: |
+        mkdir -p ci-sdk
+        date +%s > ci-sdk/host-save-observed-end.txt
+        python3 - <<'PYOUTCOME'
+        import json, os, pathlib
+        names = ['TAR_RESTORE_OUTCOME', 'TAR_HIT', 'TAR_MATCHED_KEY', 'TAR_SAVE_OUTCOME',
+                 'HOST_RESTORE_OUTCOME', 'HOST_HIT', 'HOST_MATCHED_KEY', 'HOST_REQUESTED_KEY',
+                 'HOST_ORIGIN', 'HOST_SAVE_READY', 'HOST_SAVE_OUTCOME']
+        report = {name.lower(): os.environ.get(name, '') for name in names}
+        report.update(persistence='unproven-until-later-exact-restore',
+                      save_log='See original actions/cache/save step logs for compression, upload, warning or immutable-key collision; outcome alone is not proof.',
+                      quota='unknown; no quota API query or mutation performed')
+        pathlib.Path('ci-sdk/cache-action-outcomes.json').write_text(json.dumps(report, indent=2) + '\n')
+        PYOUTCOME
+
+    - name: Fresh current application preparation, actual compilation and both IPKs
+      env:
+        HOST_ORIGIN: ${{ steps.host_restore.outputs.origin }}
+      run: |
+        set -euo pipefail
+        date +%s > ci-sdk/application-start.txt
+        cd "$RUNNER_TEMP/smartdns-sdk"
+        source=$(cat "$GITHUB_WORKSPACE/ci-sdk/core-commit.txt")
+        make package/feeds/packages/smartdns/prepare V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/prepare.log"
+        (cd "$RUNNER_TEMP/validated-webui"; sha256sum -c Cargo.lock.sha256)
+        mapfile -t plugin_dirs < <(find build_dir -type d -path "*/smartdns-$source/plugin/smartdns-ui")
+        test "${#plugin_dirs[@]}" -eq 1
+        plugin_dir=${plugin_dirs[0]}
+        # The archive must contain the exact source lock already validated.
+        # Do not repair a missing or divergent archive by injecting CI bytes.
+        cmp "$GITHUB_WORKSPACE/plugin/smartdns-ui/Cargo.lock" "$RUNNER_TEMP/validated-webui/Cargo.lock"
+        cmp "$RUNNER_TEMP/validated-webui/Cargo.lock" "$plugin_dir/Cargo.lock"
+        cp "$RUNNER_TEMP/validated-webui/"Cargo.lock* "$GITHUB_WORKSPACE/ci-sdk/"
+        (cd "$plugin_dir"; sha256sum -c "$GITHUB_WORKSPACE/ci-sdk/Cargo.lock.sha256")
         compile_status=0
         CARGO_BUILD_ARGS=--locked make package/feeds/packages/smartdns/compile V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/compile.log" || compile_status=$?
         printf '%s\n' "$compile_status" > "$GITHUB_WORKSPACE/ci-sdk/compile-status.txt"
@@ -314,6 +557,19 @@ jobs:
         grep -F './usr/sbin/smartdns' ../smartdns_*.inventory
         grep -F './usr/lib/smartdns_ui.so' ../smartdns-ui_*.inventory
         grep -F './usr/share/smartdns/wwwroot/dashboard/upstream-servers.html' ../smartdns-ui_*.inventory
+        python3 "$GITHUB_WORKSPACE/.github/scripts/sdk-host-cache.py" probe \
+          --sdk-root "$RUNNER_TEMP/smartdns-sdk" --evidence "$GITHUB_WORKSPACE/ci-sdk" --origin "$HOST_ORIGIN"
+        date +%s > "$GITHUB_WORKSPACE/ci-sdk/application-end.txt"
+
+    - name: Require a complete cold capsule for dedicated cache validation
+      if: inputs.sdk_cache_validation == 'cold'
+      env:
+        SAVE_READY: ${{ steps.host_snapshot.outputs.save_ready }}
+      run: |
+        test "$SAVE_READY" = true
+        # cache/save may report success after a warning. Only the subsequent
+        # dedicated exact-warm run can prove that these bytes were persisted.
+
     - uses: actions/upload-artifact@v4
       if: always()
       with:
