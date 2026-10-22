@@ -9,10 +9,12 @@ PKG_NAME:=smartdns
 PKG_VERSION:=1.2025.46.2
 PKG_RELEASE:=3
 
-PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL:=https://www.github.com/pymumu/smartdns.git
-PKG_SOURCE_VERSION:=64fc9f20fba0e14cb118fe7f145557971cafd858
-PKG_MIRROR_HASH:=skip
+PKG_SOURCE_VERSION:=f2ddd202ee3073b3cc477e1075c69ccf0ec79cee
+PKG_SOURCE:=smartdns-$(PKG_SOURCE_VERSION).tar.gz
+PKG_SOURCE_URL:=https://codeload.github.com/polaris-arch/smartdns/tar.gz
+PKG_SOURCE_URL_FILE:=$(PKG_SOURCE_VERSION)
+PKG_HASH:=3008031c319f6e0eeea9abc6eec96b10fde2e242b739738a666deeff8db0cc9d
+PKG_BUILD_DIR:=$(BUILD_DIR)/smartdns-$(PKG_SOURCE_VERSION)
 
 # Must match package/webui/source.conf; preparation verifies this archive again.
 SMARTDNS_WEBUI_SOURCE_VERSION:=1c06fee693434ec7c71f06010d3f87416baba9f0
