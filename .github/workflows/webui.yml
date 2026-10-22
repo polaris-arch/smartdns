@@ -108,7 +108,13 @@ jobs:
         (cd plugin/smartdns-ui; sha256sum -c ../../ci-webui/Cargo.lock.sha256)
         (cd plugin/smartdns-ui; timeout -k 15 1200 cargo test --locked -- --test-threads=1) 2>&1 | tee ci-webui/rust-rest.log
         (cd plugin/smartdns-ui; sha256sum -c ../../ci-webui/Cargo.lock.sha256)
-        grep -F 'test test_rest_api_https_server ... ok' ci-webui/rust-rest.log
+        # Native C logs can split libtest's case name from its final status.
+        # Execute the exact HTTPS case from the same locked target a second time;
+        # require a successful process and one non-ignored result, not arbitrary ok.
+        (cd plugin/smartdns-ui; timeout -k 15 120 cargo test --locked --color never --test restapi_test test_rest_api_https_server -- --exact --test-threads=1 --color never) 2>&1 | tee ci-webui/https-exact.log
+        test "$(grep -Ec '^running 1 test$' ci-webui/https-exact.log)" -eq 1
+        test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' ci-webui/https-exact.log)" -eq 1
+        (cd plugin/smartdns-ui; sha256sum -c ../../ci-webui/Cargo.lock.sha256)
         test -s ci-webui/actual-service-api.json
     - name: Build matching daemon/plugin and actual generic WebUI package
       run: |
@@ -172,9 +178,10 @@ jobs:
         [[ "$source" =~ ^[0-9a-f]{40}$ && "$hash" =~ ^[0-9a-f]{64}$ ]]
         grep -Fx 'PKG_SOURCE_URL:=https://codeload.github.com/polaris-arch/smartdns/tar.gz' "$recipe"
         git merge-base --is-ancestor "$source" HEAD
-        # The source commit includes all product, CI and test fixes. Only the
-        # recipe containing its real commit/archive pin may differ from HEAD.
-        test -z "$(git diff --name-only "$source" HEAD -- . ':!package/openwrt/Makefile')"
+        # All product/test/prepare source must match. Only this reviewed CI-only
+        # evidence gate and the recipe's real source/archive pin may differ.
+        # recipe-commit.txt records CI HEAD; core-commit.txt records SDK source.
+        test -z "$(git diff --name-only "$source" HEAD -- . ':!package/openwrt/Makefile' ':!.github/workflows/webui.yml')"
         printf '%s\n' "$source" > ci-sdk/core-commit.txt
         cp "$recipe" ci-sdk/Makefile
         cd "$RUNNER_TEMP/smartdns-sdk"
