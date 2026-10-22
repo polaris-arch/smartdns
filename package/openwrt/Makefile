@@ -108,7 +108,6 @@ define Build/Compile/smartdns-webui
 endef
 
 define Build/Compile/smartdns-ui
-	cargo install --force --locked bindgen-cli
 	CARGO_BUILD_ARGS="$(if $(strip $(RUST_PKG_FEATURES)),--features "$(strip $(RUST_PKG_FEATURES))") --profile $(CARGO_PKG_PROFILE)"
 	+$(CARGO_PKG_VARS) CARGO_BUILD_ARGS="$(CARGO_BUILD_ARGS)" CC=$(TARGET_CC) \
 	PATH="$$(PATH):$(CARGO_HOME)/bin" \

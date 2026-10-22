@@ -178,10 +178,10 @@ jobs:
         [[ "$source" =~ ^[0-9a-f]{40}$ && "$hash" =~ ^[0-9a-f]{64}$ ]]
         grep -Fx 'PKG_SOURCE_URL:=https://codeload.github.com/polaris-arch/smartdns/tar.gz' "$recipe"
         git merge-base --is-ancestor "$source" HEAD
-        # All product/test/prepare source must match. Only this reviewed CI-only
-        # evidence gate and the recipe's real source/archive pin may differ.
+        # All source, including CI and build helpers, must match the archive.
+        # Only the recipe's real source/archive pin may differ.
         # recipe-commit.txt records CI HEAD; core-commit.txt records SDK source.
-        test -z "$(git diff --name-only "$source" HEAD -- . ':!package/openwrt/Makefile' ':!.github/workflows/webui.yml')"
+        test -z "$(git diff --name-only "$source" HEAD -- . ':!package/openwrt/Makefile')"
         printf '%s\n' "$source" > ci-sdk/core-commit.txt
         cp "$recipe" ci-sdk/Makefile
         cd "$RUNNER_TEMP/smartdns-sdk"
@@ -200,6 +200,28 @@ jobs:
         make defconfig
         grep -Fx 'CONFIG_PACKAGE_smartdns=m' .config
         grep -Fx 'CONFIG_PACKAGE_smartdns-ui=m' .config
+        grep -Fx 'CONFIG_x86_64=y' .config
+        grep -Fx 'CONFIG_USE_MUSL=y' .config
+        test "$(uname -m)" = x86_64
+        # Rust 1.89 forbids download-ci-llvm=true on CI, and if-unchanged
+        # requires Git sources, not this feed's verified release tarball.
+        # Build LLVM honestly; bound resources to this existing x86-only job.
+        python3 - <<'PY'
+        import difflib, hashlib, os, pathlib
+        path = pathlib.Path('feeds/packages/lang/rust/Makefile')
+        before = path.read_bytes()
+        assert hashlib.sha256(before).hexdigest() == '6bccd582a3bfc665f14e29ea89dd2b134221a2dca78c08313a0a6b4e23056d75'
+        old = b'--set=llvm.download-ci-llvm=true'
+        assert before.count(old) == 1
+        new = b'--set=llvm.download-ci-llvm=false --set=build.jobs=2 --set=llvm.link-jobs=1 --set=llvm.targets=X86 --set=llvm.experimental-targets='
+        after = before.replace(old, new)
+        evidence = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'ci-sdk'
+        (evidence / 'rust-feed.before').write_bytes(before)
+        (evidence / 'rust-feed.after').write_bytes(after)
+        (evidence / 'rust-feed.diff').write_text(''.join(difflib.unified_diff(before.decode().splitlines(True), after.decode().splitlines(True), fromfile='pinned/rust/Makefile', tofile='ci/rust/Makefile')))
+        (evidence / 'rust-feed.sha256').write_text(''.join(hashlib.sha256(data).hexdigest() + '  ' + name + '\n' for name, data in [('rust-feed.before', before), ('rust-feed.after', after)]))
+        path.write_bytes(after)
+        PY
         cp .config feeds.conf "$GITHUB_WORKSPACE/ci-sdk/"
     - name: Actual SDK download, preparation and both package builds
       run: |
@@ -219,10 +241,30 @@ jobs:
         cp "$RUNNER_TEMP/validated-webui/Cargo.lock" "$plugin_dir/Cargo.lock"
         cp "$RUNNER_TEMP/validated-webui/"Cargo.lock* "$GITHUB_WORKSPACE/ci-sdk/"
         (cd "$plugin_dir"; sha256sum -c "$GITHUB_WORKSPACE/ci-sdk/Cargo.lock.sha256")
+        make package/feeds/packages/rust/host/configure V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/rust-host-configure.log"
+        cp build_dir/target-x86_64_musl/host/rustc-1.89.0-src/bootstrap.toml "$GITHUB_WORKSPACE/ci-sdk/rust-bootstrap.toml"
+        python3 - <<'PY'
+        import os, pathlib, tomllib
+        assert os.environ.get('CI') == 'true' and os.environ.get('GITHUB_ACTIONS') == 'true'
+        config = tomllib.loads((pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'ci-sdk/rust-bootstrap.toml').read_text())
+        assert config['build']['build'] == 'x86_64-unknown-linux-gnu'
+        assert config['build']['host'] == ['x86_64-unknown-linux-gnu']
+        assert set(config['build']['target']) == {'x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl'}
+        assert config['build']['jobs'] == 2
+        assert config['llvm']['download-ci-llvm'] is False
+        assert config['llvm']['link-jobs'] == 1
+        assert config['llvm']['targets'] == 'X86' and config['llvm']['experimental-targets'] == ''
+        PY
+        make package/feeds/packages/rust/host/compile V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/rust-host-compile.log"
+        # The pinned feed installs to target staging/host, not hostpkg/bin.
+        sdk_rustc="$PWD/staging_dir/target-x86_64_musl/host/bin/rustc"
+        "$sdk_rustc" -vV | tee "$GITHUB_WORKSPACE/ci-sdk/rustc.txt"
+        test "$("$sdk_rustc" --version | awk '{print $2}')" = 1.89.0
+        "$sdk_rustc" --print sysroot | tee "$GITHUB_WORKSPACE/ci-sdk/rust-sysroot.txt"
+        sha256sum "$sdk_rustc" > "$GITHUB_WORKSPACE/ci-sdk/rustc.sha256"
         CARGO_BUILD_ARGS=--locked make package/feeds/packages/smartdns/compile V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/compile.log"
         (cd "$plugin_dir"; sha256sum -c "$GITHUB_WORKSPACE/ci-sdk/Cargo.lock.sha256")
-        staging_dir/hostpkg/bin/rustc -vV | tee "$GITHUB_WORKSPACE/ci-sdk/rustc.txt"
-        test "$(staging_dir/hostpkg/bin/rustc --version | awk '{print $2}')" = 1.89.0
+        sha256sum -c "$GITHUB_WORKSPACE/ci-sdk/rustc.sha256"
         mkdir -p "$GITHUB_WORKSPACE/ci-sdk/ipk"
         find bin/packages -type f \( -name 'smartdns_*.ipk' -o -name 'smartdns-ui_*.ipk' \) -exec cp '{}' "$GITHUB_WORKSPACE/ci-sdk/ipk/" \;
         cd "$GITHUB_WORKSPACE/ci-sdk/ipk"

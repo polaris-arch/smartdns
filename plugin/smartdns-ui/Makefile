@@ -69,19 +69,10 @@ ifneq ($(CARGO_BUILD_TARGET),)
   ARCH_TARGET_PATH=$(CARGO_BUILD_TARGET)/
 endif
 
-# check and install bindgen
-IS_BINDGEN_INSTALL=$(shell which bindgen 2>/dev/null)
-ifeq ($(IS_BINDGEN_INSTALL),)
-  $(shell cargo install --force --locked bindgen-cli)
-endif
-
-ifneq ($(CARGO_BUILD_TARGET),)
-  CARGO_BUILD_TARGET_INSTALL=$(shell rustup target list | grep $(CARGO_BUILD_TARGET) | grep installed)
-  ifeq ($(CARGO_BUILD_TARGET_INSTALL),)
-    # install target
-    $(shell rustup target add $(CARGO_BUILD_TARGET))
-  endif
-endif
+# The caller prepares Cargo/Rust, libclang and the selected target or build-std
+# configuration. build.rs uses the Cargo bindgen library, not bindgen-cli.
+# Do not install tools while parsing this Makefile or consult an unrelated
+# rustup toolchain: the actual Cargo build validates its compiler/target inputs.
 
 IS_MUSL=$(shell $(CC) -v 2>&1 | grep -i musl >/dev/null 2>&1 && echo 1 || echo 0)
 ifeq ($(IS_MUSL), 1)
