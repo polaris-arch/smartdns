@@ -638,25 +638,45 @@ TEST(AnyOffline, DefaultUniqueBurstFallsBackToNativeWhenCoordinatorFull)
 }
 
 TEST(UpstreamRoundRobinWire, TwoBackendSerialFairnessAndLegacyFanout) {
-    for (int cap : {0, 1, 2}) {
+    for (int cap : {0, 1, 2}) for (bool compatibility : {false, true}) {
+        if (!cap && compatibility) continue;
         SCOPED_TRACE(cap);
+        SCOPED_TRACE(compatibility);
         std::atomic<int> a{0}, b{0};
+        std::atomic<int> first_port{0}, second_port{0};
         smartdns::MockServer first, second;
         smartdns::Server server;
-        auto reply = [&](smartdns::ServerRequestContext *r, std::atomic<int> &counter) {
+        auto reply = [&](smartdns::ServerRequestContext *r, std::atomic<int> &counter,
+                         std::atomic<int> &previous_port) {
+            EXPECT_EQ(r->from->ss_family, AF_INET);
+            const int port = ntohs(reinterpret_cast<sockaddr_in *>(r->from)->sin_port);
+            EXPECT_GT(port, 0);
+            const int previous = previous_port.exchange(port);
+            // Two physical slots retain each endpoint's UDP socket. With one
+            // slot, idle eviction is expected; do not confuse slots with IP count.
+            if (previous && cap != 1) EXPECT_EQ(port, previous);
             counter++;
             response_question(r);
             unsigned char ip[4] = {192, 0, 2, 9};
             EXPECT_EQ(dns_add_A(r->response_packet, DNS_RRS_AN, r->domain.c_str(), 60, ip), 0);
             return smartdns::SERVER_REQUEST_OK;
         };
-        ASSERT_TRUE(first.Start("udp://127.0.0.1:61053", [&](smartdns::ServerRequestContext *r) { return reply(r, a); }));
-        ASSERT_TRUE(second.Start("udp://127.0.0.1:61054", [&](smartdns::ServerRequestContext *r) { return reply(r, b); }));
-        std::string options = " -quota-group wire-rr";
-        if (cap) options += " -upstream-round-robin -max-upstream-connections " + std::to_string(cap);
+        ASSERT_TRUE(first.Start("udp://127.0.0.1:61053", [&](smartdns::ServerRequestContext *r) { return reply(r, a, first_port); }));
+        ASSERT_TRUE(second.Start("udp://127.0.0.2:61053", [&](smartdns::ServerRequestContext *r) { return reply(r, b, second_port); }));
+        std::string upstreams;
+        if (!cap) {
+            upstreams = "server 127.0.0.1:61053 -quota-group wire-rr\n"
+                        "server 127.0.0.2:61053 -quota-group wire-rr\n";
+        } else if (compatibility) {
+            const std::string options = " -quota-group wire-rr -upstream-round-robin -max-upstream-connections " + std::to_string(cap);
+            upstreams = "server rr-provider.test:61053 -host-ip 127.0.0.1" + options + "\n"
+                        "server rr-provider.test:61053 -host-ip 127.0.0.2" + options + "\n";
+        } else {
+            upstreams = "server rr-provider.test:61053 -upstream-ip-pool -host-ip 127.0.0.1,127.0.0.2"
+                        " -max-upstream-connections " + std::to_string(cap) + "\n";
+        }
         ASSERT_TRUE(server.Start("bind 127.0.0.1:60053\ncache-size 0\nprefetch-domain no\n"
-            "speed-check-mode none\ndualstack-ip-selection no\n"
-            "server 127.0.0.1:61053" + options + "\nserver 127.0.0.1:61054" + options + "\n"));
+            "speed-check-mode none\ndualstack-ip-selection no\n" + upstreams));
         for (int i = 0; i < 6; i++) {
             auto name = "rr-" + std::to_string(i) + ".test";
             auto answer = local_query(DNS_T_A, false, false, false, false, false, 60053, name.c_str());
@@ -668,4 +688,11 @@ TEST(UpstreamRoundRobinWire, TwoBackendSerialFairnessAndLegacyFanout) {
         }
         EXPECT_EQ(a, cap ? 3 : 6); EXPECT_EQ(b, cap ? 3 : 6);
     }
+}
+
+TEST(UpstreamRoundRobinWire, AmbiguousNumericLegacyConfigurationRequiresExplicitMigration) {
+    smartdns::Server server;
+    EXPECT_FALSE(server.Start("bind 127.0.0.1:60053\n"
+        "server 127.0.0.1:61053 -quota-group wire-rr -upstream-round-robin -max-upstream-connections 1\n"
+        "server 127.0.0.1:61054 -quota-group wire-rr -upstream-round-robin -max-upstream-connections 1\n"));
 }

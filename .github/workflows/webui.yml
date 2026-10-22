@@ -44,10 +44,46 @@ jobs:
     - uses: actions/checkout@v4
       with:
         persist-credentials: false
-    - uses: actions-rust-lang/setup-rust-toolchain@v1
+    - name: Install the SDK-compatible lock resolver without a premature cache key
+      uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        profile: minimal
+        toolchain: '1.89.0'
+        override: false
+        cache: false
+    - name: Resolve one dependency lock for tests and both package builds
+      run: |
+        set -euo pipefail
+        mkdir -p ci-webui
+        cd plugin/smartdns-ui
+        test "$(rustc +1.89.0 --version | awk '{print $2}')" = 1.89.0
+        rustc +1.89.0 -vV > ../../ci-webui/lock-rustc.txt
+        cargo +1.89.0 --version > ../../ci-webui/lock-cargo.txt
+        cargo +1.89.0 --config 'resolver.incompatible-rust-versions="fallback"' generate-lockfile
+        cp Cargo.lock ../../ci-webui/Cargo.lock
+        sha256sum Cargo.lock > ../../ci-webui/Cargo.lock.sha256
+        # Fallback is a preference, not a guarantee: inspect the resolved graphs
+        # for both actual CI targets, then require real builds on their compilers.
+        for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
+          cargo +1.89.0 metadata --locked --format-version 1 --filter-platform "$target" > "../../ci-webui/metadata-$target.json"
+        done
+        python3 - <<'PY'
+        import json, pathlib
+        for path in pathlib.Path('../../ci-webui').glob('metadata-*.json'):
+            data = json.loads(path.read_text())
+            selected = {node['id'] for node in data['resolve']['nodes']}
+            for package in data['packages']:
+                version = package.get('rust_version')
+                if package['id'] in selected and version:
+                    parts = tuple(int(part) for part in version.split('.'))
+                    assert (parts + (0, 0))[:3] <= (1, 89, 0), (path.name, package['id'], version)
+        PY
+        sha256sum -c ../../ci-webui/Cargo.lock.sha256
+    - name: Install test compiler and cache the actual plugin workspace and lock
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
         toolchain: stable
+        rust-src-dir: plugin/smartdns-ui
+        cache-workspaces: 'plugin/smartdns-ui -> target'
     - uses: actions/setup-node@v4
       with:
         node-version: '24'
@@ -57,7 +93,7 @@ jobs:
         sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev zlib1g-dev clang libclang-dev dnsutils curl wget patch
         mkdir -p ci-webui/packages
         git rev-parse HEAD > ci-webui/source-sha.txt
-        rustc -vV > ci-webui/rustc.txt
+        (cd plugin/smartdns-ui; rustc -vV) > ci-webui/rustc.txt
         node --version > ci-webui/node.txt
     - name: All Rust and real REST tests, including unchanged HTTPS case
       env:
@@ -67,12 +103,14 @@ jobs:
         set -euo pipefail
         make -C src WITH_ZLIB=yes EXTRA_CFLAGS=-fPIC libsmartdns-test.a -j2
         (cd plugin/smartdns-ui; timeout -k 15 1200 cargo test --locked -- --test-threads=1) 2>&1 | tee ci-webui/rust-rest.log
+        (cd plugin/smartdns-ui; sha256sum -c ../../ci-webui/Cargo.lock.sha256)
         grep -F 'test test_rest_api_https_server ... ok' ci-webui/rust-rest.log
         test -s ci-webui/actual-service-api.json
     - name: Build matching daemon/plugin and actual generic WebUI package
       run: |
         set -euo pipefail
-        timeout -k 15 1800 sh package/build-pkg.sh --platform linux --arch x86-64 --with-ui --ver "0.0.0-ci-${GITHUB_SHA:0:12}" --outputdir "$PWD/ci-webui/packages" 2>&1 | tee ci-webui/package.log
+        CARGO_BUILD_ARGS=--locked timeout -k 15 1800 sh package/build-pkg.sh --platform linux --arch x86-64 --with-ui --ver "0.0.0-ci-${GITHUB_SHA:0:12}" --outputdir "$PWD/ci-webui/packages" 2>&1 | tee ci-webui/package.log
+        (cd plugin/smartdns-ui; sha256sum -c ../../ci-webui/Cargo.lock.sha256)
         . package/webui/source.conf
         sh package/webui/test-prepare-source.sh "package/target/smartdns-webui-$SMARTDNS_WEBUI_COMMIT.tar.gz" 2>&1 | tee ci-webui/prepare.log
         node package/webui/test-table-identity.cjs package/target/smartdns-webui ci-webui/actual-service-api.json ci-webui/table-identity.json
@@ -105,6 +143,11 @@ jobs:
     - uses: actions/setup-node@v4
       with:
         node-version: '24'
+    - name: Retrieve the dependency lock already tested and packaged by this run
+      uses: actions/download-artifact@v4
+      with:
+        name: plugin-webui-${{ github.sha }}
+        path: ${{ runner.temp }}/validated-webui
     - name: Prepare ordinary SDK dependencies and verified official SDK
       run: |
         set -euo pipefail
@@ -125,7 +168,10 @@ jobs:
         [[ "$source" =~ ^[0-9a-f]{40}$ && "$hash" =~ ^[0-9a-f]{64}$ ]]
         grep -Fx 'PKG_SOURCE_URL:=https://codeload.github.com/polaris-arch/smartdns/tar.gz' "$recipe"
         git merge-base --is-ancestor "$source" HEAD
-        test "$(git diff --name-only "$source" HEAD)" = package/openwrt/Makefile
+        # Only these exact packaging/CI/test paths may differ from the pinned
+        # product archive. The updated wire fixture runs from HEAD in native CI;
+        # it is not claimed to be in the SDK archive. No product/prepare drift.
+        test -z "$(git diff --name-only "$source" HEAD -- . ':!package/openwrt/Makefile' ':!.github/workflows/webui.yml' ':!test/cases/test-any-offline.cc')"
         printf '%s\n' "$source" > ci-sdk/core-commit.txt
         cp "$recipe" ci-sdk/Makefile
         cd "$RUNNER_TEMP/smartdns-sdk"
@@ -156,7 +202,17 @@ jobs:
         tar -tzf "dl/smartdns-$source.tar.gz" > "$GITHUB_WORKSPACE/ci-sdk/source-inventory.txt"
         grep -Fx "smartdns-$source/package/webui/prepare-source.sh" "$GITHUB_WORKSPACE/ci-sdk/source-inventory.txt"
         make package/feeds/packages/smartdns/prepare V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/prepare.log"
-        make package/feeds/packages/smartdns/compile V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/compile.log"
+        (cd "$RUNNER_TEMP/validated-webui"; sha256sum -c Cargo.lock.sha256)
+        mapfile -t plugin_dirs < <(find build_dir -type d -path "*/smartdns-$source/plugin/smartdns-ui")
+        test "${#plugin_dirs[@]}" -eq 1
+        plugin_dir=${plugin_dirs[0]}
+        cp "$RUNNER_TEMP/validated-webui/Cargo.lock" "$plugin_dir/Cargo.lock"
+        cp "$RUNNER_TEMP/validated-webui/"Cargo.lock* "$GITHUB_WORKSPACE/ci-sdk/"
+        (cd "$plugin_dir"; sha256sum -c "$GITHUB_WORKSPACE/ci-sdk/Cargo.lock.sha256")
+        CARGO_BUILD_ARGS=--locked make package/feeds/packages/smartdns/compile V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/compile.log"
+        (cd "$plugin_dir"; sha256sum -c "$GITHUB_WORKSPACE/ci-sdk/Cargo.lock.sha256")
+        staging_dir/hostpkg/bin/rustc -vV | tee "$GITHUB_WORKSPACE/ci-sdk/rustc.txt"
+        test "$(staging_dir/hostpkg/bin/rustc --version | awk '{print $2}')" = 1.89.0
         mkdir -p "$GITHUB_WORKSPACE/ci-sdk/ipk"
         find bin/packages -type f \( -name 'smartdns_*.ipk' -o -name 'smartdns-ui_*.ipk' \) -exec cp '{}' "$GITHUB_WORKSPACE/ci-sdk/ipk/" \;
         cd "$GITHUB_WORKSPACE/ci-sdk/ipk"
