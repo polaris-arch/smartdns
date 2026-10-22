@@ -315,7 +315,10 @@ build_webpages()
 		return 1
 	fi
 
-	if [ -f "$SMARTDNS_WEBUI_SOURCE/out/index.html" ]; then
+	WEBUI_SOURCE_DIGEST=$(python3 "$CODE_DIR/package/prepare-webui.py" "$SMARTDNS_WEBUI_SOURCE") || return 1
+	if [ -f "$SMARTDNS_WEBUI_SOURCE/out/index.html" ] &&
+		[ -f "$SMARTDNS_WEBUI_SOURCE/.polaris-ui-digest" ] &&
+		[ "$(cat "$SMARTDNS_WEBUI_SOURCE/.polaris-ui-digest")" = "$WEBUI_SOURCE_DIGEST" ]; then
 		echo "smartdns-webui already built, skipping build."
 		return 0
 	fi
@@ -332,6 +335,7 @@ build_webpages()
 		echo "Failed to build smartdns-webui."
 		return 1
 	fi
+	printf '%s\n' "$WEBUI_SOURCE_DIGEST" > "$SMARTDNS_WEBUI_SOURCE/.polaris-ui-digest" || return 1
 
 	echo "smartdns-webui build completed."
 
