@@ -94,9 +94,20 @@ else
   SMARTDNS_BUILD_TYPE=
 endif
 
-.PHONY: all clean install test test-prepare $(BIN)
+# Apply the reproducible-build policy only after target/linker/profile inference.
+# override also preserves it when a caller supplies arguments on the make CLI.
+ifeq ($(filter --locked,$(CARGO_BUILD_ARGS)),)
+  override CARGO_BUILD_ARGS += --locked
+endif
+
+.PHONY: all clean install test test-prepare print-rust-target $(BIN)
 
 all: $(BIN)
+
+# Query with the same environment CC/PATH as the actual build.
+# Use make --no-print-directory -s for a machine-readable single line.
+print-rust-target:
+	@printf '%s\n' '$(CARGO_BUILD_TARGET)'
 
 test-prepare:
 	$(MAKE) WITH_ZLIB=0 -B -C $(SMARTDNS_SRC_DIR) libsmartdns-test.a
@@ -109,7 +120,7 @@ install: $(BIN)
 	install -v -m 0644 -D -t $(DESTDIR)$(SLIBDIR)/smartdns target/smartdns_ui.so
 
 test: test-prepare
-	MAKEFLAGS= WITH_ZLIB=0 cargo test
+	MAKEFLAGS= WITH_ZLIB=0 cargo test --locked
 
 clean:
 	cargo clean

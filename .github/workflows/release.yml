@@ -9,6 +9,10 @@ on:
     types: [published]
   workflow_dispatch:
     inputs:
+      build_only:
+        description: 'Validate and build only; never modify tags or Releases'
+        type: boolean
+        default: false
       target:
         description: 'Release architectures'
         type: choice
@@ -20,7 +24,7 @@ on:
         default: ''
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: smartdns-release-${{ github.repository }}
@@ -28,11 +32,15 @@ concurrency:
 
 jobs:
   validate:
+    permissions:
+      contents: read
     uses: ./.github/workflows/c-cpp.yml
     with:
       release_validation: true
 
   check_updates:
+    permissions:
+      contents: read
     name: Check for updates (Schedule only)
     runs-on: ubuntu-latest
     outputs:
@@ -40,6 +48,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Make decision
         id: decision
@@ -68,6 +78,17 @@ jobs:
 
   build-release:
     name: Build Cross-Compiled Artifacts
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.assets.outputs.artifact-id }}
+      artifact_digest: ${{ steps.assets.outputs.artifact-digest }}
+      evidence_id: ${{ steps.evidence.outputs.artifact-id }}
+      manifest_sha: ${{ steps.receipt.outputs.manifest_sha }}
+      source: ${{ steps.identity.outputs.source }}
+      tree: ${{ steps.identity.outputs.tree }}
+      attempt: ${{ steps.identity.outputs.attempt }}
+      version: ${{ steps.packages.outputs.version }}
     needs: [check_updates, validate]
     if: needs.check_updates.outputs.should_run == 'true'
     runs-on: ubuntu-22.04
@@ -78,24 +99,28 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Verify stable release identity
         if: github.event_name == 'release' || inputs.release_tag != ''
         env:
           RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+          BUILD_ONLY: ${{ inputs.build_only == true }}
         run: |
           python3 .github/scripts/prepare-release-assets.py --check-tag "$RELEASE_TAG"
-          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$GITHUB_SHA"
+          if [ "$BUILD_ONLY" != true ]; then
+            test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$GITHUB_SHA"
+          fi
 
       # 2. Setup Node.js (needed for webui compilation)
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24.21.0'
 
       # 3. Setup Rust (needed for smartdns-ui compilation)
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.1
 
       # 4. Install Cargo Cache to speed up builds
       - name: Cache Cargo Dependencies
@@ -104,16 +129,15 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            plugin/smartdns-ui/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('plugin/smartdns-ui/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-sources-v3-${{ hashFiles('plugin/smartdns-ui/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-sources-v3-
 
       # 5. Install system dependencies
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtest-dev dnsperf jq wget unzip tar make gcc
+          sudo apt-get install -y libgtest-dev dnsperf jq wget unzip tar make gcc clang libclang-dev
           
           # Download and install Alpine's apk.static dynamically
           APK_FILE=$(wget -qO- https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/ | grep -oE 'apk-tools-static-[0-9][a-zA-Z0-9.-]*\.apk' | head -n 1)
@@ -123,20 +147,6 @@ jobs:
           sudo cp /tmp/sbin/apk.static /usr/bin/apk
           sudo chmod +x /usr/local/bin/apk /usr/bin/apk
           apk --version
-
-      # 6. Cache Bindgen CLI
-      - name: Cache Bindgen CLI
-        uses: actions/cache@v5
-        id: cache-bindgen
-        with:
-          path: ~/.cargo/bin/bindgen
-          key: ${{ runner.os }}-bindgen-cli-0.69.5
-
-      # 7. Install bindgen-cli globally in cargo (required by smartdns-ui Makefile)
-      - name: Install Bindgen CLI
-        if: steps.cache-bindgen.outputs.cache-hit != 'true'
-        run: |
-          cargo install --force --locked bindgen-cli
 
       # 8. Cache Musl Toolchains and OpenSSL
       - name: Cache Musl Toolchains and OpenSSL
@@ -269,18 +279,65 @@ jobs:
             build_openssl "/opt/toolchain/$toolchain/bin/$toolchain-gcc" "$ssl_target"
           done
 
+      - name: Record immutable source and compiler inputs
+        id: identity
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test ! -e plugin/smartdns-ui/target
+          git ls-files --error-unmatch plugin/smartdns-ui/Cargo.lock
+          mkdir -p release-evidence
+          sha256sum plugin/smartdns-ui/Cargo.lock > release-evidence/lock.before
+          test "$(cut -d' ' -f1 release-evidence/lock.before)" = 627d46f1a05e5d82d2f71ba47ba3aeb2f28ab1c7f2c29e42b438df5b874ccb68
+          rustc -Vv | tee release-evidence/rustc.txt
+          test "$(rustc --version)" = 'rustc 1.99.1 (58cf8f9c3 2026-10-13)'
+          test "$(node --version)" = v24.21.0
+          { command -v rustc cargo node clang; rustc --print sysroot; cargo -V; node -v; clang --version; } > release-evidence/toolchains.txt
+          git describe --tags --always --dirty > release-evidence/git-describe.txt
+          sha256sum package/webui/source.conf package/webui/*.patch > release-evidence/frontend-inputs.sha256
+          cp package/webui/source.conf release-evidence/
+          grep -E '^PKG_(SOURCE_VERSION|HASH):=' package/openwrt/Makefile > release-evidence/openwrt-source.txt
+          echo "source=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
+          echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Record remote state before read-only build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+        run: |
+          python3 - <<'PYREMOTE'
+          import importlib.util, json, os, pathlib
+          spec = importlib.util.spec_from_file_location('assets', '.github/scripts/prepare-release-assets.py')
+          mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+          base = mod.repo_endpoint(os.environ['GITHUB_REPOSITORY'])
+          latest = mod.gh_api(base + '/releases/latest', missing_ok=True)
+          tags = sorted({'nightly', os.environ.get('RELEASE_TAG', ''), (latest or {}).get('tag_name', '')} - {''})
+          state = {tag: {kind: mod.gh_api(base + endpoint + tag, missing_ok=True)
+                   for kind, endpoint in [('ref', '/git/ref/tags/'), ('release', '/releases/tags/')]}
+                   for tag in tags}
+          # Downloads by users are not a tag/Release mutation.
+          for item in state.values():
+              for asset in (item['release'] or {}).get('assets', []):
+                  asset.pop('download_count', None)
+          pathlib.Path('release-evidence/remote.before.json').write_text(json.dumps(state, sort_keys=True, indent=2) + '\n')
+          PYREMOTE
+
       # 9. Run the build script
       - name: Build All Targets
+        id: packages
         run: |
           # 1. Determine release version
           export RELEASE_VERSION="$(date +"1.%Y.%m.%d-%H%M")"
           
+          echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "$RELEASE_VERSION" > release-evidence/package-version.txt
           echo "Building Version: ${RELEASE_VERSION}"
           
           # 2. Write build-static.sh on-the-fly (not committed to repo)
           cat << 'EOF' > build-static.sh
-          #!/bin/sh
-          set -e
+          #!/bin/bash
+          set -euo pipefail
 
           ORIG_PATH="$PATH"
           CURR_DIR=$(cd $(dirname $0);pwd)
@@ -289,19 +346,19 @@ jobs:
 
           build()
           {
-              local BUILD_OPT
+              local BUILD_OPT=""
               BUILD_OPT="$BUILD_OPT --platform $2" 
               BUILD_OPT="$BUILD_OPT --arch all" 
               BUILD_OPT="$BUILD_OPT --filearch=$1-$2-all " 
               BUILD_OPT="$BUILD_OPT --ver $VER" 
               BUILD_OPT="$BUILD_OPT --outputdir $CURR_DIR" 
-              if [ ! -z "$CORSS_TOOL" ]; then
+              if [ ! -z "${CORSS_TOOL:-}" ]; then
                   BUILD_OPT="$BUILD_OPT --cross-tool $CORSS_TOOL"
               fi
-              if [ "$3" = "nobuild" ]; then
+              if [ "${3:-}" = "nobuild" ]; then
                   BUILD_OPT="$BUILD_OPT --only-package"
               fi
-              if [ "$4" = "ui" ]; then
+              if [ "${4:-}" = "ui" ]; then
                   BUILD_OPT="$BUILD_OPT --with-ui"
               fi
 
@@ -309,13 +366,40 @@ jobs:
 
               # Prepend target's toolchain bin directory to PATH so correct gcc/strip/objdump are used
               export PATH="$ORIG_PATH"
-              if [ -n "$CC" ]; then
-                  local TC_BIN_DIR=$(dirname "$CC")
+              if [ -n "${CC:-}" ]; then
+                  local TC_BIN_DIR=$(dirname "${CC:-}")
                   export PATH="$TC_BIN_DIR:$PATH"
               fi
 
+              if [ "${4:-}" = ui ] && [ "${3:-}" != nobuild ]; then
+                  # Environment-origin CC is essential: reuse the helper's mapping.
+                  local rust_target
+                  rust_target=$(CC="$CC" make -s --no-print-directory -C "$CODE_DIR/plugin/smartdns-ui" OPTIMIZE_SIZE=1 print-rust-target)
+                  test -n "$rust_target"
+                  rustup target add --toolchain 1.99.1 "$rust_target"
+                  rustup target list --toolchain 1.99.1 --installed | grep -Fx "$rust_target"
+                  test -d "$(rustc --print target-libdir --target "$rust_target")"
+                  rm -f "$CODE_DIR/plugin/smartdns-ui/target/smartdns_ui.so"
+                  { echo "target=$rust_target"; echo 'profile=release-optmize-size'; echo "CC=$CC"; "$CC" --version; "$CC" -dumpmachine; "$CC" --print-sysroot; } > "$CURR_DIR/release-evidence/$1-toolchain.txt"
+              fi
+
               $CODE_DIR/package/build-pkg.sh  $BUILD_OPT || { echo "build-pkg.sh failed for $1 $2"; exit 1; }
-              if [ "$3" != "nobuild" ] && [ "$4" = "" ]; then
+              if [ "${4:-}" = ui ]; then
+                  local plugin="$CODE_DIR/plugin/smartdns-ui/target/smartdns_ui.so"
+                  test -s "$plugin"
+                  if [ "${3:-}" != nobuild ]; then
+                      sha256sum "$plugin" | cut -d' ' -f1 > "$CURR_DIR/release-evidence/$1-plugin.sha256"
+                      "${CC%-gcc}-readelf" -h -d "$plugin" > "$CURR_DIR/release-evidence/$1-plugin.elf.txt"
+                      strings "$plugin" | grep -F "$(cat "$CURR_DIR/release-evidence/git-describe.txt")" > "$CURR_DIR/release-evidence/$1-plugin.version.txt"
+                  fi
+                  test "$(sha256sum "$plugin" | cut -d' ' -f1)" = "$(cat "$CURR_DIR/release-evidence/$1-plugin.sha256")"
+                  # Every UI architecture ends with a generic archive: verify the actual packaged plugin.
+                  if [ "$2" = linux ]; then
+                      tar -xOf "$CURR_DIR/smartdns.$VER.$1-linux-all.tar.gz" smartdns/usr/local/lib/smartdns/smartdns_ui.so | sha256sum | cut -d' ' -f1 > "$CURR_DIR/release-evidence/$1-packaged-plugin.sha256"
+                      cmp "$CURR_DIR/release-evidence/$1-plugin.sha256" "$CURR_DIR/release-evidence/$1-packaged-plugin.sha256"
+                  fi
+              fi
+              if [ "${3:-}" != "nobuild" ] && [ "${4:-}" = "" ]; then
                   cp $CODE_DIR/src/smartdns $CURR_DIR/smartdns-$1 || { echo "Failed to copy smartdns binary"; exit 1; }
               fi
           }
@@ -400,6 +484,11 @@ jobs:
 
           chmod +x build-static.sh
           ./build-static.sh
+          sha256sum -c release-evidence/lock.before
+          sha256sum plugin/smartdns-ui/Cargo.lock > release-evidence/lock.after
+          cmp release-evidence/lock.before release-evidence/lock.after
+          sha256sum package/target/smartdns-webui/package-lock.json > release-evidence/frontend-locks.sha256
+          sha256sum package/target/smartdns-webui-*.tar.gz > release-evidence/frontend-archives.sha256
 
           echo "=== List of all files generated in workspace ==="
           ls -la
@@ -428,13 +517,222 @@ jobs:
           ls -la release-assets/
           echo "==========================================="
 
+      - name: Verify packaged plugin bytes and ELF identities
+        env:
+          VERSION: ${{ steps.packages.outputs.version }}
+        run: |
+          python3 - <<'PYPACKAGES'
+          import hashlib, io, json, os, pathlib, struct, subprocess, tarfile, tempfile
+          evidence = pathlib.Path('release-evidence')
+          # ELF class/machine are an output check, not a Rust target mapping.
+          machines = {'arm': (1, 40), 'aarch64': (2, 183), 'x86_64': (2, 62), 'x86': (1, 3)}
+          arches = list(machines) if os.environ['BUILD_TARGET'] == 'all' else ['x86_64']
+          records = {}
+          def plugin_from_tar(data):
+              with tarfile.open(fileobj=io.BytesIO(data), mode='r:*') as tar:
+                  matches = [m for m in tar.getmembers() if m.isfile() and m.name.endswith('/smartdns_ui.so')]
+                  assert len(matches) == 1, 'missing/duplicate packaged plugin'
+                  return tar.extractfile(matches[0]).read()
+          for arch in arches:
+              expected = (evidence / (arch + '-plugin.sha256')).read_text().strip()
+              for p in sorted(pathlib.Path('release-assets').glob('smartdns.*.' + arch + '-*-all-polaris.*')):
+                  # Original x86/x86_64 optware packages are daemon-only.
+                  if arch in ('x86', 'x86_64') and '-optware-' in p.name:
+                      continue
+                  if p.suffix == '.ipk':
+                      with tarfile.open(p, 'r:gz') as outer:
+                          member, = [m for m in outer.getmembers() if m.name.lstrip('./') == 'data.tar.gz']
+                          data = plugin_from_tar(outer.extractfile(member).read())
+                  elif p.suffix == '.deb':
+                      data = plugin_from_tar(subprocess.check_output(['dpkg-deb', '--fsys-tarfile', str(p)]))
+                  elif p.suffix == '.apk':
+                      with tempfile.TemporaryDirectory() as tmp:
+                          subprocess.run(['apk', 'extract', '--allow-untrusted', '--destination', tmp, str(p.resolve())], check=True)
+                          plugin, = pathlib.Path(tmp).rglob('smartdns_ui.so')
+                          assert not plugin.is_symlink()
+                          data = plugin.read_bytes()
+                  else:
+                      data = plugin_from_tar(p.read_bytes())
+                  assert hashlib.sha256(data).hexdigest() == expected, 'packaged plugin mismatch: ' + p.name
+                  assert data[:4] == b'\x7fELF' and data[5] == 1, 'expected little-endian ELF'
+                  assert (data[4], struct.unpack('<H', data[18:20])[0]) == machines[arch], 'wrong ELF architecture'
+                  version = (evidence / 'git-describe.txt').read_text().strip()
+                  assert version.encode() in data, 'actual plugin lacks source version'
+                  records[p.name] = dict(plugin_sha256=expected, elf_class=data[4], elf_machine=machines[arch][1], git_describe=version)
+          expected_count = 18 if os.environ['BUILD_TARGET'] == 'all' else 4
+          assert len(records) == expected_count, 'UI package evidence count mismatch'
+          (evidence / 'packaged-plugins.json').write_text(json.dumps(records, sort_keys=True, indent=2) + '\n')
+          PYPACKAGES
+
+      - name: Verify remote state unchanged through read-only build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+        run: |
+          python3 - <<'PYREMOTE'
+          import importlib.util, json, os, pathlib
+          spec = importlib.util.spec_from_file_location('assets', '.github/scripts/prepare-release-assets.py')
+          mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+          base = mod.repo_endpoint(os.environ['GITHUB_REPOSITORY'])
+          latest = mod.gh_api(base + '/releases/latest', missing_ok=True)
+          tags = sorted({'nightly', os.environ.get('RELEASE_TAG', ''), (latest or {}).get('tag_name', '')} - {''})
+          state = {tag: {kind: mod.gh_api(base + endpoint + tag, missing_ok=True)
+                   for kind, endpoint in [('ref', '/git/ref/tags/'), ('release', '/releases/tags/')]}
+                   for tag in tags}
+          # Downloads by users are not a tag/Release mutation.
+          for item in state.values():
+              for asset in (item['release'] or {}).get('assets', []):
+                  asset.pop('download_count', None)
+          pathlib.Path('release-evidence/remote.after.json').write_text(json.dumps(state, sort_keys=True, indent=2) + '\n')
+          PYREMOTE
+          cmp release-evidence/remote.before.json release-evidence/remote.after.json
+
       - name: Preserve verified release assets
+        id: assets
         uses: actions/upload-artifact@v4
         with:
-          name: smartdns-polaris-${{ github.sha }}
+          name: smartdns-polaris-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-assets/*
           if-no-files-found: error
           retention-days: 7
+
+      - name: Bind successful build and immutable artifact
+        id: receipt
+        env:
+          ASSET_ID: ${{ steps.assets.outputs.artifact-id }}
+          ASSET_DIGEST: ${{ steps.assets.outputs.artifact-digest }}
+          VERSION: ${{ steps.packages.outputs.version }}
+        run: |
+          python3 - <<'PYRECEIPT'
+          import hashlib, json, os, pathlib, re, subprocess
+          root = pathlib.Path('.')
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          def files(directory):
+              return {p.name: {'sha256': hashlib.sha256(p.read_bytes()).hexdigest(), 'size': p.stat().st_size}
+                      for p in sorted(directory.iterdir()) if p.is_file() and not p.is_symlink()}
+          assert re.fullmatch(r'[1-9][0-9]*', os.environ['ASSET_ID'])
+          assert re.fullmatch(r'[0-9a-f]{64}', os.environ['ASSET_DIGEST'])
+          receipt = dict(source=git('rev-parse', 'HEAD'), tree=git('rev-parse', 'HEAD^{tree}'),
+                         run=os.environ['GITHUB_RUN_ID'], attempt=os.environ['GITHUB_RUN_ATTEMPT'],
+                         repository=os.environ['GITHUB_REPOSITORY'], version=os.environ['VERSION'],
+                         target=os.environ['BUILD_TARGET'], artifact_id=os.environ['ASSET_ID'],
+                         artifact_digest=os.environ['ASSET_DIGEST'],
+                         lock=hashlib.sha256(pathlib.Path('plugin/smartdns-ui/Cargo.lock').read_bytes()).hexdigest(),
+                         assets=files(root / 'release-assets'), evidence=files(root / 'release-evidence'))
+          manifest = root / 'release-evidence/manifest.json'
+          manifest.write_text(json.dumps(receipt, sort_keys=True, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('manifest_sha=' + hashlib.sha256(manifest.read_bytes()).hexdigest() + '\n')
+          PYRECEIPT
+
+      - name: Preserve separate build evidence
+        id: evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartdns-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-evidence/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish only the verified bytes from this build
+    needs: [build-release]
+    if: ${{ needs.build-release.result == 'success' && inputs.build_only != true }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      ASSET_ID: ${{ needs.build-release.outputs.artifact_id }}
+      ASSET_DIGEST: ${{ needs.build-release.outputs.artifact_digest }}
+      EVIDENCE_ID: ${{ needs.build-release.outputs.evidence_id }}
+      MANIFEST_SHA: ${{ needs.build-release.outputs.manifest_sha }}
+      BUILD_SOURCE: ${{ needs.build-release.outputs.source }}
+      BUILD_TREE: ${{ needs.build-release.outputs.tree }}
+      BUILD_ATTEMPT: ${{ needs.build-release.outputs.attempt }}
+      RELEASE_VERSION: ${{ needs.build-release.outputs.version }}
+    steps:
+      - name: Require exact successful current-attempt identity
+        run: |
+          set -euo pipefail
+          [[ "$ASSET_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$EVIDENCE_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ASSET_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$MANIFEST_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$BUILD_TREE" =~ ^[0-9a-f]{40}$ ]]
+          test "$BUILD_SOURCE" = "$GITHUB_SHA"
+          # A publish-only rerun cannot silently reuse a previous attempt.
+          # Rerun all jobs to produce and validate a fresh exact artifact instead.
+          test "$BUILD_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+          test -n "$RELEASE_VERSION"
+
+      - name: Checkout exact built source without credentials
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.build-release.outputs.source }}
+          persist-credentials: false
+
+      # Omitting github-token/run-id uses the current run's artifact service;
+      # no actions:read token or cross-run promotion mechanism is introduced.
+      - name: Download exact asset artifact
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.build-release.outputs.artifact_id }}
+          path: release-assets
+          merge-multiple: true
+
+      - name: Download exact evidence artifact
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.build-release.outputs.evidence_id }}
+          path: release-evidence
+          merge-multiple: true
+
+      # The v4 download action only warns on transport ZIP digest mismatch.
+      # Do not rely on that warning: the producing job's SHA-bound manifest
+      # authenticates the exact ID/digest and fails closed on every payload byte.
+      - name: Verify handoff before any publication operation
+        run: |
+          python3 - <<'PYVERIFY'
+          import hashlib, importlib.util, json, os, pathlib, re, subprocess
+          def digest(p):
+              return hashlib.sha256(p.read_bytes()).hexdigest()
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+          manifest = pathlib.Path('release-evidence/manifest.json')
+          require(digest(manifest) == os.environ['MANIFEST_SHA'], 'manifest digest mismatch')
+          r = json.loads(manifest.read_text())
+          for key, env in [('source', 'GITHUB_SHA'), ('tree', 'BUILD_TREE'), ('run', 'GITHUB_RUN_ID'),
+                           ('attempt', 'GITHUB_RUN_ATTEMPT'), ('repository', 'GITHUB_REPOSITORY'),
+                           ('version', 'RELEASE_VERSION'), ('target', 'BUILD_TARGET'),
+                           ('artifact_id', 'ASSET_ID'), ('artifact_digest', 'ASSET_DIGEST')]:
+              require(r[key] == os.environ[env], 'handoff mismatch: ' + key)
+          require(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == r['source'], 'source mismatch')
+          require(subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == r['tree'], 'tree mismatch')
+          require(digest(pathlib.Path('plugin/smartdns-ui/Cargo.lock')) == r['lock'], 'source lock mismatch')
+          spec = importlib.util.spec_from_file_location('assets', '.github/scripts/prepare-release-assets.py')
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          expected = {mod.distribution_name(n) for n in mod.expected_assets(r['version'], r['target'])}
+          require(set(r['assets']) == expected | {'SHA256SUMS'}, 'asset allowlist mismatch')
+          for directory, records in [('release-assets', r['assets']), ('release-evidence', r['evidence'])]:
+              folder = pathlib.Path(directory)
+              allowed = set(records) | ({'manifest.json'} if directory == 'release-evidence' else set())
+              require({p.name for p in folder.iterdir()} == allowed, 'unexpected/missing files: ' + directory)
+              for name, record in records.items():
+                  p = folder / name
+                  require(p.is_file() and not p.is_symlink() and p.stat().st_size > 0, 'invalid file: ' + name)
+                  require(p.stat().st_size == record['size'] and digest(p) == record['sha256'], 'bytes mismatch: ' + name)
+          sums = ''.join(r['assets'][n]['sha256'] + '  ' + n + '\n' for n in sorted(expected))
+          require(pathlib.Path('release-assets/SHA256SUMS').read_text() == sums, 'checksum manifest mismatch')
+          require(pathlib.Path('release-evidence/package-version.txt').read_text().strip() == r['version'], 'package version mismatch')
+          arches = ['arm', 'aarch64', 'x86_64', 'x86'] if r['target'] == 'all' else ['x86_64']
+          for arch in arches:
+              for suffix in ['toolchain.txt', 'plugin.elf.txt', 'plugin.version.txt', 'plugin.sha256', 'packaged-plugin.sha256']:
+                  require(arch + '-' + suffix in r['evidence'], 'missing target evidence: ' + arch + '-' + suffix)
+          print('Verified exact artifact ID/digest binding, run/attempt/source/tree/lock/version and all asset bytes.')
+          PYVERIFY
 
       - name: Recheck stable remote tag before publication
         if: github.event_name == 'release' || inputs.release_tag != ''

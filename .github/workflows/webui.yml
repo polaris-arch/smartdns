@@ -21,11 +21,14 @@ jobs:
     if: ${{ !inputs.full_validation }}
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
     - uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        profile: minimal
-        toolchain: stable
+        toolchain: '1.99.1'
+        rust-src-dir: plugin/smartdns-ui
+        cache-workspaces: 'plugin/smartdns-ui -> target'
     - name: test
       run: |
         EXTRA_CFLAGS=-fPIC make -C plugin/smartdns-ui test -j8
@@ -44,13 +47,13 @@ jobs:
     - uses: actions/checkout@v4
       with:
         persist-credentials: false
-    - name: Install the SDK-compatible lock resolver without a premature cache key
+    - name: Install the SDK-compatible source-lock checker without a premature cache key
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: '1.89.0'
         override: false
         cache: false
-    - name: Resolve one dependency lock for tests and both package builds
+    - name: Validate the tracked dependency lock for tests and both package builds
       run: |
         set -euo pipefail
         mkdir -p ci-webui
@@ -58,11 +61,12 @@ jobs:
         test "$(rustc +1.89.0 --version | awk '{print $2}')" = 1.89.0
         rustc +1.89.0 -vV > ../../ci-webui/lock-rustc.txt
         cargo +1.89.0 --version > ../../ci-webui/lock-cargo.txt
-        cargo +1.89.0 --config 'resolver.incompatible-rust-versions="fallback"' generate-lockfile
+        git ls-files --error-unmatch Cargo.lock
+        test -s Cargo.lock
         cp Cargo.lock ../../ci-webui/Cargo.lock
         sha256sum Cargo.lock > ../../ci-webui/Cargo.lock.sha256
-        # Fallback is a preference, not a guarantee: inspect the resolved graphs
-        # for both actual CI targets, then require real builds on their compilers.
+        # Never resolve or update the source graph in a build. Inspect both
+        # actual CI targets, then require real builds on their compilers.
         for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
           cargo +1.89.0 metadata --locked --format-version 1 --filter-platform "$target" > "../../ci-webui/metadata-$target.json"
         done
@@ -81,12 +85,12 @@ jobs:
     - name: Install test compiler and cache the actual plugin workspace and lock
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        toolchain: stable
+        toolchain: '1.99.1'
         rust-src-dir: plugin/smartdns-ui
         cache-workspaces: 'plugin/smartdns-ui -> target'
     - uses: actions/setup-node@v4
       with:
-        node-version: '24'
+        node-version: '24.21.0'
     - name: Prepare ordinary build dependencies
       run: |
         sudo apt-get update
@@ -152,7 +156,7 @@ jobs:
         persist-credentials: false
     - uses: actions/setup-node@v4
       with:
-        node-version: '24'
+        node-version: '24.21.0'
     - name: Retrieve the dependency lock already tested and packaged by this run
       uses: actions/download-artifact@v4
       with:
@@ -223,6 +227,8 @@ jobs:
         path.write_bytes(after)
         PY
         cp .config feeds.conf "$GITHUB_WORKSPACE/ci-sdk/"
+        cp include/package.mk "$GITHUB_WORKSPACE/ci-sdk/sdk-package.mk"
+        cp rules.mk "$GITHUB_WORKSPACE/ci-sdk/sdk-rules.mk"
     - name: Actual SDK download, preparation and both package builds
       run: |
         set -euo pipefail
@@ -233,12 +239,16 @@ jobs:
         printf '%s  %s\n' "$hash" "dl/smartdns-$source.tar.gz" | sha256sum -c - | tee "$GITHUB_WORKSPACE/ci-sdk/core-hash.txt"
         tar -tzf "dl/smartdns-$source.tar.gz" > "$GITHUB_WORKSPACE/ci-sdk/source-inventory.txt"
         grep -Fx "smartdns-$source/package/webui/prepare-source.sh" "$GITHUB_WORKSPACE/ci-sdk/source-inventory.txt"
+        grep -Fx "smartdns-$source/plugin/smartdns-ui/Cargo.lock" "$GITHUB_WORKSPACE/ci-sdk/source-inventory.txt"
         make package/feeds/packages/smartdns/prepare V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/prepare.log"
         (cd "$RUNNER_TEMP/validated-webui"; sha256sum -c Cargo.lock.sha256)
         mapfile -t plugin_dirs < <(find build_dir -type d -path "*/smartdns-$source/plugin/smartdns-ui")
         test "${#plugin_dirs[@]}" -eq 1
         plugin_dir=${plugin_dirs[0]}
-        cp "$RUNNER_TEMP/validated-webui/Cargo.lock" "$plugin_dir/Cargo.lock"
+        # The archive must contain the exact source lock already validated.
+        # Do not repair a missing or divergent archive by injecting CI bytes.
+        cmp "$GITHUB_WORKSPACE/plugin/smartdns-ui/Cargo.lock" "$RUNNER_TEMP/validated-webui/Cargo.lock"
+        cmp "$RUNNER_TEMP/validated-webui/Cargo.lock" "$plugin_dir/Cargo.lock"
         cp "$RUNNER_TEMP/validated-webui/"Cargo.lock* "$GITHUB_WORKSPACE/ci-sdk/"
         (cd "$plugin_dir"; sha256sum -c "$GITHUB_WORKSPACE/ci-sdk/Cargo.lock.sha256")
         make package/feeds/packages/rust/host/configure V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/rust-host-configure.log"
@@ -262,8 +272,37 @@ jobs:
         test "$("$sdk_rustc" --version | awk '{print $2}')" = 1.89.0
         "$sdk_rustc" --print sysroot | tee "$GITHUB_WORKSPACE/ci-sdk/rust-sysroot.txt"
         sha256sum "$sdk_rustc" > "$GITHUB_WORKSPACE/ci-sdk/rustc.sha256"
-        CARGO_BUILD_ARGS=--locked make package/feeds/packages/smartdns/compile V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/compile.log"
-        (cd "$plugin_dir"; sha256sum -c "$GITHUB_WORKSPACE/ci-sdk/Cargo.lock.sha256")
+        sdk_cargo="$PWD/staging_dir/target-x86_64_musl/host/bin/cargo"
+        "$sdk_cargo" -vV | tee "$GITHUB_WORKSPACE/ci-sdk/cargo.txt"
+        sha256sum "$sdk_cargo" > "$GITHUB_WORKSPACE/ci-sdk/cargo.sha256"
+        compile_status=0
+        CARGO_BUILD_ARGS=--locked make package/feeds/packages/smartdns/compile V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/compile.log" || compile_status=$?
+        printf '%s\n' "$compile_status" > "$GITHUB_WORKSPACE/ci-sdk/compile-status.txt"
+        # A successful SDK compile may auto-remove its source directory. Save
+        # the actual surviving state, never label the earlier copy a final lock.
+        if test -f "$plugin_dir/Cargo.lock"; then
+          cp "$plugin_dir/Cargo.lock" "$GITHUB_WORKSPACE/ci-sdk/Cargo.lock.after-compile"
+          sha256sum "$plugin_dir/Cargo.lock" > "$GITHUB_WORKSPACE/ci-sdk/lock-after-state.txt"
+        else
+          printf 'absent-after-compile\n' > "$GITHUB_WORKSPACE/ci-sdk/lock-after-state.txt"
+        fi
+        test "$compile_status" -eq 0 || exit "$compile_status"
+        python3 - <<'PYSDKLOCK'
+        import hashlib, os, pathlib, re
+        evidence = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'ci-sdk'
+        expected = hashlib.sha256((evidence / 'Cargo.lock').read_bytes()).hexdigest()
+        log = (evidence / 'compile.log').read_text()
+        # These are emitted inside the actual recipe around plugin make, before
+        # package.mk's normal cleanup. Both complete lines are mandatory.
+        positions = []
+        for stage in ('BEFORE', 'AFTER'):
+            matches = list(re.finditer(r'^SMARTDNS_SDK_LOCK_' + stage + r'=(.*)$', log, re.M))
+            assert len(matches) == 1 and matches[0].group(1) == expected, stage
+            positions.append(matches[0].start())
+        assert positions[0] < positions[1]
+        (evidence / 'lock-consumption.txt').write_text(expected + ' before-and-after-actual-plugin-make\n')
+        PYSDKLOCK
+        sha256sum -c "$GITHUB_WORKSPACE/ci-sdk/cargo.sha256"
         sha256sum -c "$GITHUB_WORKSPACE/ci-sdk/rustc.sha256"
         mkdir -p "$GITHUB_WORKSPACE/ci-sdk/ipk"
         find bin/packages -type f \( -name 'smartdns_*.ipk' -o -name 'smartdns-ui_*.ipk' \) -exec cp '{}' "$GITHUB_WORKSPACE/ci-sdk/ipk/" \;

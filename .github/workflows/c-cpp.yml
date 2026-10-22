@@ -37,6 +37,8 @@ jobs:
             image: debian:trixie
     steps:
     - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
     - name: Check result-gate and measurement source fixtures
       run: |
         python3 .github/scripts/check-native-results.py --self-test

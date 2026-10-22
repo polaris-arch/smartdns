@@ -108,10 +108,12 @@ define Build/Compile/smartdns-webui
 endef
 
 define Build/Compile/smartdns-ui
+	@lock_hash=$$$$("$(MKHASH)" sha256 "$(PKG_BUILD_DIR)/plugin/smartdns-ui/Cargo.lock") && test "$$$${#lock_hash}" -eq 64 && case "$$$$lock_hash" in *[!0-9a-f]*) exit 1;; esac && printf 'SMARTDNS_SDK_LOCK_BEFORE=%s\n' "$$$$lock_hash"
 	CARGO_BUILD_ARGS="$(if $(strip $(RUST_PKG_FEATURES)),--features "$(strip $(RUST_PKG_FEATURES))") --profile $(CARGO_PKG_PROFILE)"
 	+$(CARGO_PKG_VARS) CARGO_BUILD_ARGS="$(CARGO_BUILD_ARGS)" CC=$(TARGET_CC) \
 	PATH="$$(PATH):$(CARGO_HOME)/bin" \
 	make -C $(PKG_BUILD_DIR)/plugin/smartdns-ui
+	@lock_hash=$$$$("$(MKHASH)" sha256 "$(PKG_BUILD_DIR)/plugin/smartdns-ui/Cargo.lock") && test "$$$${#lock_hash}" -eq 64 && case "$$$$lock_hash" in *[!0-9a-f]*) exit 1;; esac && printf 'SMARTDNS_SDK_LOCK_AFTER=%s\n' "$$$$lock_hash"
 endef
 
 define Download/smartdns-webui
