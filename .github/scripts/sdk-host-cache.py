@@ -283,7 +283,16 @@ def verify_source(checkout, archive, source, archive_sha256, lock):
             require(not relative or (not PurePosixPath(relative).is_absolute() and
                     all(part not in ("", ".", "..") for part in relative.split("/"))),
                     "noncanonical source archive path")
+            # Git records regular/executable identity, not POSIX group-write.
+            # Codeload emits 0664/0775 (equivalent to tar.umask=0002); local
+            # git archive commonly uses 0022 (0644/0755). Accept precisely those
+            # representations, never world-write, special bits or type drift.
+            require(member.sparse is None and
+                    not any(k.startswith("GNU.sparse") for k in member.pax_headers),
+                    "source sparse member")
             if member.isdir():
+                require(member.type == tarfile.DIRTYPE and member.mode in (0o755, 0o775),
+                        "source directory mode")
                 require(not relative or any(p.startswith(relative + "/") for p in tree),
                         "unexpected source directory")
                 continue
@@ -291,12 +300,15 @@ def verify_source(checkout, archive, source, archive_sha256, lock):
             seen.add(relative)
             mode, expected = tree[relative]
             if mode == "120000":
-                require(member.issym(), "source symlink mode mismatch")
+                require(member.issym() and member.mode == 0o777, "source symlink mode mismatch")
                 data = member.linkname.encode()
                 actual = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
             else:
-                require(member.isfile() and mode in ("100644", "100755"), "source file type")
-                require((member.mode & 0o7777) == int(mode[-3:], 8), "source executable mode")
+                require(member.type in (tarfile.REGTYPE, tarfile.AREGTYPE) and
+                        mode in ("100644", "100755"), "source file type")
+                expected_mode = int(mode[-3:], 8)
+                require(member.mode in (expected_mode, expected_mode | 0o020),
+                        "source executable mode")
                 require(0 <= member.size <= 32 * 1024 * 1024, "source file bound")
                 total += member.size
                 require(total <= 64 * 1024 * 1024, "source total bound")

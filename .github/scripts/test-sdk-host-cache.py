@@ -1075,11 +1075,11 @@ class SourceAndReference(unittest.TestCase):
         with self.assertRaises(HELPER.ContractError):
             HELPER.source_delta(self.repo, self.old, self.commit(), reference=True)
 
-    def source_archive(self):
+    def source_archive(self, umask="0002"):
         archive = self.root / "source.tar.gz"
         # git archive uses pax_global_header; verify_source must still verify
         # every resulting product blob/mode rather than trust container hash.
-        subprocess.run(["git", "-C", str(self.repo), "-c", "tar.umask=0022", "archive", "--format=tar.gz",
+        subprocess.run(["git", "-C", str(self.repo), "-c", "tar.umask=" + umask, "archive", "--format=tar.gz",
                         "--prefix=smartdns-" + self.old + "/", "-o", str(archive), self.old], check=True)
         digest = HELPER.file_digest(archive)
         self.write(HELPER.RECIPE, "PKG_SOURCE_VERSION:=" + self.old + "\nPKG_HASH:=" + digest + "\n# recipe unchanged\n")
@@ -1092,6 +1092,57 @@ class SourceAndReference(unittest.TestCase):
                                       self.repo / "plugin/smartdns-ui/Cargo.lock")
         self.assertEqual(result["source"], self.old)
         self.assertEqual(result["tracked_files"], 4)
+
+    def test_source_archive_codeload_and_local_modes_preserve_git_identity(self):
+        self.write("run.sh", "#!/bin/sh\nexit 0\n")
+        (self.repo / "run.sh").chmod(0o755)
+        os.symlink("product.c", self.repo / "product-link")
+        self.old = self.commit()
+        for umask, regular, executable in (("0002", 0o664, 0o775), ("0022", 0o644, 0o755)):
+            with self.subTest(umask=umask):
+                archive, digest = self.source_archive(umask)
+                with tarfile.open(archive) as tar:
+                    modes = {m.name.rsplit("/", 1)[-1]: m.mode for m in tar}
+                self.assertEqual(modes["product.c"], regular)
+                self.assertEqual(modes["run.sh"], executable)
+                self.assertEqual(modes["product-link"], 0o777)
+                result = HELPER.verify_source(self.repo, archive, self.old, digest,
+                                              self.repo / "plugin/smartdns-ui/Cargo.lock")
+                self.assertEqual(result["tracked_files"], 6)
+
+    def test_source_archive_permission_and_type_boundaries(self):
+        archive, _ = self.source_archive()
+        with tarfile.open(archive, "r:gz") as stream:
+            original = [(copy.copy(m), stream.extractfile(m).read() if m.isfile() else b"") for m in stream]
+        cases = [("file", mode) for mode in (0o600, 0o666, 0o777, 0o755, 0o645, 0o1644, 0o2644, 0o4644)]
+        cases += [("dir", mode) for mode in (0o700, 0o777, 0o1775, 0o2775, 0o4775)]
+        cases += [("type", value) for value in (tarfile.LNKTYPE, tarfile.SYMTYPE, tarfile.FIFOTYPE,
+                                                tarfile.CHRTYPE, tarfile.BLKTYPE)]
+        cases += [("sparse", None)]
+        for kind, value in cases:
+            with self.subTest(kind=kind, value=value):
+                members = copy.deepcopy(original)
+                index = next(i for i, (m, _) in enumerate(members)
+                             if m.isdir()) if kind == "dir" else next(
+                                 i for i, (m, _) in enumerate(members) if m.name.endswith("/product.c"))
+                header, data = members[index]
+                if kind in ("file", "dir"):
+                    header.mode = value
+                elif kind == "type":
+                    header.type = value
+                    header.linkname = "product.c"
+                    header.size = 0
+                else:
+                    header.pax_headers = {"GNU.sparse.name": "product.c"}
+                with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT) as stream:
+                    for member, content in members:
+                        stream.addfile(member, io.BytesIO(content) if member.isfile() else None)
+                digest = HELPER.file_digest(archive)
+                self.write(HELPER.RECIPE, "PKG_SOURCE_VERSION:=" + self.old + "\nPKG_HASH:=" + digest + "\n# recipe unchanged\n")
+                self.commit()
+                with self.assertRaises(HELPER.ContractError):
+                    HELPER.verify_source(self.repo, archive, self.old, digest,
+                                         self.repo / "plugin/smartdns-ui/Cargo.lock")
 
     def test_source_lock_mismatch_rejected(self):
         archive, digest = self.source_archive()
