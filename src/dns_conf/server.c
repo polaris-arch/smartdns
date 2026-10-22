@@ -25,6 +25,65 @@
 
 #include <getopt.h>
 #include <errno.h>
+#include <arpa/inet.h>
+
+/* Strict bounded pool parsing. Keep the original authority separate from its
+ * numeric backends; legacy host-ip substitution is intentionally unchanged. */
+static int _config_pool_number(const char *text, unsigned int *value)
+{
+	unsigned int n = 0;
+	if (!text || !*text) return -1;
+	for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+		if (*p < '0' || *p > '9' || n > 64) return -1;
+		n = n * 10 + (*p - '0');
+	}
+	if (!n || n > 64) return -1;
+	*value = n;
+	return 0;
+}
+
+static int _config_pool_ips(struct dns_servers *server, const char *text)
+{
+	const char *at = text;
+	if (!at || !*at) return -1;
+	while (*at) {
+		const char *end = strchr(at, ',');
+		size_t len = end ? (size_t)(end - at) : strlen(at);
+		char literal[DNS_MAX_IPLEN], normalized[DNS_MAX_IPLEN];
+		struct in_addr a4;
+		struct in6_addr a6;
+		int family;
+		if (!len || len >= sizeof(literal)) return -1;
+		memcpy(literal, at, len); literal[len] = '\0';
+		if (inet_pton(AF_INET, literal, &a4) == 1) {
+			family = AF_INET;
+		} else if (inet_pton(AF_INET6, literal, &a6) == 1) {
+			if (IN6_IS_ADDR_V4MAPPED(&a6)) {
+				memcpy(&a4, &a6.s6_addr[12], sizeof(a4)); family = AF_INET;
+			} else family = AF_INET6;
+		} else return -1;
+		if (family == AF_INET) {
+			uint32_t ip = ntohl(a4.s_addr);
+			if (ip == INADDR_ANY || IN_MULTICAST(ip) || ip == INADDR_BROADCAST) return -1;
+			if (!inet_ntop(AF_INET, &a4, normalized, sizeof(normalized))) return -1;
+		} else {
+			if (IN6_IS_ADDR_UNSPECIFIED(&a6) || IN6_IS_ADDR_MULTICAST(&a6)) return -1;
+			if (!inet_ntop(AF_INET6, &a6, normalized, sizeof(normalized))) return -1;
+		}
+		unsigned int i;
+		for (i = 0; i < server->pool_ip_count; i++)
+			if (!strcmp(server->pool_ips[i], normalized)) break;
+		if (i == server->pool_ip_count) {
+			if (i == 64) return -1;
+			safe_strncpy(server->pool_ips[i], normalized, sizeof(server->pool_ips[i]));
+			server->pool_ip_count++;
+		}
+		if (!end) break;
+		at = end + 1;
+		if (!*at) return -1;
+	}
+	return 0;
+}
 
 static int _config_server(int argc, char *argv[], dns_server_type_t type, int default_port)
 {
@@ -41,7 +100,11 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 	int drop_packet_latency_ms = 0;
 	int tcp_keepalive = -1;
 	int is_bootstrap_dns = 0;
-	char host_ip[DNS_MAX_IPLEN] = {0};
+	const char *host_ip = NULL;
+	unsigned int host_ip_occurrences = 0;
+	int legacy_host_ip_invalid = 0;
+	int legacy_connection_invalid = 0;
+	const char *connection_limit_text = NULL;
 	int no_tls_host_name = 0;
 	int no_tls_host_verify = 0;
 	const char *group_name = NULL;
@@ -80,6 +143,8 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		{"quota-group", required_argument, NULL, 270},
 		{"upstream-round-robin", no_argument, NULL, 271},
 		{"max-upstream-connections", required_argument, NULL, 272},
+		{"upstream-ip-pool", no_argument, NULL, 273},
+		{"max-upstream-backends", required_argument, NULL, 274},
 		{NULL, no_argument, NULL, 0}
 	};
 	/* clang-format on */
@@ -95,6 +160,9 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 	}
 
 	server = &dns_conf.servers[index];
+	const char *source_file = conf_get_conf_file();
+	safe_strncpy(server->source_file, source_file ? source_file : "<configuration>", sizeof(server->source_file));
+	server->source_line = conf_get_current_lineno();
 	server->spki[0] = '\0';
 	server->path[0] = '\0';
 	server->hostname[0] = '\0';
@@ -107,10 +175,16 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 	server->subnet_all_query_types = 0;
 	server->upstream_round_robin = 0;
 	server->max_upstream_connections = 0;
+	server->upstream_ip_pool = 0;
+	server->pool_compat_skip = 0;
+	server->max_upstream_backends = 0;
+	server->pool_ip_count = 0;
+	memset(server->pool_ips, 0, sizeof(server->pool_ips));
 
 	if (parse_uri(ip, scheme, server->server, &port, server->path) != 0) {
 		return -1;
 	}
+	safe_strncpy(server->authority, server->server, sizeof(server->authority));
 
 	if (scheme[0] != '\0') {
 		if (strcasecmp(scheme, "https") == 0) {
@@ -241,10 +315,9 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 			break;
 		}
 		case 258: {
-			if (check_is_ipaddr(optarg) != 0) {
-				goto errout;
-			}
-			safe_strncpy(host_ip, optarg, DNS_MAX_IPLEN);
+			host_ip = optarg;
+			host_ip_occurrences++;
+			if (check_is_ipaddr(optarg) != 0) legacy_host_ip_invalid = 1;
 			break;
 		}
 		case 259: {
@@ -300,10 +373,15 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 			server->upstream_round_robin = 1;
 			break;
 		case 272:
-			/* A single decimal digit is the complete supported range: no signs,
-			 * whitespace, suffixes, overflow, or silent clamping. */
-			if (optarg[0] < '1' || optarg[0] > '4' || optarg[1] != '\0') return -1;
-			server->max_upstream_connections = optarg[0] - '0';
+			if (_config_pool_number(optarg, &server->max_upstream_connections)) return -1;
+			connection_limit_text = optarg;
+			if (optarg[0] < '1' || optarg[0] > '4' || optarg[1]) legacy_connection_invalid = 1;
+			break;
+		case 273:
+			server->upstream_ip_pool = 1;
+			break;
+		case 274:
+			if (_config_pool_number(optarg, &server->max_upstream_backends)) return -1;
 			break;
 		case 270:
 			if (!*optarg || strlen(optarg) >= sizeof(server->quota_group)) return -1;
@@ -315,7 +393,7 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		}
 		default:
 			/* Do not silently turn malformed opt-in options into defaults. */
-			if (optopt == 271 || optopt == 272) return -1;
+			if (optopt == 271 || optopt == 272 || optopt == 273 || optopt == 274 || optopt == 258) return -1;
 			if (optind > optind_last) {
 				tlog(TLOG_WARN, "unknown server option: %s at '%s:%d'.", argv[optind - 1], conf_get_conf_file(),
 					 conf_get_current_lineno());
@@ -326,11 +404,28 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		optind_last = optind;
 	}
 
-	if (server->upstream_round_robin) {
-		if (!server->quota_group[0]) return -1;
-		if (!server->max_upstream_connections) server->max_upstream_connections = 2;
-	} else if (server->max_upstream_connections) {
-		return -1;
+	if (server->upstream_ip_pool) {
+		if (server->upstream_round_robin || is_bootstrap_dns || server->proxyname[0] ||
+			type == DNS_SERVER_MDNS || check_is_ipaddr(server->server) == 0 || host_ip_occurrences > 1) {
+			tlog(TLOG_ERROR, "upstream-ip-pool requires a domain authority and cannot use proxy, bootstrap, mDNS or legacy RR");
+			return -1;
+		}
+		if (!server->max_upstream_backends) server->max_upstream_backends = 4;
+		if (server->max_upstream_connections > server->max_upstream_backends) return -1;
+		if (host_ip && _config_pool_ips(server, host_ip)) return -1;
+		if (server->pool_ip_count > server->max_upstream_backends)
+			tlog(TLOG_WARN, "pool %s configured %u unique addresses, selecting first %u (overflow %u)",
+				server->server, server->pool_ip_count, server->max_upstream_backends,
+				server->pool_ip_count - server->max_upstream_backends);
+	} else {
+		if (server->max_upstream_backends || legacy_host_ip_invalid || legacy_connection_invalid) return -1;
+		/* Preserve the legacy single-digit 1..4 grammar, including rejection of 01. */
+		if (connection_limit_text && (connection_limit_text[0] < '1' || connection_limit_text[0] > '4' ||
+			connection_limit_text[1] != '\0')) return -1;
+		if (server->upstream_round_robin) {
+			if (!server->quota_group[0]) return -1;
+			if (!server->max_upstream_connections) server->max_upstream_connections = 2;
+		} else if (server->max_upstream_connections) return -1;
 	}
 	if (server->query_burst && !server->max_query_rate) return -1;
 	if (server->max_query_rate && !server->query_burst) server->query_burst = 1;
@@ -340,7 +435,7 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 			if (strcmp(other->quota_group, server->quota_group) == 0 &&
 				(other->max_query_rate != server->max_query_rate || other->query_burst != server->query_burst ||
 				 other->upstream_round_robin != server->upstream_round_robin ||
-				 other->max_upstream_connections != server->max_upstream_connections)) {
+				 (server->upstream_round_robin && other->max_upstream_connections != server->max_upstream_connections))) {
 				tlog(TLOG_ERROR, "conflicting rate/burst/round-robin/connection limit for quota group %s", server->quota_group);
 				return -1;
 			}
@@ -361,7 +456,7 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 			safe_strncpy(server->httphost, server->server, DNS_MAX_CNAME_LEN);
 		}
 
-		if (host_ip[0] != '\0') {
+		if (host_ip && !server->upstream_ip_pool) {
 			safe_strncpy(server->server, host_ip, DNS_MAX_IPLEN);
 		}
 	}

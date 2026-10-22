@@ -7,7 +7,7 @@ VER="`date +"1.%Y.%m.%d-%H%M"`"
 CODE_DIR="$CURR_DIR/.."
 IS_BUILD_SMARTDNS=1
 OUTPUTDIR=$CURR_DIR
-SMARTDNS_WEBUI_URL="https://github.com/pymumu/smartdns-webui/archive/refs/heads/main.zip"
+. "$CURR_DIR/webui/source.conf"
 SMARTDNS_WEBUI_SOURCE="$WORKDIR/smartdns-webui"
 SMARTDNS_STATIC_DIR="$WORKDIR/smartdns-static"
 SMARTDNS_WITH_LIBS=0
@@ -282,59 +282,30 @@ build_smartdns()
 
 build_webpages()
 {
-	if [ ! -f "$WORKDIR/smartdns-webui.zip" ]; then
-		echo "smartdns-webui source not found, downloading..."
-		wget -O $WORKDIR/smartdns-webui.zip $SMARTDNS_WEBUI_URL
-		if [ $? -ne 0 ]; then
-			echo "Failed to download smartdns-webui source at $SMARTDNS_WEBUI_URL"
+	mkdir -p "$WORKDIR" || return 1
+	WEBUI_ARCHIVE="$WORKDIR/smartdns-webui-$SMARTDNS_WEBUI_COMMIT.tar.gz"
+	if [ ! -f "$WEBUI_ARCHIVE" ]; then
+		WEBUI_DOWNLOAD=$(mktemp "$WORKDIR/.webui-download.XXXXXX") || return 1
+		if ! wget -O "$WEBUI_DOWNLOAD" "$SMARTDNS_WEBUI_URL" ||
+		   ! printf '%s  %s\n' "$SMARTDNS_WEBUI_SHA256" "$WEBUI_DOWNLOAD" | sha256sum -c -; then
+			rm -f "$WEBUI_DOWNLOAD"
 			return 1
 		fi
+		mv "$WEBUI_DOWNLOAD" "$WEBUI_ARCHIVE" || return 1
 	fi
-
-	if [ ! -d "$SMARTDNS_WEBUI_SOURCE" ]; then
-		echo "smartdns-webui source not found, unzipping..."
-		unzip -q $WORKDIR/smartdns-webui.zip -d $WORKDIR
-		if [ $? -ne 0 ]; then
-			echo "Failed to unzip smartdns-webui source."
-			return 1
-		fi
-		mv $WORKDIR/smartdns-webui-main $SMARTDNS_WEBUI_SOURCE
-		if [ $? -ne 0 ]; then
-			echo "Failed to rename smartdns-webui directory."
-			return 1
-		fi
-	fi
-
-	if [ ! -d "$SMARTDNS_WEBUI_SOURCE" ]; then
-		echo "smartdns-webui source not found."
+	# Always validate cached archive and rebuild a clean source. An existing
+	# out/index.html is not evidence of the pinned source or the local patch.
+	WEBUI_BUILD=$(mktemp -d "$WORKDIR/webui-build.XXXXXX") || return 1
+	if ! "$CURR_DIR/webui/prepare-source.sh" "$WEBUI_ARCHIVE" "$WEBUI_BUILD/source" ||
+	   ! npm ci --prefix "$WEBUI_BUILD/source" ||
+	   ! npm run build --prefix "$WEBUI_BUILD/source"; then
+		rm -rf "$WEBUI_BUILD"
 		return 1
 	fi
-
-	if [ ! -f "$SMARTDNS_WEBUI_SOURCE/package.json" ]; then
-		echo "smartdns-webui source is not valid."
-		return 1
-	fi
-
-	if [ -f "$SMARTDNS_WEBUI_SOURCE/out/index.html" ]; then
-		echo "smartdns-webui already built, skipping build."
-		return 0
-	fi
-
-	echo "Building smartdns-webui..."
-	npm install --prefix $SMARTDNS_WEBUI_SOURCE
-	if [ $? -ne 0 ]; then
-		echo "Failed to install smartdns-webui dependencies."
-		return 1
-	fi
-
-	npm run build --prefix $SMARTDNS_WEBUI_SOURCE
-	if [ $? -ne 0 ]; then
-		echo "Failed to build smartdns-webui."
-		return 1
-	fi
-
+	rm -rf "$SMARTDNS_WEBUI_SOURCE"
+	mv "$WEBUI_BUILD/source" "$SMARTDNS_WEBUI_SOURCE" || return 1
+	rmdir "$WEBUI_BUILD"
 	echo "smartdns-webui build completed."
-
 	return 0
 }
 

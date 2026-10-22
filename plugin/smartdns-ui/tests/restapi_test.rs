@@ -715,3 +715,90 @@ fn test_rest_api_cache_domains() {
         assert!(domain.get("ttl_remaining").is_some());
     }
 }
+
+#[test]
+fn test_rest_api_service_pool_configuration_and_backend_identity() {
+    let mut server = common::TestServer::new();
+    server.enable_mock_server();
+    server.add_mock_server_conf("server-https",
+        "https://resolver.example/dns-query -upstream-ip-pool -host-ip 127.0.0.1,127.0.0.2 -max-upstream-backends 4");
+    server.add_mock_server_conf("server-https",
+        "https://second.example/dns-query -upstream-ip-pool -host-ip 127.0.0.3,127.0.0.4");
+    // Same transport and authority, but a distinct path/security identity must
+    // stay a separate logical row with a distinct stable service ID.
+    server.add_mock_server_conf("server-https",
+        "https://resolver.example/alternate -upstream-ip-pool -host-ip 127.0.0.5,127.0.0.6");
+    server.add_mock_server_conf("server", "127.0.0.9:5309");
+    assert!(server.start().is_ok());
+    let mut client = common::TestClient::new(&server.get_host());
+    assert!(client.login("admin", "password").is_ok());
+    // The fixture starts the real core on a thread; wait for its configuration
+    // publication, not a timing-dependent fixed sleep.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let rows = loop {
+        let (code, body) = client.get("/api/upstream-server").unwrap();
+        assert_eq!(code, 200);
+        let rows = http_api_msg::api_msg_parse_upstream_server_list(&body).unwrap();
+        if rows.iter().filter(|row| row.service.as_ref().map(|v| v.pool_enabled).unwrap_or(false)).count() == 3 {
+            if let Ok(path) = std::env::var("SMARTDNS_SERVICE_API_EVIDENCE") {
+                std::fs::write(path, &body).unwrap();
+            }
+            break rows;
+        }
+        assert!(std::time::Instant::now() < deadline, "core did not publish configured service");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let pools: Vec<_> = rows.iter().filter(|row| row.service.as_ref().map(|v| v.pool_enabled).unwrap_or(false)).collect();
+    assert_eq!(pools.len(), 3, "three configured services must not become six IP rows");
+    for pool in &pools {
+        let details = pool.service.as_ref().unwrap();
+        assert_eq!(details.freshness_status, "non_expiring");
+        assert_eq!(details.freshness_remaining_ms, None);
+    }
+    let ids: std::collections::HashSet<_> = pools.iter()
+        .map(|row| &row.service.as_ref().unwrap().service_id).collect();
+    assert_eq!(ids.len(), 3, "same-protocol/same-authority rows need distinct keys");
+    assert_eq!(rows.len(), 4);
+    let ordinary = rows.iter().find(|row| row.ip == "127.0.0.9").unwrap();
+    assert!(!ordinary.service.as_ref().unwrap().pool_enabled);
+    assert_eq!(ordinary.service.as_ref().unwrap().freshness_status, "not_applicable");
+    assert_eq!(ordinary.service.as_ref().unwrap().freshness_remaining_ms, None);
+    assert_eq!(ordinary.service.as_ref().unwrap().stats_semantics, "legacy-endpoint-v1");
+    assert_eq!(ordinary.port, 5309);
+    let row = pools.iter().find(|row| row.host == "resolver.example"
+        && row.service.as_ref().unwrap().config_identity.path == "/dns-query").unwrap();
+    assert_eq!(row.host, "resolver.example");
+    assert!(row.ip.is_empty());
+    let details = row.service.as_ref().unwrap();
+    assert_eq!(details.stats_semantics, "service-v1");
+    assert_eq!(details.endpoint_count, 2);
+    assert_eq!(details.endpoint_ips, vec!["127.0.0.1", "127.0.0.2"]);
+    assert_eq!(details.backend_cap, 4);
+    assert_eq!(details.connection_cap, 2, "unspecified connections follows actual members, not cap");
+    let (code, body) = client.get(&format!("/api/upstream-server/{}/backends", details.service_id)).unwrap();
+    assert_eq!(code, 200);
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["backend_list"].as_array().unwrap().len(), 2);
+    let (code, _) = client.get("/api/upstream-server/not-an-id/backends").unwrap();
+    assert_eq!(code, 400);
+    // The historical helper's set_with_auth_header argument actually sets
+    // no_auth_header; use a genuinely fresh unauthenticated client instead.
+    let anonymous = common::TestClient::new(&server.get_host());
+    let (code, _) = anonymous.get(&format!("/api/upstream-server/{}/backends", details.service_id)).unwrap();
+    assert_eq!(code, 401);
+}
+
+#[test]
+fn test_rest_api_drop_counter_reports_accumulated_value() {
+    let mut server = common::TestServer::new();
+    assert!(server.start().is_ok());
+    let stats = server.get_data_server().get_stat();
+    stats.add_request_drop(2);
+    stats.add_request_drop(3);
+    let mut client = common::TestClient::new(&server.get_host());
+    assert!(client.login("admin", "password").is_ok());
+    let (code, body) = client.get("/api/stats/metrics").unwrap();
+    assert_eq!(code, 200);
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["request_drop_count"], 5);
+}

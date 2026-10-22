@@ -40,6 +40,7 @@
 #include "proxy.h"
 #include "query.h"
 #include "upstream_policy.h"
+#include "upstream_service.h"
 #include "server_info.h"
 #include "wake_event.h"
 
@@ -160,6 +161,7 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 		return 0;
 	}
 
+    _dns_attempt_response_sample(query, server_info);
 	_dns_attempt_retire(query, server_info, 0);
 	request_num = atomic_read(&query->dns_request_sent);
 	if (request_num < 0) {
@@ -173,6 +175,8 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 		ret = query->callback(query->domain, DNS_QUERY_RESULT, server_info, packet, inpacket, inpacket_len,
 							  query->user_ptr);
 
+        _dns_service_query_result(query, server_info, ret == DNS_CLIENT_ACTION_OK &&
+            (packet->head.rcode == DNS_RC_NOERROR || packet->head.rcode == DNS_RC_NXDOMAIN));
 		if (ret == DNS_CLIENT_ACTION_RETRY || ret == DNS_CLIENT_ACTION_DROP) {
 			/* remove this result */
 			_dns_replied_check_remove(query, server_info);
@@ -284,11 +288,26 @@ static int _dns_client_send_one_packet(struct dns_server_info *server_info, stru
 
 	while (1) {
 		switch (server_info->type) {
-		case DNS_SERVER_UDP:
-			/* udp query */
-			ret = _dns_client_send_udp(server_info, packet_data, packet_data_len);
-			send_err = errno;
-			break;
+        case DNS_SERVER_UDP: {
+            unsigned generation = _dns_attempt_generation(query, server_info);
+            if (server_info->service && _dns_attempt_wire_begin(query, server_info, generation) != DNS_ADMIT_OK) {
+                _dns_attempt_retire(query, server_info, generation); return -1;
+            }
+            ret = _dns_client_send_udp(server_info, packet_data, packet_data_len);
+            send_err = errno;
+            if (server_info->service) {
+                if (!ret) _dns_attempt_mark_sent(query, server_info, generation);
+                else {
+                    /* Datagram failure leaves no buffered owner. Revoke this
+                     * lease, but do not self-feed a new turn on socket pressure. */
+                    if (send_err == EAGAIN || send_err == EWOULDBLOCK)
+                        __atomic_store_n(&server_info->service->next_eligible,
+                            get_tick_count() + 100, __ATOMIC_RELEASE);
+                    _dns_service_write_result(query, server_info, generation, 0, 0);
+                }
+            }
+            break;
+        }
 		case DNS_SERVER_TCP:
 			/* tcp query */
 			ret = _dns_client_send_framed(server_info, query, packet_data, packet_data_len);
@@ -338,6 +357,7 @@ static int _dns_client_send_one_packet(struct dns_server_info *server_info, stru
 			case EOPNOTSUPP: {
 				tlog(TLOG_DEBUG, "send query to %s failed, %s, type: %d", server_info->ip, strerror(send_err),
 					 server_info->type);
+                _dns_service_endpoint_failure(server_info);
 				_dns_client_close_socket(server_info);
                 /* Reconnect is scheduled through the same admission path. */
 				_dns_attempt_retire(query, server_info, 0);
@@ -351,7 +371,9 @@ static int _dns_client_send_one_packet(struct dns_server_info *server_info, stru
 				 server_info->type);
 			time_t now = 0;
 			time(&now);
-			if (now - 10 > server_info->last_recv || send_err != ENOMEM) {
+			if (server_info->service) {
+                if (send_err != EAGAIN && send_err != EWOULDBLOCK) _dns_service_endpoint_failure(server_info);
+            } else if (now - 10 > server_info->last_recv || send_err != ENOMEM) {
 				server_info->prohibit = 1;
 			}
 
@@ -365,81 +387,70 @@ static int _dns_client_send_one_packet(struct dns_server_info *server_info, stru
 	return 0;
 }
 
-struct rr_dispatch_context {
+struct service_dispatch_context {
     struct dns_query_struct *query;
     unsigned long now;
     int pass;
 };
-static int _dns_client_rr_eligible(struct dns_server_info *server, void *opaque)
+static int _dns_client_service_eligible(struct dns_server_info *server, void *opaque)
 {
-    struct rr_dispatch_context *ctx = opaque;
+    struct service_dispatch_context *ctx = opaque;
     if (!ctx->pass && server->flags.fallback && ctx->now - ctx->query->created_tick < DNS_QUERY_TIMEOUT) return 0;
+    if (server->service) return _dns_service_endpoint_eligible(server, ctx->now);
     pthread_mutex_lock(&server->lock);
     int eligible = !_dns_client_check_server_prohibit(server, ctx->pass ? 5 : 60);
     pthread_mutex_unlock(&server->lock);
     return eligible;
 }
-/* RR-containing groups take a pinned membership snapshot, then drop the global
- * list lock before health checks, socket setup, or transport IO. Legacy-only
- * groups continue down the original fanout path unchanged. */
-static int _dns_client_send_packet_rr(struct dns_query_struct *query, void *packet, int len,
-                                      struct dns_server_group *group, unsigned long now)
+/* A routing group contains logical services, not their endpoint declarations.
+ * Configuration bounds groups to DNS_MAX_SERVERS. Stack snapshots avoid allocating
+ * under the global registry lock or per deferred scheduler tick. */
+static int _dns_client_send_packet_services(struct dns_query_struct *query, void *packet, int len,
+    struct dns_server_group *group, unsigned long now)
 {
+    struct { struct dns_upstream_service *service; struct dns_server_info *server; } targets[DNS_MAX_SERVERS];
+    unsigned count = 0;
     struct dns_server_group_member *member;
-    unsigned int count = 0, at = 0;
-    list_for_each_entry(member, &group->head, list) count++;
-    struct dns_server_info **servers = calloc(count ? count : 1, sizeof(*servers));
-    if (servers) {
-        list_for_each_entry(member, &group->head, list) {
-            servers[at++] = member->server;
-            dns_client_server_info_get(member->server);
-        }
+    list_for_each_entry(member, &group->head, list) {
+        if (count == DNS_MAX_SERVERS) break;
+        targets[count].service = member->service; targets[count].server = member->server;
+        if (member->service) _dns_service_get(member->service);
+        else dns_client_server_info_get(member->server);
+        count++;
     }
     pthread_mutex_unlock(&client.server_list_lock);
-    if (!servers) { query->next_send_tick = now + 100; return 0; }
     unsigned char buffer[DNS_IN_PACKSIZE];
-    int sent = 0;
+    unsigned sent = 0;
     atomic_inc(&query->dns_request_sent);
-    struct rr_dispatch_context ctx = {.query = query, .now = now};
-    for (ctx.pass = 0; ctx.pass < 2 && !sent; ctx.pass++) {
-        for (unsigned int i = 0; i < count; i++) {
-            struct dns_server_info *server = servers[i];
-            if (server->flags.upstream_round_robin) {
-                unsigned int previous;
-                for (previous = 0; previous < i; previous++)
-                    if (servers[previous]->policy == server->policy) break;
-                if (previous < i) continue; /* one dispatch per logical service */
-                server = _dns_policy_rr_begin(query, servers, count, server, _dns_client_rr_eligible, &ctx);
-                if (!server) continue;
-            } else {
-                if (!_dns_client_rr_eligible(server, &ctx) || _dns_attempt_begin(query, server) != DNS_ADMIT_OK) continue;
-            }
-            /* Snapshot dispatch also includes legacy members in a mixed group.
-             * Serialize the check and creation for every endpoint, not only RR. */
-            pthread_mutex_lock(&server->lock);
-            int socket_result = server->fd < 0 ? _dns_client_create_socket(server) : 0;
-            int socket_errno = errno;
-            if (socket_result != 0 && socket_errno != EAGAIN) server->prohibit = 1;
-            pthread_mutex_unlock(&server->lock);
-            if (socket_result != 0) {
+    struct service_dispatch_context ctx = {.query = query, .now = now, .pass = 0};
+    for (unsigned i = 0; i < count; i++) {
+        struct dns_server_info *server = targets[i].server;
+        if (targets[i].service) {
+            server = _dns_service_select(targets[i].service, query, _dns_client_service_eligible, &ctx);
+            if (!server) continue;
+        } else if (!_dns_client_service_eligible(server, &ctx) || _dns_attempt_begin(query, server) != DNS_ADMIT_OK) continue;
+        _dns_service_prepare_connection(server);
+        pthread_mutex_lock(&server->lock);
+        int socket_result = server->fd < 0 ? _dns_client_create_socket(server) : 0;
+        int socket_errno = errno;
+        pthread_mutex_unlock(&server->lock);
+        if (socket_result) {
+            if (server->service && socket_errno != EAGAIN) _dns_service_endpoint_failure(server);
+            _dns_attempt_retire(query, server, 0);
+        } else {
+            void *data = NULL; int data_len = 0;
+            if (_dns_client_setup_server_packet(server, query, packet, len, buffer, &data, &data_len))
                 _dns_attempt_retire(query, server, 0);
-                continue;
-            }
-            void *data = NULL;
-            int data_len = 0;
-            if (_dns_client_setup_server_packet(server, query, packet, len, buffer, &data, &data_len)) {
-                _dns_attempt_retire(query, server, 0);
-                continue;
-            }
-            if (_dns_client_send_one_packet(server, query, data, data_len) == 0) {
-                sent++;
-                if (query->single_upstream) break;
-            }
+            else if (!_dns_client_send_one_packet(server, query, data, data_len)) sent++;
         }
+        if (targets[i].service) dns_client_server_info_release(server);
+        if (sent && query->single_upstream) break;
     }
     atomic_dec(&query->dns_request_sent);
-    for (unsigned int i = 0; i < count; i++) dns_client_server_info_release(servers[i]);
-    free(servers);
+    for (unsigned i = 0; i < count; i++) {
+        if (targets[i].service) _dns_service_put(targets[i].service);
+        else dns_client_server_info_release(targets[i].server);
+    }
     query->next_send_tick = now + 100;
     return 0;
 }
@@ -455,16 +466,24 @@ int _dns_client_send_packet(struct dns_query_struct *query, void *packet, int le
 	/* Preserve configured group fanout. Admission only suppresses the affected endpoint. */
 	pthread_mutex_lock(&client.server_list_lock);
 	struct dns_server_group *group = query->server_group;
-	if (now - query->created_tick >= (DNS_QUERY_RETRY - 1) * DNS_QUERY_TIMEOUT) {
+	if (!query->bootstrap_only && now - query->created_tick >= (DNS_QUERY_RETRY - 1) * DNS_QUERY_TIMEOUT) {
 		struct dns_server_group *fallback = _dns_client_get_group("fallback");
 		if (fallback) group = fallback;
 	}
-    if (group->round_robin_members) {
-        return _dns_client_send_packet_rr(query, packet, len, group, now);
-    }
+    if (group->service_members) return _dns_client_send_packet_services(query, packet, len, group, now);
 	atomic_inc(&query->dns_request_sent); /* protect against reentrant completion */
+    unsigned bootstrap_count = 0, bootstrap_selected = 0;
+    if (query->bootstrap_only && query->single_upstream) {
+        list_for_each_entry(member, &group->head, list) bootstrap_count++;
+        if (bootstrap_count) bootstrap_selected = query->bootstrap_cursor++ % bootstrap_count;
+    }
 	for (int pass = 0; pass < 2 && sent == 0; pass++) {
+        unsigned bootstrap_index = 0;
 		list_for_each_entry(member, &group->head, list) {
+            /* Only the validated bootstrap group participates. A successful UDP
+             * send is not a successful resolution: rotate on the next bounded
+             * retry so a silent head cannot starve another configured resolver. */
+            if (bootstrap_count && bootstrap_index++ != bootstrap_selected) continue;
 			struct dns_server_info *server_info = member->server;
 			void *data = NULL;
 			int data_len = 0;
@@ -548,19 +567,31 @@ int dns_client_query(const char *domain, int qtype, dns_client_callback callback
 	query->next_send_tick = query->created_tick;
 	query->single_upstream = !!(options->enable_flag & DNS_QUEY_OPTION_SINGLE_UPSTREAM);
 	query->checking_disabled = !!(options->enable_flag & DNS_QUEY_OPTION_CD);
+    query->bootstrap_only = !!(options->enable_flag & DNS_QUEY_OPTION_BOOTSTRAP_ONLY);
 	if (options->enable_flag & DNS_QUEY_OPTION_BUDGET) {
 		query->budget = options->budget;
 		dns_query_budget_get(query->budget);
 	}
 	query->has_result = 0;
-	query->server_group = _dns_client_get_dnsserver_group(group_name);
+	query->server_group = query->bootstrap_only ? _dns_client_get_group("bootstrap-dns") :
+        _dns_client_get_dnsserver_group(group_name);
+    if (query->bootstrap_only && (!query->server_group || list_empty(&query->server_group->head) ||
+        query->server_group->service_members)) goto errout;
+    if (query->bootstrap_only)
+        query->bootstrap_cursor = (options->enable_flag & DNS_QUEY_OPTION_BOOTSTRAP_START) ? options->bootstrap_start :
+            __atomic_fetch_add(&query->server_group->bootstrap_query_sequence, 1, __ATOMIC_RELAXED);
 	if (query->server_group == NULL) {
 		tlog(TLOG_ERROR, "get dns server group %s failed.", group_name);
 		goto errout;
 	}
 
     if (!query->budget) {
-        query->budget = dns_client_query_budget_new(group_name);
+        if (query->bootstrap_only) {
+            unsigned count = 0;
+            struct dns_server_group_member *member;
+            list_for_each_entry(member, &query->server_group->head, list) count++;
+            query->budget = dns_query_budget_new(count * DNS_QUERY_RETRY, DNS_QUERY_RETRY * DNS_QUERY_TIMEOUT);
+        } else query->budget = dns_client_query_budget_new(group_name);
         if (!query->budget) goto errout;
     }
 
@@ -686,10 +717,10 @@ static void _dns_client_period_run(unsigned int msec)
             !server->http2_write_owner) continue;
         if (server->type == DNS_SERVER_HTTPS) {
             if (!strncmp(server->alpn_selected, "h2", 2)) {
-                if (_dns_client_http2_process_write(server) < 0) _dns_client_close_socket(server);
-            } else if (!server->send_buff.len && _dns_client_process_stream_writes(server) < 0) _dns_client_close_socket(server);
+                if (_dns_client_http2_process_write(server) < 0) { _dns_service_endpoint_failure(server); _dns_client_close_socket(server); }
+            } else if (!server->send_buff.len && _dns_client_process_stream_writes(server) < 0) { _dns_service_endpoint_failure(server); _dns_client_close_socket(server); }
         } else if (server->type == DNS_SERVER_TCP || server->type == DNS_SERVER_TLS) {
-            if (_dns_client_process_stream_writes(server) < 0) _dns_client_close_socket(server);
+            if (_dns_client_process_stream_writes(server) < 0) { _dns_service_endpoint_failure(server); _dns_client_close_socket(server); }
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
         } else if (server->type == DNS_SERVER_QUIC || server->type == DNS_SERVER_HTTP3) {
             struct epoll_event event = {.events = EPOLLOUT};
@@ -703,6 +734,19 @@ static void _dns_client_period_run(unsigned int msec)
 	if (msec % 10 == 0) {
 		_dns_client_period_run_second();
 	}
+}
+
+void _dns_client_event_batch_pin(struct epoll_event *events, int count)
+{
+    for (int i = 0; i < count; i++)
+        if (events[i].data.fd != client.fd_wakeup && events[i].data.ptr)
+            dns_client_server_info_get(events[i].data.ptr);
+}
+void _dns_client_event_batch_unpin(struct epoll_event *events, int count)
+{
+    for (int i = 0; i < count; i++)
+        if (events[i].data.fd != client.fd_wakeup && events[i].data.ptr)
+            dns_client_server_info_release(events[i].data.ptr);
 }
 
 static void *_dns_client_work(void *arg)
@@ -723,6 +767,7 @@ static void *_dns_client_work(void *arg)
 
 	while (atomic_read(&client.run)) {
 		now = get_tick_count();
+        _dns_services_run_due(now);
 
 		if (now >= expect_time) {
 			unsigned long elapsed_from_start = now - start_time;
@@ -752,12 +797,19 @@ static void *_dns_client_work(void *arg)
 			sleep_time = 0;
 		}
 
+        unsigned long service_due = _dns_services_next_deadline();
+        if (service_due <= now) sleep_time = 0;
+        else if (service_due - now < (unsigned long)sleep_time) sleep_time = service_due - now;
 		num = epoll_wait(client.epoll_fd, events, DNS_MAX_EVENTS, sleep_time);
 		if (num < 0) {
 			usleep(100000);
 			continue;
 		}
 
+        /* epoll returns borrowed pointers for the whole batch. Bootstrap/TTL
+         * callbacks can revoke later entries, so pin every endpoint before any
+         * callback or timer runs, not only when its individual event is reached. */
+        _dns_client_event_batch_pin(events, num);
 		for (i = 0; i < num; i++) {
 			struct epoll_event *event = &events[i];
 			struct dns_server_info *server_info = (struct dns_server_info *)event->data.ptr;
@@ -778,8 +830,18 @@ static void *_dns_client_work(void *arg)
 				continue;
 			}
 
-			_dns_client_process(server_info, event, now);
+            _dns_services_run_due(get_tick_count());
+            pthread_mutex_lock(&server_info->lock);
+            int live_event = server_info->fd >= 0 &&
+                (!server_info->service || !__atomic_load_n(&server_info->service_revoked, __ATOMIC_ACQUIRE) ||
+                    server_info->active_attempts);
+            pthread_mutex_unlock(&server_info->lock);
+            if (live_event && _dns_client_process(server_info, event, now) < 0 && server_info->service &&
+                !_dns_policy_service_cooldown(server_info->service, get_tick_count()))
+                _dns_service_endpoint_failure(server_info);
+            _dns_services_flush_pending();
 		}
+        _dns_client_event_batch_unpin(events, num);
 	}
 
 	close(client.epoll_fd);
@@ -891,11 +953,13 @@ void dns_client_exit(void)
 	}
 
 	/* free all resources */
+    _dns_services_stop();
 	_dns_client_close_wakeup_event();
 	_dns_client_remove_all_pending_servers();
 	_dns_client_server_remove_all();
 	_dns_client_query_remove_all();
 	_dns_client_group_remove_all();
+    _dns_services_remove_all();
 
 	pthread_mutex_destroy(&client.server_list_lock);
 	pthread_mutex_destroy(&client.domain_map_lock);

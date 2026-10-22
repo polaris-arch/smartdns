@@ -14,11 +14,11 @@ PKG_SOURCE_URL:=https://www.github.com/pymumu/smartdns.git
 PKG_SOURCE_VERSION:=64fc9f20fba0e14cb118fe7f145557971cafd858
 PKG_MIRROR_HASH:=skip
 
-SMARTDNS_WEBUI_VERSION:=1.0.0
-SMAETDNS_WEBUI_SOURCE_PROTO:=git
-SMARTDNS_WEBUI_SOURCE_URL:=https://github.com/pymumu/smartdns-webui.git
-SMARTDNS_WEBUI_SOURCE_VERSION:=35cbf4a1940f5dd32670c69bd5cc02437ad073e7
-SMARTDNS_WEBUI_FILE:=smartdns-webui-$(SMARTDNS_WEBUI_VERSION).tar.gz
+# Must match package/webui/source.conf; preparation verifies this archive again.
+SMARTDNS_WEBUI_SOURCE_VERSION:=1c06fee693434ec7c71f06010d3f87416baba9f0
+SMARTDNS_WEBUI_SOURCE_URL:=https://codeload.github.com/pymumu/smartdns-webui/tar.gz
+SMARTDNS_WEBUI_HASH:=7a698dd4826750869429e83d91ce99a4e474d0809588a7f4124ef86875be9b1f
+SMARTDNS_WEBUI_FILE:=smartdns-webui-$(SMARTDNS_WEBUI_SOURCE_VERSION).tar.gz
 
 PKG_MAINTAINER:=Nick Peng <pymumu@gmail.com>
 PKG_LICENSE:=GPL-3.0-or-later
@@ -99,7 +99,9 @@ endef
 
 define Build/Compile/smartdns-webui
 	which npm || (echo "npm not found, please install npm first" && exit 1)
-	npm install --prefix $(PKG_BUILD_DIR)/smartdns-webui/
+	rm -rf "$(PKG_BUILD_DIR)/smartdns-webui"
+	$(PKG_BUILD_DIR)/package/webui/prepare-source.sh "$(DL_DIR)/$(SMARTDNS_WEBUI_FILE)" "$(PKG_BUILD_DIR)/smartdns-webui"
+	npm ci --prefix $(PKG_BUILD_DIR)/smartdns-webui/
 	npm run build --prefix $(PKG_BUILD_DIR)/smartdns-webui/
 endef
 
@@ -113,21 +115,12 @@ endef
 
 define Download/smartdns-webui
 	FILE:=$(SMARTDNS_WEBUI_FILE)
-	PROTO:=$(SMAETDNS_WEBUI_SOURCE_PROTO)
 	URL:=$(SMARTDNS_WEBUI_SOURCE_URL)
-	MIRROR_HASH:=b3f4f73b746ee169708f6504c52b33d9bbeb7c269b731bd7de4f61d0ad212d74
-	VERSION:=$(SMARTDNS_WEBUI_SOURCE_VERSION)
+	URL_FILE:=$(SMARTDNS_WEBUI_SOURCE_VERSION)
 	HASH:=$(SMARTDNS_WEBUI_HASH)
-	SUBDIR:=smartdns-webui
 endef
 $(eval $(call Download,smartdns-webui))
 
-ifdef CONFIG_PACKAGE_smartdns-ui
-define Build/Prepare
-	$(call Build/Prepare/Default)
-	$(TAR) -C $(PKG_BUILD_DIR)/ -xf $(DL_DIR)/$(SMARTDNS_WEBUI_FILE)
-endef
-endif
 
 define Build/Compile
 	$(call Build/Compile/Default,smartdns)

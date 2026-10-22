@@ -167,3 +167,44 @@ errout:
 	tlog(TLOG_ERROR, "add server failed, host-ip: %s, type: %d", host_ip, type);
 	return -1;
 }
+
+int dns_server_listener_match(int family, const unsigned char *address, int port, int datagram)
+{
+    int match = 0;
+    if (!server.conn_list.next) return 0; /* no server initialized (isolated client tests) */
+    pthread_mutex_lock(&server.conn_list_lock);
+    struct dns_server_conn_head *conn;
+    list_for_each_entry(conn, &server.conn_list, list) {
+        int udp = conn->type == DNS_CONN_TYPE_UDP_SERVER;
+        int stream = conn->type == DNS_CONN_TYPE_TCP_SERVER || conn->type == DNS_CONN_TYPE_TLS_SERVER ||
+            conn->type == DNS_CONN_TYPE_HTTPS_SERVER || conn->type == DNS_CONN_TYPE_HTTP_SERVER;
+        if ((!udp && !stream) || udp != !!datagram || conn->fd < 0) continue;
+        struct sockaddr_storage bound = {0}; socklen_t size = sizeof(bound);
+        if (getsockname(conn->fd, (struct sockaddr *)&bound, &size)) continue;
+        unsigned char listener[16]; int listener_family = bound.ss_family, listener_port;
+        if (listener_family == AF_INET) {
+            struct sockaddr_in *a = (void *)&bound;
+            listener_port = ntohs(a->sin_port); memcpy(listener, &a->sin_addr, 4);
+        } else if (listener_family == AF_INET6) {
+            struct sockaddr_in6 *a = (void *)&bound;
+            listener_port = ntohs(a->sin6_port); memcpy(listener, &a->sin6_addr, 16);
+            if (IN6_IS_ADDR_V4MAPPED(&a->sin6_addr)) {
+                memmove(listener, listener + 12, 4); listener_family = AF_INET;
+            }
+        } else continue;
+        if (listener_port != port) continue;
+        const unsigned char zero[16] = {0};
+        int wildcard = !memcmp(listener, zero, listener_family == AF_INET ? 4 : 16);
+        if (!wildcard && family == listener_family && !memcmp(address, listener, family == AF_INET ? 4 : 16)) {
+            match = 1; break;
+        }
+        if (!wildcard || (listener_family == AF_INET && family != AF_INET)) continue;
+        if (listener_family == AF_INET6 && family == AF_INET) {
+            int v6only = 1; socklen_t len = sizeof(v6only);
+            if (getsockopt(conn->fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &len) || v6only) continue;
+        }
+        match = 2;
+    }
+    pthread_mutex_unlock(&server.conn_list_lock);
+    return match;
+}

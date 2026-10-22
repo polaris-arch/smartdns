@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 
 #include "smartdns/smartdns.h"
+#include "smartdns/upstream_service.h"
 
 #include "smartdns/lib/art.h"
 #include "smartdns/lib/atomic.h"
@@ -124,6 +125,7 @@ static void _show_version(void)
 	char str_ver[256] = {0};
 	_smartdns_get_version(str_ver, sizeof(str_ver));
 	printf("smartdns %s\n", str_ver);
+    printf("features: smartdns-upstream-service-pool-v1\n");
 }
 
 static int _smartdns_load_from_resolv_file(const char *resolv_file)
@@ -189,6 +191,7 @@ static int _smartdns_load_from_default_resolv(void)
 static int _smartdns_prepare_server_flags(struct client_dns_server_flags *flags, struct dns_servers *server)
 {
 	memset(flags, 0, sizeof(*flags));
+    if (server->upstream_ip_pool) flags->service_config_id = (unsigned)(server - dns_conf.servers) + 1;
 	switch (server->type) {
 	case DNS_SERVER_UDP: {
 		struct client_dns_server_flag_udp *flag_udp = &flags->udp;
@@ -276,14 +279,23 @@ static int _smartdns_add_servers(void)
 	struct client_dns_server_flags flags;
 
 	for (i = 0; i < (unsigned int)dns_conf.server_num; i++) {
+		if (dns_conf.servers[i].pool_compat_skip) continue;
 		if (_smartdns_prepare_server_flags(&flags, &dns_conf.servers[i]) != 0) {
 			tlog(TLOG_ERROR, "prepare server flags failed, %s:%d", dns_conf.servers[i].server,
 				 dns_conf.servers[i].port);
 			return -1;
 		}
 
-		ret = dns_client_add_server(dns_conf.servers[i].server, dns_conf.servers[i].port, dns_conf.servers[i].type,
-									&flags);
+		server = &dns_conf.servers[i];
+		if (server->upstream_ip_pool) {
+			struct dns_upstream_pool_config pool = {0};
+			pool.max_backends = server->max_upstream_backends;
+			pool.ip_count = server->pool_ip_count;
+			memcpy(pool.ips, server->pool_ips, sizeof(pool.ips));
+			ret = dns_client_add_service(server->server, server->port, server->type, &flags, &pool);
+		} else {
+			ret = dns_client_add_server(server->server, server->port, server->type, &flags);
+		}
 		if (ret != 0) {
 			tlog(TLOG_ERROR, "add server failed, %s:%d", dns_conf.servers[i].server, dns_conf.servers[i].port);
 			return -1;
@@ -300,7 +312,7 @@ static int _smartdns_add_servers(void)
 
 		for (j = 0; j < group->server_num; j++) {
 			server = group->servers[j];
-			if (server == NULL) {
+			if (server == NULL || server->pool_compat_skip) {
 				continue;
 			}
 
@@ -309,7 +321,10 @@ static int _smartdns_add_servers(void)
 				return -1;
 			}
 
-			ret = dns_client_add_to_group(group->group_name, server->server, server->port, server->type, &flags);
+			if (server->upstream_ip_pool)
+				ret = dns_client_add_service_to_group(group->group_name, server->server, server->port, server->type, &flags);
+			else
+				ret = dns_client_add_to_group(group->group_name, server->server, server->port, server->type, &flags);
 			if (ret != 0) {
 				tlog(TLOG_ERROR, "add server %s to group %s failed", server->server, group->group_name);
 				return -1;
@@ -317,7 +332,7 @@ static int _smartdns_add_servers(void)
 		}
 	}
 
-	return 0;
+	return dns_client_services_start();
 }
 
 static int _proxy_add_servers(void)

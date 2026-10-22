@@ -76,6 +76,10 @@ typedef enum dns_server_security_status {
 #define DNS_QUEY_OPTION_BUDGET (1 << 3)
 #define DNS_QUEY_OPTION_SINGLE_UPSTREAM (1 << 4)
 #define DNS_QUEY_OPTION_CD (1 << 5)
+/* Internal raw bootstrap isolation: no default/fallback routing or ECS. */
+#define DNS_QUEY_OPTION_BOOTSTRAP_ONLY (1 << 6)
+/* Internal per-discovery/family fair start; only honored with BOOTSTRAP_ONLY. */
+#define DNS_QUEY_OPTION_BOOTSTRAP_START (1 << 7)
 
 struct dns_query_budget;
 struct dns_query_budget *dns_query_budget_new(unsigned int max_attempts, unsigned int timeout_ms);
@@ -137,6 +141,7 @@ struct dns_query_options {
 	const char *conf_group_name;
 	/* Read only when DNS_QUEY_OPTION_BUDGET is set. */
 	struct dns_query_budget *budget;
+    unsigned int bootstrap_start; /* read only with BOOTSTRAP_START */
 };
 
 /* query domain */
@@ -190,6 +195,8 @@ struct client_dns_server_flags {
 	unsigned int query_burst;
 	unsigned int max_concurrent_queries;
 	unsigned int upstream_round_robin;
+    /* Load-local discriminator for separately declared pool services. Not identity material. */
+    unsigned int service_config_id;
 	unsigned int max_upstream_connections;
 	char quota_group[DNS_MAX_CNAME_LEN];
 	int drop_packet_latency_ms;

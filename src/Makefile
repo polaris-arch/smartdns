@@ -113,9 +113,11 @@ $(BIN) : $(MAIN_OBJ) $(SMARTDNS_LIB)
 	$(CC) $^ -o $@ $(LDFLAGS)
 
 $(SMARTDNS_TEST_LIB): $(TEST_OBJS)
+	$(RM) $@
 	$(AR) rcs $@ $^
 
 $(SMARTDNS_LIB): $(OBJS)
+	$(RM) $@
 	$(AR) rcs $@ $^
 
 clang-tidy-parallel:

@@ -27,6 +27,7 @@
 #include "group.h"
 #include "pending_server.h"
 
+#include "upstream_service.h"
 #include "smartdns/fast_ping.h"
 #include "smartdns/lib/stringutil.h"
 #include "smartdns/util.h"
@@ -156,6 +157,7 @@ static void _dns_client_server_free(struct dns_server_info *server_info)
 	_dns_client_server_close(server_info);
 	_dns_policy_detach(server_info);
 	pthread_mutex_destroy(&server_info->lock);
+    _dns_service_put(server_info->service);
 	free(server_info);
 }
 
@@ -182,7 +184,7 @@ void dns_client_server_info_release(struct dns_server_info *server_info)
 	_dns_client_server_free(server_info);
 }
 
-static void _dns_client_server_info_remove(struct dns_server_info *server_info)
+void _dns_client_server_info_remove(struct dns_server_info *server_info)
 {
 	if (server_info == NULL) {
 		return;
@@ -234,6 +236,7 @@ static int _dns_client_server_exist(const char *server_ip, int port, dns_server_
 	pthread_mutex_lock(&client.server_list_lock);
 	list_for_each_entry_safe(server_info, tmp, &client.dns_server_list, list)
 	{
+		if (server_info->service) continue;
 		if (server_info->port != port || server_info->type != server_type) {
 			continue;
 		}
@@ -283,6 +286,7 @@ struct dns_server_info *_dns_client_get_server(const char *server_ip, int port, 
 	pthread_mutex_lock(&client.server_list_lock);
 	list_for_each_entry_safe(server_info, tmp, &client.dns_server_list, list)
 	{
+		if (server_info->service) continue;
 		if (server_info->port != port || server_info->type != server_type) {
 			continue;
 		}
@@ -305,8 +309,9 @@ struct dns_server_info *_dns_client_get_server(const char *server_ip, int port, 
 }
 
 /* add dns server information */
-int _dns_client_server_add(const char *server_ip, const char *server_host, int port, dns_server_type_t server_type,
-						   struct client_dns_server_flags *flags)
+static int _dns_client_server_add_ext(const char *server_ip, const char *server_host, int port,
+    dns_server_type_t server_type, struct client_dns_server_flags *flags,
+    struct dns_upstream_service *service, struct dns_server_info **out)
 {
 	struct dns_server_info *server_info = NULL;
 	struct addrinfo *gai = NULL;
@@ -390,7 +395,7 @@ int _dns_client_server_add(const char *server_ip, const char *server_host, int p
 	}
 
 	/* if server exist, return */
-	if (_dns_client_server_exist(server_ip, port, server_type, flags) == 0) {
+	if (!service && _dns_client_server_exist(server_ip, port, server_type, flags) == 0) {
 		return 0;
 	}
 
@@ -412,6 +417,8 @@ int _dns_client_server_add(const char *server_ip, const char *server_host, int p
 
 	safe_strncpy(server_info->ip, server_ip, sizeof(server_info->ip));
 	server_info->port = port;
+    server_info->service = service;
+    _dns_service_get(service);
 	server_info->ai_family = gai->ai_family;
 	server_info->ai_addrlen = gai->ai_addrlen;
 	server_info->type = server_type;
@@ -505,7 +512,7 @@ int _dns_client_server_add(const char *server_ip, const char *server_host, int p
 	gai = NULL;
 
 	/* exclude this server from default group */
-	if ((server_info->flags.server_flag & SERVER_FLAG_EXCLUDE_DEFAULT) == 0) {
+	if (!service && (server_info->flags.server_flag & SERVER_FLAG_EXCLUDE_DEFAULT) == 0) {
 		if (_dns_client_add_to_group(DNS_SERVER_GROUP_DEFAULT, server_info) != 0) {
 			tlog(TLOG_ERROR, "add server %s to default group failed.", server_ip);
 			_dns_client_server_info_remove(server_info);
@@ -518,9 +525,9 @@ int _dns_client_server_add(const char *server_ip, const char *server_host, int p
 	}
 
 	tlog(TLOG_INFO, "add server %s:%d%s, type: %s", server_ip, port, ifname,
-		 _dns_server_get_type_string(server_info->type));
-
-	return 0;
+         _dns_server_get_type_string(server_info->type));
+    if (out) { dns_client_server_info_get(server_info); *out = server_info; }
+    return 0;
 errout:
 	if (server_info) {
 		if (server_info->ping_host) {
@@ -529,6 +536,7 @@ errout:
 
 		_dns_policy_detach(server_info);
 		pthread_mutex_destroy(&server_info->lock);
+        _dns_service_put(server_info->service);
 		free(server_info);
 	}
 
@@ -627,6 +635,7 @@ static int _dns_client_server_remove(const char *server_ip, int port, dns_server
 	pthread_mutex_lock(&client.server_list_lock);
 	list_for_each_entry_safe(server_info, tmp, &client.dns_server_list, list)
 	{
+		if (server_info->service) continue;
 		if (server_info->port != port || server_info->type != server_type) {
 			continue;
 		}
@@ -700,4 +709,14 @@ int dns_server_num(void)
 int dns_server_alive_num(void)
 {
 	return atomic_read(&client.dns_server_num) - atomic_read(&client.dns_server_prohibit_num);
+}
+
+int _dns_client_server_add(const char *ip, const char *host, int port, dns_server_type_t type,
+    struct client_dns_server_flags *flags)
+{ return _dns_client_server_add_ext(ip, host, port, type, flags, NULL, NULL); }
+int _dns_client_service_endpoint_add(struct dns_upstream_service *service, const char *ip,
+    struct dns_server_info **out)
+{
+    struct client_dns_server_flags flags = service->flags;
+    return _dns_client_server_add_ext(ip, service->host, service->port, service->type, &flags, service, out);
 }

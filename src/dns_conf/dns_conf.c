@@ -493,6 +493,175 @@ static void _dns_conf_auto_set_cache_size(void)
 	}
 }
 
+/* Translate only lossless legacy RR declarations into one runtime service. The
+ * complete configuration is validated before any declaration is changed. */
+struct pool_compat_plan {
+	int leader;
+	unsigned int count;
+	char ips[64][DNS_MAX_IPLEN];
+};
+
+static int _pool_group_contains(const struct dns_server_groups *g, const struct dns_servers *s)
+{
+	for (int i = 0; i < g->server_num; i++) if (g->servers[i] == s) return 1;
+	return 0;
+}
+
+static int _pool_same_group_sets(const struct dns_servers *a, const struct dns_servers *b)
+{
+	struct dns_server_groups *g;
+	unsigned long bucket;
+	hash_for_each(dns_group_table.group, bucket, g, node) {
+		if (_pool_group_contains(g, a) != _pool_group_contains(g, b)) return 0;
+	}
+	return 1;
+}
+
+static int _pool_is_bootstrap(const struct dns_servers *s)
+{
+	struct dns_server_groups *g;
+	unsigned long bucket;
+	hash_for_each(dns_group_table.group, bucket, g, node)
+		if (!strcmp(g->group_name, "bootstrap-dns") && _pool_group_contains(g, s)) return 1;
+	return 0;
+}
+
+static int _pool_same_legacy_semantics(const struct dns_servers *a, const struct dns_servers *b)
+{
+	return !strcasecmp(a->authority, b->authority) && a->port == b->port && a->type == b->type &&
+		a->result_flag == b->result_flag && a->server_flag == b->server_flag && a->ttl == b->ttl &&
+		a->set_mark == b->set_mark && a->drop_packet_latency_ms == b->drop_packet_latency_ms &&
+		a->tcp_keepalive == b->tcp_keepalive && a->max_query_rate == b->max_query_rate &&
+		a->query_burst == b->query_burst && a->max_upstream_connections == b->max_upstream_connections &&
+		a->fallback == b->fallback && a->subnet_all_query_types == b->subnet_all_query_types &&
+		a->skip_check_cert == b->skip_check_cert && !strcmp(a->spki, b->spki) &&
+		!strcmp(a->hostname, b->hostname) && !strcmp(a->httphost, b->httphost) &&
+		!strcmp(a->tls_host_verify, b->tls_host_verify) && !strcmp(a->path, b->path) &&
+		!strcmp(a->proxyname, b->proxyname) && !strcmp(a->ifname, b->ifname) && !strcmp(a->alpn, b->alpn) &&
+		a->ipv4_ecs.enable == b->ipv4_ecs.enable && a->ipv4_ecs.subnet == b->ipv4_ecs.subnet &&
+		!strcmp(a->ipv4_ecs.ip, b->ipv4_ecs.ip) && a->ipv6_ecs.enable == b->ipv6_ecs.enable &&
+		a->ipv6_ecs.subnet == b->ipv6_ecs.subnet && !strcmp(a->ipv6_ecs.ip, b->ipv6_ecs.ip);
+}
+
+static int _pool_legacy_numeric(const char *text, char *normalized, size_t size)
+{
+	struct in_addr a4;
+	struct in6_addr a6;
+	if (inet_pton(AF_INET, text, &a4) != 1) {
+		if (inet_pton(AF_INET6, text, &a6) != 1) return -1;
+		if (!IN6_IS_ADDR_V4MAPPED(&a6)) {
+			if (IN6_IS_ADDR_UNSPECIFIED(&a6) || IN6_IS_ADDR_MULTICAST(&a6)) return -1;
+			return inet_ntop(AF_INET6, &a6, normalized, size) ? 0 : -1;
+		}
+		memcpy(&a4, &a6.s6_addr[12], sizeof(a4));
+	}
+	uint32_t ip = ntohl(a4.s_addr);
+	if (!ip || IN_MULTICAST(ip) || ip == INADDR_BROADCAST) return -1;
+	return inet_ntop(AF_INET, &a4, normalized, size) ? 0 : -1;
+}
+
+static int _dns_conf_normalize_pool_compat(void)
+{
+	int has_legacy = 0, ret = -1;
+	for (int i = 0; i < dns_conf.server_num; i++)
+		if (dns_conf.servers[i].upstream_round_robin && !dns_conf.servers[i].pool_compat_skip) has_legacy = 1;
+	if (!has_legacy) return 0;
+	struct pool_compat_plan *plans = calloc((size_t)dns_conf.server_num, sizeof(*plans));
+	if (!plans) return -1;
+	for (int i = 0; i < dns_conf.server_num; i++) plans[i].leader = -1;
+	for (int i = 0; i < dns_conf.server_num; i++) {
+		struct dns_servers *s = &dns_conf.servers[i];
+		if (!s->upstream_round_robin || s->pool_compat_skip) continue;
+		char ip[DNS_MAX_IPLEN];
+		if (!s->quota_group[0] || !s->authority[0] || check_is_ipaddr(s->authority) == 0 ||
+			s->upstream_ip_pool || s->proxyname[0] || s->type == DNS_SERVER_MDNS || _pool_is_bootstrap(s) ||
+			s->max_concurrent_queries || _pool_legacy_numeric(s->server, ip, sizeof(ip))) {
+			tlog(TLOG_ERROR, "%s:%u: legacy RR %s requires explicit migration: use domain authority, static numeric host-ip, no proxy/bootstrap/mDNS or per-endpoint concurrency", s->source_file, s->source_line, s->quota_group);
+			goto out;
+		}
+		int leader = i;
+		for (int j = 0; j < dns_conf.server_num; j++) {
+			struct dns_servers *other = &dns_conf.servers[j];
+			if (j == i || strcmp(s->quota_group, other->quota_group)) continue;
+			if (!other->upstream_round_robin || other->upstream_ip_pool ||
+				!_pool_same_legacy_semantics(s, other) || !_pool_same_group_sets(s, other)) {
+				tlog(TLOG_ERROR, "%s:%u: legacy RR quota group %s differs from %s:%u and cannot be losslessly converted; split services explicitly and retain intended shared quota", s->source_file, s->source_line, s->quota_group, other->source_file, other->source_line);
+				goto out;
+			}
+			if (j < leader) leader = j;
+		}
+		plans[i].leader = leader;
+		struct pool_compat_plan *plan = &plans[leader];
+		unsigned int at;
+		for (at = 0; at < plan->count; at++) if (!strcmp(plan->ips[at], ip)) break;
+		if (at == plan->count) {
+			if (at == 64) goto out;
+			safe_strncpy(plan->ips[at], ip, sizeof(plan->ips[at])); plan->count++;
+		}
+	}
+	/* Commit: retain original array entries so all existing group pointers remain
+	 * stable. Only the first entry is instantiated; identical group sets were
+	 * required above, so skipping the others cannot change routing membership. */
+	for (int i = 0; i < dns_conf.server_num; i++) {
+		if (plans[i].leader < 0) continue;
+		struct dns_servers *s = &dns_conf.servers[i];
+		if (plans[i].leader != i) { s->pool_compat_skip = 1; continue; }
+		s->upstream_ip_pool = 1; s->upstream_round_robin = 0;
+		s->pool_ip_count = plans[i].count;
+		s->max_upstream_backends = plans[i].count > s->max_upstream_connections ? plans[i].count : s->max_upstream_connections;
+		memcpy(s->pool_ips, plans[i].ips, sizeof(s->pool_ips));
+		safe_strncpy(s->server, s->authority, sizeof(s->server));
+		char address_list[64 * DNS_MAX_IPLEN] = {0};
+		size_t used = 0;
+		for (unsigned int at = 0; at < s->pool_ip_count; at++) {
+			int written = snprintf(address_list + used, sizeof(address_list) - used, "%s%s", at ? "," : "", s->pool_ips[at]);
+			if (written < 0 || (size_t)written >= sizeof(address_list) - used) break;
+			used += (size_t)written;
+		}
+		tlog(TLOG_WARN, "%s:%u: legacy RR %s normalized in memory to one service %s; preserve common authority/security/routing options and replace RR/address options with: -upstream-ip-pool -host-ip %s -max-upstream-backends %u -max-upstream-connections %u; actual-send RR and service-v1 counters now apply; configuration file unchanged",
+			s->source_file, s->source_line, s->quota_group, s->authority, address_list,
+			s->max_upstream_backends, s->max_upstream_connections);
+	}
+	ret = 0;
+out:
+	free(plans);
+	return ret;
+}
+
+#ifdef TEST
+int dns_conf_pool_normalize_for_test(void);
+int dns_conf_pool_normalize_for_test(void) { return _dns_conf_normalize_pool_compat(); }
+#endif
+
+/* Pool discovery never falls back through the ordinary/default resolver graph. */
+static int _dns_conf_verify_pool_bootstrap(void)
+{
+	int needs_bootstrap = 0, numeric_bootstrap = 0;
+	struct dns_server_groups *group;
+	unsigned long bucket;
+	for (int i = 0; i < dns_conf.server_num; i++)
+		if (dns_conf.servers[i].upstream_ip_pool && !dns_conf.servers[i].pool_ip_count)
+			needs_bootstrap = 1;
+	if (!needs_bootstrap) return 0;
+	hash_for_each(dns_group_table.group, bucket, group, node) {
+		if (strcmp(group->group_name, "bootstrap-dns")) continue;
+		for (int i = 0; i < group->server_num; i++) {
+			struct dns_servers *s = group->servers[i];
+            if (!s || s->upstream_ip_pool || s->proxyname[0] || s->type == DNS_SERVER_MDNS ||
+                check_is_ipaddr(s->server) != 0) {
+                tlog(TLOG_ERROR, "automatic upstream-ip-pool requires every bootstrap-dns declaration to be an explicit numeric non-proxy non-pool target");
+                return -1;
+            }
+            numeric_bootstrap = 1;
+		}
+	}
+	if (!dns_conf_exist_bootstrap_dns || !numeric_bootstrap) {
+		tlog(TLOG_ERROR, "automatic upstream-ip-pool requires an explicit numeric non-pool bootstrap-dns server");
+		return -1;
+	}
+	return 0;
+}
+
 static int _dns_conf_load_post(void)
 {
 	_config_current_group_pop_to_default();
@@ -509,6 +678,8 @@ static int _dns_conf_load_post(void)
 
 	_dns_conf_group_post();
 	if (_config_any_verify() != 0) return -1;
+	if (_dns_conf_normalize_pool_compat() != 0) return -1;
+	if (_dns_conf_verify_pool_bootstrap() != 0) return -1;
 
 	_dns_conf_dns64_post();
 

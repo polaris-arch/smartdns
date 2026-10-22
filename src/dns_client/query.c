@@ -21,6 +21,7 @@
 #include "conn_stream.h"
 #include "ecs.h"
 #include "query.h"
+#include "upstream_service.h"
 #include "upstream_policy.h"
 
 void _dns_client_query_get(struct dns_query_struct *query)
@@ -66,6 +67,7 @@ void _dns_client_query_release(struct dns_query_struct *query)
 	pthread_mutex_unlock(&query->lock);
 
 	_dns_attempt_free_all(query);
+    _dns_service_query_free(query);
 	pthread_mutex_destroy(&query->lock);
 
 	/* free resource */
@@ -90,6 +92,7 @@ void _dns_client_query_remove(struct dns_query_struct *query)
 	if (query->terminal) { pthread_mutex_unlock(&query->lock); return; }
 	query->terminal = 1;
 	pthread_mutex_unlock(&query->lock);
+    _dns_service_query_terminal(query);
 	/* remove query from period check list, and release reference*/
 	pthread_mutex_lock(&client.domain_map_lock);
 	list_del_init(&query->dns_request_list);
@@ -155,7 +158,7 @@ int _dns_client_send_query(struct dns_query_struct *query)
 		dns_set_OPT_option(packet, DNS_OPT_FLAG_DO);
 	}
 	/* dns_add_OPT_TCP_KEEPALIVE(packet, 1200); */
-	if (_dns_client_dns_add_ecs(query, packet) != 0) {
+	if (!query->bootstrap_only && _dns_client_dns_add_ecs(query, packet) != 0) {
 		tlog(TLOG_ERROR, "add ecs failed.");
 		return -1;
 	}
@@ -256,7 +259,7 @@ void _dns_replied_check_remove(struct dns_query_struct *dns_query, struct dns_se
 
 int _dns_client_query_parser_options(struct dns_query_struct *query, struct dns_query_options *options)
 {
-	if (options->enable_flag & DNS_QUEY_OPTION_ECS_IP) {
+	if (!query->bootstrap_only && (options->enable_flag & DNS_QUEY_OPTION_ECS_IP)) {
 		struct sockaddr_storage addr;
 		socklen_t addr_len = sizeof(addr);
 		struct dns_opt_ecs *ecs = NULL;
@@ -292,7 +295,7 @@ int _dns_client_query_parser_options(struct dns_query_struct *query, struct dns_
 		}
 	}
 
-	if (options->enable_flag & DNS_QUEY_OPTION_ECS_DNS) {
+	if (!query->bootstrap_only && (options->enable_flag & DNS_QUEY_OPTION_ECS_DNS)) {
 		struct dns_opt_ecs *ecs = &options->ecs_dns;
 		if (ecs->family != DNS_OPT_ECS_FAMILY_IPV6 && ecs->family != DNS_OPT_ECS_FAMILY_IPV4) {
 			return -1;
@@ -310,7 +313,7 @@ int _dns_client_query_parser_options(struct dns_query_struct *query, struct dns_
 		query->ecs.enable = 1;
 	}
 
-	if (query->ecs.enable == 0) {
+	if (!query->bootstrap_only && query->ecs.enable == 0) {
 		_dns_client_query_setup_default_ecs(query);
 	}
 

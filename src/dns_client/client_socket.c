@@ -39,7 +39,7 @@ int _dns_client_create_socket(struct dns_server_info *server_info)
 	if (server_info->fd > 0) {
 		pthread_mutex_unlock(&server_info->lock);
         /* Another RR dispatch may finish connecting after our snapshot. */
-		return server_info->flags.upstream_round_robin ? 0 : -1;
+		return server_info->service ? 0 : -1;
 	}
 
     if (_dns_policy_connection_acquire(server_info) != 0) {
@@ -89,7 +89,7 @@ int _dns_client_create_socket(struct dns_server_info *server_info)
 		ret = -1;
 	}
 
-    if (ret != 0 && server_info->flags.upstream_round_robin) {
+    if (ret != 0 && server_info->service) {
         /* Constructors can fail after publishing fd/SSL (e.g. epoll setup).
          * Tear down before returning the reserved physical connection slot. */
         _dns_client_close_socket(server_info);

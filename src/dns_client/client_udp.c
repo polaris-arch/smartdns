@@ -439,6 +439,7 @@ void _dns_client_check_udp_nat(struct dns_query_struct *query)
 	list_for_each_entry(group_member, &query->server_group->head, list)
 	{
 		server_info = group_member->server;
+        if (!server_info) continue; /* pool endpoints own their retry/connection lifecycle */
 		if (server_info->type != DNS_SERVER_UDP) {
 			continue;
 		}

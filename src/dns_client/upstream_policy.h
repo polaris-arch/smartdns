@@ -9,12 +9,11 @@ extern "C" {
 #define DNS_ADMIT_OK 0
 #define DNS_ADMIT_WAIT 1
 #define DNS_ADMIT_DONE 2
+int _dns_policy_service_init(struct dns_upstream_service *service);
+void _dns_policy_service_release(struct dns_upstream_service *service);
+unsigned long _dns_policy_service_cooldown(struct dns_upstream_service *service, unsigned long now);
+unsigned long _dns_policy_service_wait(struct dns_upstream_service *service, unsigned long now);
 int _dns_policy_attach(struct dns_server_info *server);
-/* Dispatch takes only the service lock, never the global server-list lock.
- * The caller pins each snapshot member until dispatch and IO are finished. */
-struct dns_server_info *_dns_policy_rr_begin(struct dns_query_struct *query,
-    struct dns_server_info **servers, unsigned int count, struct dns_server_info *service,
-    int (*eligible)(struct dns_server_info *, void *), void *context);
 int _dns_policy_connection_acquire(struct dns_server_info *server);
 void _dns_policy_connection_release(struct dns_server_info *server);
 void _dns_policy_detach(struct dns_server_info *server);
@@ -24,7 +23,10 @@ void _dns_policy_http_error(struct dns_server_info *server, int status, const ch
 int _dns_attempt_wire_begin(struct dns_query_struct *query, struct dns_server_info *server, unsigned int generation);
 int _dns_attempt_begin(struct dns_query_struct *query, struct dns_server_info *server);
 int _dns_attempt_live(struct dns_query_struct *query, struct dns_server_info *server, unsigned int generation);
+void _dns_attempt_response_sample(struct dns_query_struct *query, struct dns_server_info *server);
+void _dns_attempt_reply_outcome(struct dns_query_struct *query, struct dns_server_info *server, int accepted);
 void _dns_attempt_replied(struct dns_query_struct *query, struct dns_server_info *server);
+void _dns_attempt_finalize_retired(struct dns_query_struct *query, struct dns_server_info *server);
 int _dns_attempt_retire(struct dns_query_struct *query, struct dns_server_info *server, unsigned int generation);
 unsigned int _dns_attempt_generation(struct dns_query_struct *query, struct dns_server_info *server);
 void _dns_attempt_mark_sent(struct dns_query_struct *query, struct dns_server_info *server, unsigned int generation);

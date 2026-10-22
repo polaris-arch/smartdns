@@ -111,6 +111,10 @@ void dns_server_request_set_private(struct dns_request *request, void *private_d
 
 void *dns_server_request_get_private(struct dns_request *request);
 
+/* Match an actual bound listener. 1=exact, 2=wildcard (caller checks
+ * whether the destination is local), 0=no match. Never resolves DNS. */
+int dns_server_listener_match(int family, const unsigned char *address, int port, int datagram);
+
 int dns_server_get_server_name(char *name, int name_len);
 
 void dns_server_enable_update_neighbor_cache(int enable);

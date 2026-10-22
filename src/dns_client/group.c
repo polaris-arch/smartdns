@@ -17,6 +17,7 @@
  */
 
 #include "group.h"
+#include "upstream_service.h"
 #include "pending_server.h"
 #include "server_info.h"
 
@@ -86,7 +87,6 @@ int _dns_client_add_to_group(const char *group_name, struct dns_server_info *ser
 	group_member->server = server_info;
 	dns_client_server_info_get(server_info);
 	list_add(&group_member->list, &group->head);
-    if (server_info->flags.upstream_round_robin) group->round_robin_members++;
 
 	return 0;
 errout:
@@ -110,6 +110,7 @@ static int _dns_client_remove_member(struct dns_server_group_member *group_membe
 		return -1;
 	}
 
+    if (group_member->service) _dns_service_put(group_member->service);
 	if (group_member->server) {
 		dns_client_server_info_release(group_member->server);
 	}
@@ -131,7 +132,6 @@ static int _dns_client_remove_from_group(struct dns_server_group *group, struct 
 			continue;
 		}
 
-		if (server_info->flags.upstream_round_robin) group->round_robin_members--;
 		_dns_client_remove_member(group_member);
 	}
 
@@ -258,4 +258,18 @@ void _dns_client_group_remove_all(void)
 	{
 		_dns_client_remove_group(group);
 	}
+}
+int _dns_client_add_service_group(const char *name, struct dns_upstream_service *service)
+{
+    struct dns_server_group *group = _dns_client_get_group(name);
+    if (!group) return -1;
+    struct dns_server_group_member *member;
+    list_for_each_entry(member, &group->head, list) if (member->service == service) return 0;
+    member = calloc(1, sizeof(*member));
+    if (!member) return -1;
+    member->service = service;
+    _dns_service_get(service);
+    list_add_tail(&member->list, &group->head);
+    group->service_members++;
+    return 0;
 }

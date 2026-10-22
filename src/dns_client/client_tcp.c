@@ -1,3 +1,4 @@
+#include "upstream_service.h"
 /*************************************************************************
  *
  * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
@@ -365,6 +366,8 @@ int _dns_client_process_stream_writes(struct dns_server_info *server)
                    send(server->fd, stream->send_buff.data + stream->send_offset,
                         stream->send_buff.len - stream->send_offset, MSG_NOSIGNAL);
         if (sent <= 0) {
+            _dns_service_write_result(q, server, stream->attempt_generation, 0,
+                sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
             if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
             ret = -1; break;
         }
@@ -605,6 +608,7 @@ void _dns_client_check_tcp(void)
 		if (server_info->status == DNS_SERVER_STATUS_CONNECTING) {
 			if (server_info->last_recv + DNS_TCP_CONNECT_TIMEOUT < now) {
 				tlog(TLOG_DEBUG, "server %s:%d connect timeout.", server_info->ip, server_info->port);
+                _dns_service_endpoint_failure(server_info);
 				_dns_client_close_socket(server_info);
 			}
 		} else if (server_info->status == DNS_SERVER_STATUS_CONNECTED) {

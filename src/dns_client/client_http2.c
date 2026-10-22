@@ -1,3 +1,4 @@
+#include "upstream_service.h"
 /*************************************************************************
  *
  * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
@@ -147,6 +148,8 @@ static int _http2_bio_write(void *private_data, const uint8_t *buf, int len)
     }
     int sent = _dns_client_socket_ssl_send(server, buf, len);
     if (sent > 0 && owner) _dns_attempt_mark_sent(owner->query, server, owner->attempt_generation);
+    else if (owner) _dns_service_write_result(owner->query, server, owner->attempt_generation, 0,
+        sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
     return sent;
 }
 

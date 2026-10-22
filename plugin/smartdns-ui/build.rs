@@ -82,7 +82,9 @@ fn link_smartdns_lib() {
     let ignored_macros = IgnoreMacros(vec!["IPPORT_RESERVED".into()].into_iter().collect());
 
     let mut bindings_builder =
-        bindgen::Builder::default().header(format!("{}/smartdns/smartdns.h", smartdns_inc_dir));
+        bindgen::Builder::default()
+            .header(format!("{}/smartdns/smartdns.h", smartdns_inc_dir))
+            .header(format!("{}/smartdns/upstream_service.h", smartdns_inc_dir));
     if let Some(sysroot) = sysroot {
         bindings_builder = bindings_builder.clang_arg(format!("--sysroot={}", sysroot));
     }

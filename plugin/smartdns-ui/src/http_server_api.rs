@@ -96,6 +96,7 @@ impl API {
         api.register(Method::GET, "/api/log/audit/stream", true, APIRoute!(API::api_audit_log_stream));
         api.register(Method::GET, "/api/server/version", false, APIRoute!(API::api_server_version));
         api.register(Method::GET, "/api/upstream-server", true, APIRoute!(API::api_upstream_server_get_list));
+        api.register(Method::GET, "/api/upstream-server/{service_id}/backends", true, APIRoute!(API::api_upstream_server_get_backends));
         api.register(Method::GET, "/api/config/settings", true, APIRoute!(API::api_config_get_settings));
         api.register(Method::PUT, "/api/config/settings", true, APIRoute!(API::api_config_set_settings));
         api.register(Method::GET, "/api/stats/top/client", true, APIRoute!(API::api_stats_get_top_client));
@@ -926,6 +927,25 @@ impl API {
         let body = api_msg_gen_upstream_server_list(&upstream_server_list);
 
         API::response_build(StatusCode::OK, body)
+    }
+
+    async fn api_upstream_server_get_backends(
+        _this: Arc<HttpServer>,
+        param: APIRouteParam,
+        _req: Request<body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, HttpError> {
+        let id = match param.get("service_id") {
+            Some(id) if id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit()) => id,
+            _ => return API::response_error(StatusCode::BAD_REQUEST, "Invalid service identifier"),
+        };
+        let services = smartdns::DnsUpstreamServices::snapshots()
+            .map_err(|error| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        let exists = services.iter().any(|row| smartdns::snapshot_string(&row.service_id).as_deref() == Ok(id.as_str()));
+        if !exists { return API::response_error(StatusCode::NOT_FOUND, "Service not found"); }
+        let backends = crate::data_upstream_server::UpstreamBackendInfo::get_all(id)?;
+        API::response_build(StatusCode::OK, serde_json::json!({
+            "service_id": id, "backend_list": backends,
+        }).to_string())
     }
 
     async fn api_config_get_settings(

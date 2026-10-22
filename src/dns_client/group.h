@@ -35,6 +35,7 @@ int _dns_client_add_to_group(const char *group_name, struct dns_server_info *ser
 
 struct dns_server_group *_dns_client_get_group(const char *group_name);
 
+int _dns_client_add_service_group(const char *name, struct dns_upstream_service *service);
 #ifdef __cplusplus
 }
 #endif /*__cplusplus */

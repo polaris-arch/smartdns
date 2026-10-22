@@ -413,6 +413,9 @@ struct dns_edns_client_subnet {
 
 struct dns_servers {
 	char server[DNS_MAX_CNAME_LEN];
+	char authority[DNS_MAX_CNAME_LEN];
+	char source_file[DNS_MAX_PATH];
+	unsigned int source_line;
 	unsigned short port;
 	unsigned int result_flag;
 	unsigned int server_flag;
@@ -426,6 +429,11 @@ struct dns_servers {
 	unsigned int max_concurrent_queries;
 	unsigned int upstream_round_robin;
 	unsigned int max_upstream_connections;
+	unsigned int upstream_ip_pool;
+	unsigned int pool_compat_skip;
+	unsigned int max_upstream_backends;
+	unsigned int pool_ip_count;
+	char pool_ips[64][DNS_MAX_IPLEN];
 	char quota_group[DNS_MAX_CNAME_LEN];
 	int fallback;
 	int subnet_all_query_types;

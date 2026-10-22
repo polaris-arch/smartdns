@@ -429,7 +429,7 @@ pub fn api_msg_gen_upstream_server_list(upstream_server_list: &Vec<UpstreamServe
             upstream_server_list
                 .iter()
                 .map(|x| {
-                    let s = json!({
+                    let mut s = json!({
                         "host": x.host,
                         "ip": x.ip,
                         "port": x.port,
@@ -442,6 +442,11 @@ pub fn api_msg_gen_upstream_server_list(upstream_server_list: &Vec<UpstreamServe
                         "status": x.status,
                         "security": x.security,
                     });
+                    if let Some(details) = &x.service {
+                        if let serde_json::Value::Object(extra) = serde_json::to_value(details).expect("service details serialize") {
+                            s.as_object_mut().expect("upstream row object").extend(extra);
+                        }
+                    }
                     s
                 })
                 .collect::<Vec<serde_json::Value>>()
@@ -528,6 +533,9 @@ pub fn api_msg_parse_upstream_server_list(
             avg_time: avg_time.unwrap(),
             status: status.unwrap().to_string(),
             security: security.unwrap().to_string(),
+            service: if item.get("service_id").is_some() {
+                Some(serde_json::from_value(item.clone())?)
+            } else { None },
         });
     }
 

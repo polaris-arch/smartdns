@@ -1051,3 +1051,60 @@ mod tests {
         dns_log!(LogLevel::DEBUG, "test log");
     }
 }
+
+/// Bounded copied snapshots; never expose an endpoint lifetime through the UI.
+pub struct DnsUpstreamServices;
+impl DnsUpstreamServices {
+    pub fn snapshots() -> Result<Vec<smartdns_c::dns_upstream_service_snapshot_v1>, String> {
+        const MAX_ROWS: usize = 64;
+        let mut capacity = 0usize;
+        for _ in 0..4 {
+            let mut rows: Vec<smartdns_c::dns_upstream_service_snapshot_v1> =
+                (0..capacity).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let out = if capacity == 0 { std::ptr::null_mut() } else { rows.as_mut_ptr() };
+            let count = unsafe { smartdns_c::dns_client_get_service_snapshot_v1(out, capacity as u32) };
+            if count < 0 { return Err("service snapshot unavailable".into()); }
+            let count = count as usize;
+            if count > MAX_ROWS { return Err("service snapshot exceeds supported bound".into()); }
+            if count > capacity { capacity = count; continue; }
+            rows.truncate(count);
+            if rows.iter().any(|row| row.version != 1 || row.struct_size as usize !=
+                std::mem::size_of::<smartdns_c::dns_upstream_service_snapshot_v1>()) {
+                return Err("incompatible service snapshot version".into());
+            }
+            return Ok(rows);
+        }
+        Err("service membership changed during snapshot; retry".into())
+    }
+
+    pub fn endpoints(service_id: &str) -> Result<Vec<smartdns_c::dns_upstream_endpoint_snapshot_v1>, String> {
+        if service_id.len() != 64 || !service_id.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err("invalid service identifier".into());
+        }
+        let id = CString::new(service_id).map_err(|_| "invalid service identifier")?;
+        let mut capacity = 0usize;
+        for _ in 0..4 {
+            let mut rows: Vec<smartdns_c::dns_upstream_endpoint_snapshot_v1> =
+                (0..capacity).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let out = if capacity == 0 { std::ptr::null_mut() } else { rows.as_mut_ptr() };
+            let count = unsafe { smartdns_c::dns_client_get_service_endpoints_v1(id.as_ptr(), out, capacity as u32) };
+            if count < 0 { return Err("service endpoint snapshot unavailable".into()); }
+            let count = count as usize;
+            if count > 128 { return Err("service endpoint snapshot exceeds supported bound".into()); }
+            if count > capacity { capacity = count; continue; }
+            rows.truncate(count);
+            if rows.iter().any(|row| row.version != 1 || row.struct_size as usize !=
+                std::mem::size_of::<smartdns_c::dns_upstream_endpoint_snapshot_v1>()) {
+                return Err("incompatible endpoint snapshot version".into());
+            }
+            return Ok(rows);
+        }
+        Err("endpoint membership changed during snapshot; retry".into())
+    }
+}
+
+pub fn snapshot_string<const N: usize>(value: &[c_char; N]) -> Result<String, String> {
+    let end = value.iter().position(|c| *c == 0).ok_or("unterminated snapshot string")?;
+    String::from_utf8(value[..end].iter().map(|c| *c as u8).collect())
+        .map_err(|_| "invalid snapshot UTF-8".into())
+}

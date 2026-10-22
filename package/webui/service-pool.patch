@@ -1,0 +1,32 @@
+--- a/src/lib/backend/server.ts
++++ b/src/lib/backend/server.ts
+@@ -265,6 +265,9 @@
+ }
+ 
+ export interface UpStreamServers {
++    service_id?: string;
++    pool_enabled?: boolean;
++    endpoint_ips?: string[];
+     host: string;
+     ip: string;
+     port: number;
+--- a/src/components/dashboard/upstream-servers/upstream-servers-table.tsx
++++ b/src/components/dashboard/upstream-servers/upstream-servers-table.tsx
+@@ -64,7 +64,8 @@
+         enableSorting: false,
+       },
+       {
+-        accessorKey: 'ip',
++        id: 'ip',
++        accessorFn: (row) => row.pool_enabled ? (row.endpoint_ips ?? []).join(', ') : row.ip,
+         header: t('IP'),
+         enableSorting: false,
+         size: 330,
+@@ -191,6 +192,7 @@
+   const table = useMaterialReactTable({
+     columns,
+     data,
++    getRowId: (row, index) => row.pool_enabled && row.service_id ? row.service_id : String(index),
+     localization: tableLocales,
+     enableColumnResizing: true,
+     enableColumnOrdering: false,

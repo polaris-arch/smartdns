@@ -42,6 +42,8 @@ int _dns_client_server_add(const char *server_ip, const char *server_host, int p
 						   struct client_dns_server_flags *flags);
 
 void _dns_client_check_servers(void);
+void _dns_client_server_info_remove(struct dns_server_info *server);
+int _dns_client_service_endpoint_add(struct dns_upstream_service *service, const char *ip, struct dns_server_info **out);
 #ifdef __cplusplus
 }
 #endif /*__cplusplus */

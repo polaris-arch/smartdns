@@ -33,6 +33,7 @@ int _dns_client_setup_server_packet(struct dns_server_info *server_info, struct 
 
 	*packet_data = default_packet;
 	*packet_data_len = default_packet_len;
+    if (query->bootstrap_only) return 0; /* raw resolver question: no ECS or hitchhiking */
 
 	if (server_info->ecs_ipv4.enable == true || server_info->ecs_ipv6.enable == true) {
 		repack = 1;

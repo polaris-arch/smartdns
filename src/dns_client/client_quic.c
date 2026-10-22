@@ -1,3 +1,4 @@
+#include "upstream_service.h"
 /*************************************************************************
  *
  * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
@@ -653,7 +654,8 @@ static int _dns_client_quic_flush_stream(struct dns_server_info *server_info, st
     if (send_len > 0) {
         conn_stream->http3_started = 1;
         _dns_attempt_mark_sent(conn_stream->query, server_info, conn_stream->attempt_generation);
-    }
+    } else _dns_service_write_result(conn_stream->query, server_info, conn_stream->attempt_generation,
+        0, send_errno == EAGAIN || send_errno == EWOULDBLOCK);
 	if (_dns_client_quic_handle_send_result(conn_stream, send_len, epoll_events) != 0) {
 		return -1;
 	}

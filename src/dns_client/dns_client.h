@@ -70,11 +70,18 @@ typedef enum dns_server_status {
 } dns_server_status;
 
 struct dns_upstream_policy;
+struct dns_upstream_service;
+struct dns_service_observation;
 struct dns_query_attempt;
 
 /* dns server information */
 struct dns_http3_control;
 struct dns_server_info {
+    struct dns_upstream_service *service;
+    unsigned service_revoked, service_connection_held, service_failures;
+    unsigned long service_retry_at, service_drain_until, service_valid_until;
+    uint64_t service_member_id;
+    uint64_t service_attempt_count, service_success_count, service_failure_count;
 	struct dns_http3_control *http3_control;
 	struct dns_conn_stream *http2_write_owner;
     int http2_policy_blocked;
@@ -200,6 +207,7 @@ struct dns_server_pending {
 
 /* upstream server group member */
 struct dns_server_group_member {
+    struct dns_upstream_service *service;
 	struct list_head list;
 	struct dns_server_info *server;
 };
@@ -207,6 +215,8 @@ struct dns_server_group_member {
 /* upstream server groups */
 struct dns_server_group {
     unsigned int round_robin_members;
+    unsigned int service_members;
+    unsigned int bootstrap_query_sequence;
 	char group_name[DNS_GROUP_NAME_LEN];
 	struct hlist_node node;
 	struct list_head head;
@@ -273,6 +283,7 @@ struct dns_conn_stream {
 
 /* query struct */
 struct dns_query_struct {
+    struct dns_service_observation *service_observations;
 	struct list_head dns_request_list;
 	atomic_t refcnt;
 	struct dns_server_group *server_group;
@@ -306,6 +317,8 @@ struct dns_query_struct {
 	int terminal;
 	int single_upstream;
 	int checking_disabled;
+    int bootstrap_only;
+    unsigned bootstrap_cursor;
 
 	/* retry count */
 	atomic_t retry_count;
@@ -326,6 +339,10 @@ struct dns_query_struct {
 };
 
 extern struct dns_client client;
+struct epoll_event;
+void _dns_client_event_batch_pin(struct epoll_event *events, int count);
+void _dns_client_event_batch_unpin(struct epoll_event *events, int count);
+
 
 int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacket, int inpacket_len,
 					 struct sockaddr *from, socklen_t from_len);

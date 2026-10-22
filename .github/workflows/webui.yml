@@ -5,12 +5,21 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  workflow_dispatch:
+    inputs:
+      full_validation:
+        description: 'Build/test only: complete native, Rust/REST, pinned WebUI and real OpenWrt SDK; never publish'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
 
 jobs:
   build:
-
+    if: ${{ !inputs.full_validation }}
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v2
     - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -20,3 +29,147 @@ jobs:
     - name: test
       run: |
         EXTRA_CFLAGS=-fPIC make -C plugin/smartdns-ui test -j8
+
+  native-full:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_validation }}
+    uses: ./.github/workflows/c-cpp.yml
+    with:
+      release_validation: true
+
+  plugin-webui-full:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_validation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+    - name: Prepare ordinary build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev zlib1g-dev clang libclang-dev dnsutils curl wget patch
+        mkdir -p ci-webui/packages
+        git rev-parse HEAD > ci-webui/source-sha.txt
+        rustc -vV > ci-webui/rustc.txt
+        node --version > ci-webui/node.txt
+    - name: All Rust and real REST tests, including unchanged HTTPS case
+      env:
+        WITH_ZLIB: 'yes'
+        SMARTDNS_SERVICE_API_EVIDENCE: ${{ github.workspace }}/ci-webui/actual-service-api.json
+      run: |
+        set -euo pipefail
+        make -C src WITH_ZLIB=yes EXTRA_CFLAGS=-fPIC libsmartdns-test.a -j2
+        (cd plugin/smartdns-ui; timeout -k 15 1200 cargo test --locked -- --test-threads=1) 2>&1 | tee ci-webui/rust-rest.log
+        grep -F 'test test_rest_api_https_server ... ok' ci-webui/rust-rest.log
+        test -s ci-webui/actual-service-api.json
+    - name: Build matching daemon/plugin and actual generic WebUI package
+      run: |
+        set -euo pipefail
+        timeout -k 15 1800 sh package/build-pkg.sh --platform linux --arch x86-64 --with-ui --ver "0.0.0-ci-${GITHUB_SHA:0:12}" --outputdir "$PWD/ci-webui/packages" 2>&1 | tee ci-webui/package.log
+        . package/webui/source.conf
+        sh package/webui/test-prepare-source.sh "package/target/smartdns-webui-$SMARTDNS_WEBUI_COMMIT.tar.gz" 2>&1 | tee ci-webui/prepare.log
+        node package/webui/test-table-identity.cjs package/target/smartdns-webui ci-webui/actual-service-api.json ci-webui/table-identity.json
+        test -s package/target/smartdns-webui/out/dashboard/upstream-servers.html
+        package_file=$(find ci-webui/packages -maxdepth 1 -name '*.tar.gz' -type f)
+        test "$(printf '%s\n' "$package_file" | wc -l)" -eq 1
+        test -n "$package_file"
+        tar -tzf "$package_file" > ci-webui/package-inventory.txt
+        grep -F 'smartdns/usr/sbin/smartdns' ci-webui/package-inventory.txt
+        grep -F 'smartdns/usr/local/lib/smartdns/smartdns_ui.so' ci-webui/package-inventory.txt
+        grep -F 'smartdns/usr/share/smartdns/wwwroot/dashboard/upstream-servers.html' ci-webui/package-inventory.txt
+        sha256sum "$package_file" > ci-webui/package.sha256
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: plugin-webui-${{ github.sha }}
+        path: ci-webui/
+        if-no-files-found: error
+
+  openwrt-sdk:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_validation }}
+    needs: plugin-webui-full
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+    - name: Prepare ordinary SDK dependencies and verified official SDK
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev flex bison gawk gettext git libncurses-dev libssl-dev python3 python3-setuptools rsync swig unzip zlib1g-dev file wget curl zstd cmake ninja-build libelf-dev liblzma-dev
+        mkdir -p ci-sdk "$RUNNER_TEMP/smartdns-sdk"
+        git rev-parse HEAD > ci-sdk/recipe-commit.txt
+        sdk=openwrt-sdk-24.10.4-x86-64_gcc-13.3.0_musl.Linux-x86_64
+        curl --fail --location --retry 3 "https://downloads.openwrt.org/releases/24.10.4/targets/x86/64/$sdk.tar.zst" -o "$RUNNER_TEMP/$sdk.tar.zst"
+        printf '%s  %s\n' 229e871f734a2cee5ce3ad6a3e98d3836b0899bfdeaea4d9c2c5cc7b1fce1407 "$RUNNER_TEMP/$sdk.tar.zst" | sha256sum -c - | tee ci-sdk/sdk-hash.txt
+        tar --zstd -xf "$RUNNER_TEMP/$sdk.tar.zst" -C "$RUNNER_TEMP/smartdns-sdk" --strip-components=1
+    - name: Pin feeds, install candidate recipe and validate reachable source identity
+      run: |
+        set -euo pipefail
+        recipe="$GITHUB_WORKSPACE/package/openwrt/Makefile"
+        source=$(sed -n 's/^PKG_SOURCE_VERSION:=//p' "$recipe")
+        hash=$(sed -n 's/^PKG_HASH:=//p' "$recipe")
+        [[ "$source" =~ ^[0-9a-f]{40}$ && "$hash" =~ ^[0-9a-f]{64}$ ]]
+        grep -Fx 'PKG_SOURCE_URL:=https://codeload.github.com/polaris-arch/smartdns/tar.gz' "$recipe"
+        git merge-base --is-ancestor "$source" HEAD
+        test "$(git diff --name-only "$source" HEAD)" = package/openwrt/Makefile
+        printf '%s\n' "$source" > ci-sdk/core-commit.txt
+        cp "$recipe" ci-sdk/Makefile
+        cd "$RUNNER_TEMP/smartdns-sdk"
+        printf '%s\n' \
+          'src-git-full base https://github.com/openwrt/openwrt.git^78b23a26c4c98938d549e7ff5876508544e33d4d' \
+          'src-git packages https://github.com/openwrt/packages.git^f1470815f41fe199bfdafe9a91ad115bc2e91203' > feeds.conf
+        ./scripts/feeds update -a 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/feeds-update.log"
+        test "$(git -C feeds/base rev-parse HEAD)" = 78b23a26c4c98938d549e7ff5876508544e33d4d
+        test "$(git -C feeds/packages rev-parse HEAD)" = f1470815f41fe199bfdafe9a91ad115bc2e91203
+        # Do not apply unrelated feed patches to the pinned candidate source.
+        rm -rf feeds/packages/net/smartdns
+        mkdir -p feeds/packages/net/smartdns
+        cp "$recipe" feeds/packages/net/smartdns/Makefile
+        ./scripts/feeds install -a 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/feeds-install.log"
+        printf '%s\n' 'CONFIG_ALL=n' 'CONFIG_ALL_NONSHARED=n' 'CONFIG_ALL_KMODS=n' 'CONFIG_PACKAGE_smartdns=m' 'CONFIG_PACKAGE_smartdns-ui=m' > .config
+        make defconfig
+        grep -Fx 'CONFIG_PACKAGE_smartdns=m' .config
+        grep -Fx 'CONFIG_PACKAGE_smartdns-ui=m' .config
+        cp .config feeds.conf "$GITHUB_WORKSPACE/ci-sdk/"
+    - name: Actual SDK download, preparation and both package builds
+      run: |
+        set -euo pipefail
+        cd "$RUNNER_TEMP/smartdns-sdk"
+        make package/feeds/packages/smartdns/download V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/download.log"
+        source=$(cat "$GITHUB_WORKSPACE/ci-sdk/core-commit.txt")
+        hash=$(sed -n 's/^PKG_HASH:=//p' feeds/packages/net/smartdns/Makefile)
+        printf '%s  %s\n' "$hash" "dl/smartdns-$source.tar.gz" | sha256sum -c - | tee "$GITHUB_WORKSPACE/ci-sdk/core-hash.txt"
+        tar -tzf "dl/smartdns-$source.tar.gz" > "$GITHUB_WORKSPACE/ci-sdk/source-inventory.txt"
+        grep -Fx "smartdns-$source/package/webui/prepare-source.sh" "$GITHUB_WORKSPACE/ci-sdk/source-inventory.txt"
+        make package/feeds/packages/smartdns/prepare V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/prepare.log"
+        make package/feeds/packages/smartdns/compile V=sc -j2 2>&1 | tee "$GITHUB_WORKSPACE/ci-sdk/compile.log"
+        mkdir -p "$GITHUB_WORKSPACE/ci-sdk/ipk"
+        find bin/packages -type f \( -name 'smartdns_*.ipk' -o -name 'smartdns-ui_*.ipk' \) -exec cp '{}' "$GITHUB_WORKSPACE/ci-sdk/ipk/" \;
+        cd "$GITHUB_WORKSPACE/ci-sdk/ipk"
+        test "$(find . -name 'smartdns_*.ipk' | wc -l)" -eq 1
+        test "$(find . -name 'smartdns-ui_*.ipk' | wc -l)" -eq 1
+        sha256sum *.ipk > ../packages.sha256
+        for pkg in *.ipk; do tar -xzOf "$pkg" ./data.tar.gz | tar -tzf - > "../$pkg.inventory"; done
+        grep -F './usr/sbin/smartdns' ../smartdns_*.inventory
+        grep -F './usr/lib/smartdns_ui.so' ../smartdns-ui_*.inventory
+        grep -F './usr/share/smartdns/wwwroot/dashboard/upstream-servers.html' ../smartdns-ui_*.inventory
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: openwrt-sdk-${{ github.sha }}
+        path: ci-sdk/
+        if-no-files-found: error
