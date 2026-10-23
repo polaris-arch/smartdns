@@ -28,6 +28,7 @@
 #include "smartdns/dns.h"
 #include "smartdns/dns_cache.h"
 #include "dns_server/prefetch.h"
+#include "dns_server/dns_server.h"
 
 namespace {
 using Wire = std::vector<unsigned char>;
@@ -1126,6 +1127,26 @@ static void prefetch_retains_native_view_case(bool routing_policy, bool native_a
 		 * pending lookup. Exercise timer refresh in separate completed-wire
 		 * scenarios, rather than race its legitimate pending-query coalescing. */
 		if (native_api) continue;
+		/* The wire reply and cache publication precede pending-list removal.
+		 * A timer refresh requires that original lookup to have completed;
+		 * otherwise joining it is legitimate and produces no replacement. */
+		auto drained_by = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+		bool pending;
+		unsigned waited = 0;
+		do {
+			pthread_mutex_lock(&::server.request_pending_lock);
+			pending = false;
+			for (const auto &bucket : ::server.request_pending) {
+				if (!hlist_empty(&bucket)) { pending = true; break; }
+			}
+			pthread_mutex_unlock(&::server.request_pending_lock);
+			if (!pending) break;
+			waited++;
+			poll(nullptr, 0, 5);
+		} while (std::chrono::steady_clock::now() < drained_by);
+		ASSERT_FALSE(pending) << "original wire lookup has not completed";
+		if (waited) std::cout << "Prefetch fixture awaited original lookup: qtype=" << type
+			<< " routing=" << routing_policy << " polls=" << waited << std::endl;
 		ASSERT_EQ(_dns_server_prefetch_domain(dns_server_get_default_rule_group(),entry.get()),
 			DNS_CACHE_TMOUT_ACTION_OK);
 		/* Observe the asynchronous replacement, retaining the old blob to
@@ -1149,7 +1170,15 @@ static void prefetch_retains_native_view_case(bool routing_policy, bool native_a
 
 TEST(AnyAddress, BackgroundPrefetchPreservesCompatibleTypedCacheProvenance)
 {
-	ASSERT_EXIT({ prefetch_retains_native_view_case(false); prefetch_retains_native_view_case(true);
+	::testing::FLAGS_gtest_death_test_style = "threadsafe";
+	ASSERT_EXIT({
+        struct FailureLog : ::testing::EmptyTestEventListener {
+            void OnTestPartResult(const ::testing::TestPartResult &r) override {
+                if (r.failed()) fprintf(stderr, "%s:%d: %s\n", r.file_name(), r.line_number(), r.message());
+            }
+        };
+        ::testing::UnitTest::GetInstance()->listeners().Append(new FailureLog);
+        prefetch_retains_native_view_case(false); prefetch_retains_native_view_case(true);
 		prefetch_retains_native_view_case(false, true); std::cout.flush();
 		_exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
 }
