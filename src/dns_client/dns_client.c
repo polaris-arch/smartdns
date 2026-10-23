@@ -175,7 +175,8 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 		ret = query->callback(query->domain, DNS_QUERY_RESULT, server_info, packet, inpacket, inpacket_len,
 							  query->user_ptr);
 
-        _dns_service_query_result(query, server_info, ret == DNS_CLIENT_ACTION_OK &&
+        _dns_service_query_result(query, server_info,
+            (ret == DNS_CLIENT_ACTION_OK || ret == DNS_CLIENT_ACTION_OK_WAIT) &&
             (packet->head.rcode == DNS_RC_NOERROR || packet->head.rcode == DNS_RC_NXDOMAIN));
 		if (ret == DNS_CLIENT_ACTION_RETRY || ret == DNS_CLIENT_ACTION_DROP) {
 			/* remove this result */
@@ -188,11 +189,11 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
             _dns_attempt_replied(query, server_info);
 			if (ret == DNS_CLIENT_ACTION_OK) {
 				query->has_result = 1;
-			} else {
+			} else if (ret != DNS_CLIENT_ACTION_OK_WAIT) {
 				tlog(TLOG_DEBUG, "query %s result is invalid, %d", query->domain, ret);
 			}
 
-			if (request_num == 0 && ret != DNS_CLIENT_ACTION_MAY_RETRY) {
+			if (request_num == 0 && ret != DNS_CLIENT_ACTION_MAY_RETRY && ret != DNS_CLIENT_ACTION_OK_WAIT) {
 				/* if all server replied, or done, stop query, release resource */
 				_dns_client_query_remove(query);
 			}

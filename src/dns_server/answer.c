@@ -353,6 +353,30 @@ static int _dns_server_process_answer_HTTPS(struct dns_rrs *rrs, struct dns_requ
 	return 0;
 }
 
+/* Prove this packet's empty address answer, never from accumulated request state.
+ * A referral, unrelated SOA, filtered positive or truncated reply is not NODATA. */
+int _dns_server_is_nodata(struct dns_packet *packet, const char *domain, int qtype)
+{
+	char owner[DNS_MAX_CNAME_LEN];
+	int count = 0, type = 0, qclass = 0, ttl = 0;
+	if ((qtype != DNS_T_A && qtype != DNS_T_AAAA) || packet->head.rcode != DNS_RC_NOERROR ||
+		packet->head.tc || packet->head.opcode != DNS_OP_QUERY || packet->head.ancount) return 0;
+	struct dns_rrs *rr = dns_get_rrs_start(packet, DNS_RRS_QD, &count);
+	if (count != 1 || !rr || dns_get_domain(rr, owner, sizeof(owner), &type, &qclass) ||
+		type != qtype || qclass != DNS_C_IN || strcasecmp(owner, domain)) return 0;
+	rr = dns_get_rrs_start(packet, DNS_RRS_NS, &count);
+	for (int i = 0; i < count && rr; i++, rr = dns_get_rrs_next(packet, rr)) {
+		struct dns_soa soa;
+		if (rr->type != DNS_T_SOA || dns_get_domain(rr, owner, sizeof(owner), &type, &qclass) ||
+			qclass != DNS_C_IN || dns_get_SOA(rr, owner, sizeof(owner), &ttl, &soa) || ttl < 0) continue;
+		size_t zone_len = strlen(owner), domain_len = strlen(domain);
+		if (!zone_len || !strcmp(owner, ".") || (domain_len >= zone_len &&
+			!strcasecmp(domain + domain_len - zone_len, owner) &&
+			(domain_len == zone_len || domain[domain_len - zone_len - 1] == '.'))) return 1;
+	}
+	return 0;
+}
+
 int _dns_server_process_answer(struct dns_request *request, const char *domain, struct dns_packet *packet,
 							   unsigned int result_flag, int *need_passthrouh)
 {
@@ -509,6 +533,9 @@ int _dns_server_process_answer(struct dns_request *request, const char *domain, 
 	if (is_rcode_set == 0 && has_result == 1 && is_skip == 0) {
 		if (cname[0] != '\0') {
 			return DNS_CLIENT_ACTION_OK;
+		}
+		if (_dns_server_is_nodata(packet, domain, request->qtype)) {
+			return DNS_CLIENT_ACTION_OK_WAIT;
 		}
 
 		/* need retry for some server. */

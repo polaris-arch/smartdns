@@ -703,7 +703,7 @@ TEST(UpstreamPolicy, FirstSendUdpQueryAfterCooldownCanStillProveRecoveryThroughR
 }
 
 TEST(UpstreamPolicy, RecoveryExchangeCallbackContractIsSeparateFromDnsBusinessSuccess) {
-    for (int action : {DNS_CLIENT_ACTION_OK, DNS_CLIENT_ACTION_MAY_RETRY,
+    for (int action : {DNS_CLIENT_ACTION_OK, DNS_CLIENT_ACTION_OK_WAIT, DNS_CLIENT_ACTION_MAY_RETRY,
                        DNS_CLIENT_ACTION_UNDEFINE, DNS_CLIENT_ACTION_RETRY, DNS_CLIENT_ACTION_DROP}) {
         for (int rcode : {DNS_RC_NOERROR, DNS_RC_NXDOMAIN, DNS_RC_SERVFAIL, DNS_RC_REFUSED}) {
             SCOPED_TRACE(::testing::Message() << "action=" << action << " rcode=" << rcode);
@@ -717,7 +717,8 @@ TEST(UpstreamPolicy, RecoveryExchangeCallbackContractIsSeparateFromDnsBusinessSu
             EXPECT_EQ(registered.calls, 1); EXPECT_EQ(registered.rcode, rcode);
             EXPECT_EQ(probe.query.has_result, action == DNS_CLIENT_ACTION_OK);
             bool accepted = action != DNS_CLIENT_ACTION_RETRY && action != DNS_CLIENT_ACTION_DROP;
-            EXPECT_EQ(probe.query.terminal, accepted && action != DNS_CLIENT_ACTION_MAY_RETRY);
+            EXPECT_EQ(probe.query.terminal, accepted && action != DNS_CLIENT_ACTION_MAY_RETRY &&
+                action != DNS_CLIENT_ACTION_OK_WAIT);
             ASSERT_EQ(a.Wire(), DNS_ADMIT_OK);
             EXPECT_EQ(b.Wire(), accepted ? DNS_ADMIT_OK : DNS_ADMIT_WAIT);
         }
