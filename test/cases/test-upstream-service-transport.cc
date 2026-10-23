@@ -150,6 +150,7 @@ public:
     bool address_negatives = false;
     bool tcp_nodelay = false;
     bool close_after_reply = false;
+    unsigned wait_for_requests = 0;
     const char *retry_after = "1";
     bool Start(const char *ip, unsigned port, bool h2) {
         h2_ = h2;
@@ -261,7 +262,7 @@ private:
             pollfd p{SSL_get_fd(ssl), POLLIN, 0}; poll(&p, 1, 5);
         }
         std::map<http2_stream *, std::vector<uint8_t>> bodies;
-        std::set<http2_stream *> answered;
+        std::set<http2_stream *> answered, counted;
         while (run_ && handshake == 1) {
             http2_poll_item items[16]{}; int count = 0;
             int ret = http2_ctx_poll(ctx, items, 16, &count);
@@ -272,6 +273,19 @@ private:
                 }
                 if (items[i].stream) http2_stream_put(items[i].stream);
             }
+            // A cancellation fixture may need all sibling requests on the wire
+            // before its fast competitor is released. Collect complete bodies
+            // first, without blocking the peer while reading the first stream.
+            if (wait_for_requests && requests < wait_for_requests) {
+                for (auto &body : bodies) {
+                    uint8_t data[1024];int n;
+                    while ((n=http2_stream_read_body(body.first,data,sizeof(data)))>0)
+                        body.second.insert(body.second.end(),data,data+n);
+                    if (body.second.size()>DNS_IN_PACKSIZE) {run_=false;break;}
+                    if (http2_stream_is_remote_end(body.first) && counted.insert(body.first).second) requests++;
+                }
+                if (requests < wait_for_requests) {pollfd p{SSL_get_fd(ssl),POLLIN,0};poll(&p,1,5);continue;}
+            }
             for (auto it = bodies.begin(); it != bodies.end();) {
                 auto *stream = it->first;
                 if (!answered.count(stream)) {
@@ -279,7 +293,8 @@ private:
                     while ((n = http2_stream_read_body(stream, data, sizeof(data))) > 0) it->second.insert(it->second.end(), data, data + n);
                     if (it->second.size() > DNS_IN_PACKSIZE) { run_ = false; break; }
                     if (http2_stream_is_remote_end(stream)) {
-                        requests++; bool throttle = on_request && on_request();
+                        if(counted.insert(stream).second) requests++;
+                        bool throttle = on_request && on_request();
                         std::vector<uint8_t> response; std::string error;
                         if (throttle) {
                             http2_header_pair headers[] = {{"retry-after", retry_after}, {"content-length", "0"}};
@@ -294,7 +309,7 @@ private:
                     }
                 }
                 if (answered.count(stream) && http2_stream_is_end(stream)) {
-                    answered.erase(stream); http2_stream_close(stream); it = bodies.erase(it);
+                    answered.erase(stream);counted.erase(stream); http2_stream_close(stream); it = bodies.erase(it);
                 } else ++it;
             }
             if (close_after_reply && requests && bodies.empty()) break;
@@ -414,12 +429,13 @@ TEST(UpstreamServiceTransport, RealH2Nodata40CompletesServiceWithoutDuplicateAtt
 namespace {
 void late_h2_cancel_case() {
     PoolTlsPeer delayed; delayed.close_after_reply = true; delayed.address_negatives = true;
+    delayed.wait_for_requests = 2;
     delayed.on_request = [] { poll(nullptr, 0, 200); return false; };
     ASSERT_TRUE(delayed.Start("127.0.0.1", 62995, true));
     smartdns::MockServer fast;
     ASSERT_TRUE(fast.Start("udp://127.0.0.1:62996", [&](auto *r) {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-        while (!delayed.requests && std::chrono::steady_clock::now() < deadline) poll(nullptr, 0, 1);
+        while (delayed.requests < 2 && std::chrono::steady_clock::now() < deadline) poll(nullptr, 0, 1);
         dns_add_domain(r->response_packet, r->domain.c_str(), r->qtype, r->qclass);
         smartdns::MockServer::AddIP(r, r->domain, r->qtype == DNS_T_AAAA ? "2001:db8::90" : "192.0.2.90", 60);
         return smartdns::SERVER_REQUEST_OK;
@@ -435,7 +451,7 @@ void late_h2_cancel_case() {
     poll(nullptr, 0, 800);
     ASSERT_EQ(dns_client_get_loop_diagnostics_v1(&after), 0);
     std::cout << "Late H2 response/EOF: iterations=" << after.iterations - before.iterations
-        << " ready=" << after.ready_events - before.ready_events << std::endl;
+        << " ready=" << after.ready_events - before.ready_events << " requests=" << delayed.requests.load() << std::endl;
     EXPECT_EQ(delayed.requests.load(), 2u);
     EXPECT_LT(after.iterations - before.iterations, 1000u);
 }
