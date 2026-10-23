@@ -44,6 +44,7 @@ extern "C" {
 #define DNS_TCP_IDLE_TIMEOUT (60 * 10)
 #define DNS_TCP_CONNECT_TIMEOUT (5)
 #define DNS_QUERY_TIMEOUT (500)
+#define DNS_QUERY_LIFETIME (2000)
 #define DNS_QUERY_RETRY (4)
 #define DNS_PENDING_SERVER_RETRY 60
 #define SOCKET_PRIORITY (6)
@@ -168,6 +169,11 @@ struct dns_server_info {
 	 * loop finishes: see _dns_client_close_socket_ext() and
 	 * _dns_client_process_guard_enter/leave().
 	 */
+    unsigned long service_connect_tick, service_keepalive_tick, service_ping_tick;
+    uint64_t service_ping_cookie;
+    unsigned service_draining, service_normal_close, service_protocol_ready, service_keepalive_interval_ms, service_rotation;
+    int service_error_phase, service_error_code, service_system_error;
+    uint64_t service_tls_error;
 	int process_depth;
 	int close_deferred;
 };
@@ -313,6 +319,7 @@ struct dns_query_struct {
 	struct dns_query_budget *budget;
 	struct dns_query_attempt *attempts;
 	unsigned long created_tick;
+    unsigned lifetime_ms;
 	unsigned long next_send_tick;
 	int terminal;
 	int single_upstream;

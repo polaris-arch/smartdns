@@ -31,7 +31,7 @@ struct ServiceState {
     }
     ServiceState(unsigned n = 2, unsigned cap = 0, const char *quota = "", unsigned rate = 0, unsigned burst = 0, unsigned cooldown = 100)
       : endpoints(new dns_server_info[n]{}), count(n) {
-        atomic_set(&s.refs, 1); pthread_mutex_init(&s.lock, nullptr); pthread_mutex_init(&s.turn_lock, nullptr);
+        atomic_set(&s.refs, 1); pthread_mutex_init(&s.lock, nullptr); pthread_mutex_init(&s.turn_lock, nullptr); pthread_mutex_init(&s.detail_lock, nullptr);
         INIT_LIST_HEAD(&s.list); INIT_LIST_HEAD(&s.timer); INIT_LIST_HEAD(&s.waiters);
         s.started = 1; s.timer_due = ULONG_MAX; s.config.max_backends = n;
         s.type = DNS_SERVER_HTTPS; s.flags.type = s.type; s.flags.max_upstream_connections = cap;
@@ -44,7 +44,8 @@ struct ServiceState {
             pthread_mutexattr_init(&attr); pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
             pthread_mutex_init(&ep.lock, &attr); pthread_mutexattr_destroy(&attr);
             atomic_set(&ep.refcnt, 1); INIT_LIST_HEAD(&ep.conn_stream_list);
-            ep.fd = -1; ep.type = s.type; ep.flags = s.flags; ep.service = &s;
+            ep.fd = -1; ep.status = DNS_SERVER_STATUS_CONNECTED; ep.service_protocol_ready = 1; // simulated ready transport; no socket IO
+            ep.type = s.type; ep.flags = s.flags; ep.service = &s;
             ep.service_member_id = i + 1; ep.service_valid_until = ULONG_MAX; ep.ai_family = AF_INET; ep.ai_addrlen = sizeof(ep.in);
             ep.in.sin_family = AF_INET; ep.in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             ep.in.sin_port = htons(63000 + i); ep.so_mark = -1;
@@ -64,7 +65,7 @@ struct ServiceState {
         Flush(); s.stopping = 1; list_del_init(&s.timer);
         for (unsigned i = 0; i < count; i++) { _dns_policy_detach(&endpoints[i]); pthread_mutex_destroy(&endpoints[i].lock); }
         _dns_policy_service_release(&s); EXPECT_EQ(atomic_read(&s.refs), 1);
-        pthread_mutex_destroy(&s.turn_lock); pthread_mutex_destroy(&s.lock);
+        pthread_mutex_destroy(&s.turn_lock); pthread_mutex_destroy(&s.detail_lock); pthread_mutex_destroy(&s.lock);
         for (auto it = Live().begin(); it != Live().end(); ++it) if (*it == &s) { Live().erase(it); break; }
     }
 };
@@ -577,4 +578,15 @@ TEST(UpstreamServiceState, DiagnosticResultProvenanceDoesNotCallOwnRejectedResul
     EXPECT_EQ(s.s.stats.failure_count, 1U);
     EXPECT_EQ(s.s.diagnostics.failure_end[DNS_END_UNACCEPTED_RESULT], 1U);
     EXPECT_EQ(s.s.diagnostics.failure_end[DNS_END_OTHER_RESULT], 0U);
+}
+
+TEST(UpstreamServiceState, ServiceDeadlineRecordsWholeAgeWithoutPenalizingEndpoint) {
+    ServiceState s(1);s.s.config.response_timeout_ms=600;s.s.config.query_timeout_ms=700;
+    ServiceQuery q(s);q.q.created_tick-=300;
+    auto *ep=Pick(s,q);ASSERT_NE(ep,nullptr);Positive(s,q,ep);
+    _dns_attempt_expire(&q.q,get_tick_count()+500);s.Flush();
+    EXPECT_EQ(s.s.detail.kind_counts[DNS_DETAIL_QUERY_TIMEOUT],1U);
+    EXPECT_EQ(s.s.detail.kind_counts[DNS_DETAIL_RESPONSE_TIMEOUT],0U);
+    EXPECT_GE(s.s.detail.events[0].elapsed_ms,800U);EXPECT_EQ(s.s.detail.events[0].limit_ms,700U);
+    EXPECT_EQ(ep->service_retry_at,0U);
 }

@@ -1,3 +1,4 @@
+#include "smartdns/upstream_service.h"
 /*************************************************************************
  *
  * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
@@ -189,6 +190,7 @@ static int dns_server_resolve_callback(const char *domain, dns_result_type rtype
 			}
 		}
 
+        if (atomic_read(&request->notified)) dns_client_response_reject_reason(DNS_REJECT_COMPLETED);
 		ret = _dns_server_process_answer(request, domain, packet, result_flag, &need_passthrouh);
 		if (ret == 0 && need_passthrouh == 1 && atomic_read(&request->notified) == 0) {
 			/* not supported record, passthrouth */

@@ -1,9 +1,20 @@
 --- a/src/lib/backend/server.ts
 +++ b/src/lib/backend/server.ts
-@@ -264,7 +264,29 @@
+@@ -264,7 +264,41 @@
      registrar: string;
  }
-
+ 
++export interface UpstreamPolicyData {
++    version: number; family: number; response_timeout_ms: number; query_timeout_ms: number;
++    connect_timeout_ms: number; connect_delay_ms: number; keepalive_ms: number;
++    sequence: number; dropped_events: number; kind_counts: number[]; reject_counts: number[];
++    response_histogram: number[];
++    paths: Array<{ip: string; source: string; interface: string; family: number; state: number;
++      selected: boolean; connected: boolean; active_attempts: number; attempts: number; successes: number; failures: number; keepalive_ms: number}>;
++    events: Array<{sequence: number; query_id: number; age_ms: number; ip: string; family: number; port: number;
++      kind: number; phase: number; code: number; system_error: number; elapsed_ms: number; limit_ms: number; tls_error: number; message: string}>;
++}
++
 +export interface UpstreamDiagnosticsData {
 +    version: number;
 +    qps: number;
@@ -13,6 +24,7 @@
 +    skip_wait: Record<string, number>;
 +    failure_last_event: Record<string, number>;
 +    events: Record<string, number>;
++    policy?: UpstreamPolicyData | null;
 +    client_loop?: {cpu_percent?: number | null; sample_wall_ms?: number; sample_age_ms?: number;
 +      zero_wait_no_events?: number; iterations?: number; wakeups?: number} | null;
 +}
@@ -34,7 +46,7 @@
 +++ b/src/components/dashboard/upstream-servers/upstream-servers-table.tsx
 @@ -1,6 +1,7 @@
  "use client"
-
+ 
  import * as React from 'react';
 +import { UpstreamDiagnostics } from './upstream-diagnostics';
  import { useMemo, useState } from 'react';
@@ -85,10 +97,10 @@
      enableColumnOrdering: false,
 --- /dev/null
 +++ b/src/components/dashboard/upstream-servers/upstream-diagnostics.tsx
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,83 @@
 +import type * as React from 'react';
 +import { useState } from 'react';
-+import { Button, Dialog, DialogTitle, DialogContent, DialogActions } from '@mui/material';
++import { Button, Dialog, DialogTitle, DialogContent, DialogActions, Tabs, Tab } from '@mui/material';
 +import { type UpStreamServers } from '@/lib/backend/server';
 +import i18n from '@/components/core/i18n';
 +
@@ -108,45 +120,64 @@
 +  attempt_timeout: ['发送尝试超时', 'Attempt timed out'], io_or_protocol_error: ['IO 或协议处理错误', 'IO or protocol processing error'],
 +};
 +
++const kinds = ['响应尝试超时|Response attempt timeout','DNS 响应未被接受|DNS response not accepted','传输或协议错误|Transport or protocol error','空闲正常关闭|Normal idle close','服务端 GOAWAY|Peer GOAWAY','保活发送|Keepalive sent','保活确认|Keepalive acknowledged','保活探测超时|Keepalive timeout','建连超时|Connection timeout','服务期限耗尽|Service deadline expired','HTTP 429 限速|HTTP 429 rate limited','HTTP 503 不可用|HTTP 503 unavailable','DNS 错误响应码|DNS error RCODE'];
++const rejects = ['尚未分类|Unclassified','地址规则过滤|Address policy filter','截断需重试|Truncated response','无可用记录|No usable record','请求已完成|Request completed','问题节不匹配|Question mismatch'];
++const routes = ['有匹配路由|Matching route','地址族已排除|Family excluded','无匹配路由|No matching route','无可用源地址|No source address','出口绑定不可用|Binding unavailable','路由未确认|Route unconfirmed'];
++const phases = ['响应|Response','建连|Connect','TLS|TLS','HTTP/2|HTTP/2','HTTP/3|HTTP/3','Socket|Socket','策略|Policy'];
 +export function UpstreamDiagnostics({server}: {server: UpStreamServers}): React.JSX.Element | null {
-+  const [open, setOpen] = useState(false);
-+  const d = server.diagnostics;
++  const [open,setOpen] = useState(false), [tab,setTab] = useState(0);
++  const d=server.diagnostics;
 +  if (!server.pool_enabled || !d) return null;
-+  const zh = i18n.language?.startsWith('zh');
-+  const text = (cn: string, en: string): string => zh ? cn : en;
-+  const counts = (values: Record<string, number>): React.JSX.Element => {
-+    const entries = Object.entries(values).filter(([, value]) => value > 0);
-+    return <dl>{entries.length > 0 ? entries.map(([key, value]) => <div key={key}>
-+      <dt style={{display: 'inline'}}>{labels[key]?.[zh ? 0 : 1] ?? key}: </dt>
-+      <dd style={{display: 'inline', margin: 0}}>{value}</dd>
-+    </div>) : <div>0</div>}</dl>;
++  const lang=i18n.language?.startsWith('zh') ? 0 : 1;
++  const text=(cn:string,en:string):string => lang===0 ? cn : en;
++  const name=(values:string[],index:number):string => values[index]?.split('|')[lang] ?? String(index);
++  const policy=d.policy, loop=d.client_loop;
++  const counts=(values:Record<string,number>):React.JSX.Element => <dl>{Object.entries(values).filter(([,n])=>n>0).map(([key,n])=><div key={key} style={{display:'flex',justifyContent:'space-between',gap:16,padding:'6px 0'}}><dt>{labels[key]?.[lang]??key}</dt><dd style={{margin:0}}>{n}</dd></div>)}</dl>;
++  const hist=policy?.response_histogram??[], samples=hist.reduce((a,b)=>a+b,0);
++  const quantile=(fraction:number):string => {
++    if (!samples) return 'N/A'; let sum=0;
++    for (const [i,count] of hist.entries()) {sum+=count;if(sum>=Math.ceil(samples*fraction))return i<8?'≤'+[10,25,50,100,250,500,1000,2000][i]+' ms':'>2000 ms';}
++    return 'N/A';
 +  };
-+  const success = server.success_count ?? 0, failure = server.failure_count ?? 0;
-+  const settled = success + failure;
-+  const sentRate = settled ? (success / settled * 100).toFixed(2) + '%' : 'N/A';
-+  const loop = d.client_loop;
-+  const cpu = typeof loop?.cpu_percent === 'number' && Number.isFinite(loop.cpu_percent) ? loop.cpu_percent.toFixed(2) + '%' : 'N/A';
-+  return <>
-+    <Button size="small" onClick={() => { setOpen(true); }}>{text('诊断', 'Diagnostics')}</Button>
-+    <Dialog open={open} onClose={() => { setOpen(false); }} maxWidth="md" fullWidth>
-+      <DialogTitle sx={{overflowWrap: 'anywhere'}}>{server.host} · {text('统计诊断', 'Diagnostics')}</DialogTitle>
++  const panelStyle={padding:'12px 0',borderBottom:'1px solid #ddd'};
++  return <><Button size="small" onClick={()=>{setOpen(true);}}>{text('诊断','Diagnostics')}</Button>
++    <Dialog open={open} onClose={()=>{setOpen(false);}} maxWidth="md" fullWidth>
++      <DialogTitle sx={{overflowWrap:'anywhere'}}>{server.host} · {text('统计诊断','Diagnostics')}</DialogTitle>
 +      <DialogContent dividers>
-+      <section aria-label={text('服务池统计诊断', 'Service pool diagnostics')} style={{textAlign: 'left', whiteSpace: 'normal', overflowWrap: 'anywhere'}}>
-+      <p>{text('表格成功率 = 成功 ÷ 全部查询（含跳过、在途）', 'Table rate = successes / all queries, including skipped and in-flight')}</p>
-+      <p>{text('总查询 / 成功 / 已发送未成功 / 未发送 / 在途', 'Queries / successful / sent unsuccessful / unsent / in-flight')}: {server.query_count} / {success} / {failure} / {server.skip_count} / {server.in_flight}</p>
-+      <p>{text('已发送且结算的成功占比', 'Success share of sent settled queries')}: {sentRate} ({text('仍含取消，不能等同网络成功率', 'includes cancellations; not a network reliability metric')})</p>
-+      <p>QPS: {d.qps || text('不限', 'unlimited')}; {text('固定冷却', 'Fixed cooldown')}: {d.cooldown_ms} ms</p>
-+      <strong>{text('已发送未成功：结束原因', 'Sent unsuccessful: terminal context')}</strong>{counts(d.failure_end)}
-+      <strong>{text('未发送：结束原因', 'Unsent: terminal context')}</strong>{counts(d.skip_end)}
-+      <strong>{text('未发送：最后等待状态', 'Unsent: last wait state')}</strong>{counts(d.skip_wait)}
-+      <strong>{text('未成功：结算前最后记录事件', 'Unsuccessful: last recorded event')}</strong>{counts(d.failure_last_event)}
-+      <strong>{text('错误事件累计（可重复，不与查询数相加）', 'Error events (may repeat; separate from query totals)')}</strong>{counts(d.events)}
-+      <p>{text('最后记录事件不一定是最终根因；各维度分别统计', 'Last observed event is not necessarily the root cause; dimensions are separate')}</p>
-+      <p>{text('全局客户端线程 CPU（单核）', 'Global client thread CPU (one core)')}: {cpu}; {text('采样窗口 / 距今', 'Sample window / age')}: {loop?.sample_wall_ms ?? 0} / {loop?.sample_age_ms ?? 0} ms</p>
-+      <p>{text('零等待空返回 / 循环 / 唤醒累计', 'Empty zero-wait polls / iterations / wakeups')}: {loop?.zero_wait_no_events ?? 0} / {loop?.iterations ?? 0} / {loop?.wakeups ?? 0}</p>
-+      </section>
-+      </DialogContent>
-+      <DialogActions><Button onClick={() => { setOpen(false); }}>{text('关闭', 'Close')}</Button></DialogActions>
++        <div style={{display:'grid',gridTemplateColumns:'repeat(2,minmax(0,1fr))',gap:12}}>
++          {[[text('已接受响应','Accepted responses'),server.success_count],[text('已发送未成功','Sent unsuccessful'),server.failure_count],[text('未发送','Unsent'),server.skip_count],[text('处理中','In progress'),server.in_flight]].map(([label,value])=><div key={String(label)} style={{padding:12,border:'1px solid #ddd',borderRadius:8}}><div>{label}</div><strong style={{fontSize:24}}>{value??0}</strong></div>)}
++        </div>
++        <p style={{fontSize:13}}>{text('总请求','Total requests')}: {server.query_count}. {text('表格比例包含未发送与取消，不等同网络可用率。','Table rate includes unsent and cancelled work; it is not network availability.')}</p>
++        <Tabs value={tab} onChange={(_,v:number)=>{setTab(v);}} variant="scrollable" scrollButtons="auto" aria-label={text('诊断分类','Diagnostic categories')}>
++          <Tab label={text('结果原因','Outcomes')}/><Tab label={text('后端与延迟','Backends & latency')}/><Tab label={text('事件明细','Events')}/><Tab label={text('运行状态','Runtime')}/>
++        </Tabs>
++        <section role="tabpanel" style={{paddingTop:16,minHeight:180,overflowWrap:'anywhere'}}>
++          {tab===0&&<><h3>{text('已发送未成功：如何结束','Sent unsuccessful: how it ended')}</h3>{counts(d.failure_end)}<h3>{text('未发送：为何结束','Unsent: why it ended')}</h3>{counts(d.skip_end)}<details><summary>{text('未发送前的等待阶段','Wait stage before unsent settlement')}</summary>{counts(d.skip_wait)}</details></>}
++          {tab===1&&<>
++            <p>{text('连接地址族','Transport family')}: {policy?.family===4?'IPv4':policy?.family===6?'IPv6':text('双栈，按出口匹配','Dual stack, matched to egress')}</p>
++            <p>{text('响应 / 建连 / 总期限','Response / connect / total')}: {policy?.response_timeout_ms??'N/A'} / {policy?.connect_timeout_ms??'N/A'} / {policy?.query_timeout_ms??'N/A'} ms</p>
++            <p>P50 {quantile(.5)} · P95 {quantile(.95)} · P99 {quantile(.99)}</p>
++            <small>{text('直方图上界估计，仅含归属明确的响应；超时另记，不能从响应样本推断全部尾延迟。','Histogram upper-bound estimates from unambiguous responses. Timeouts are separate; response samples do not represent every request tail.')}</small>
++            {(policy?.paths??[]).map(path=><article key={path.ip} style={panelStyle}><strong>{path.ip}</strong> · IPv{path.family}<p>{name(routes,path.state)} · {path.selected?text('池成员','Pool member'):text('未选入','Not selected')} · {path.connected?text('已连接','Connected'):text('未连接','Disconnected')}</p><p>{text('出口 / 源地址','Egress / source')}: {path.interface||'N/A'} / {path.source||'N/A'}</p><small>{text('发送 / 接受 / 未成功尝试 / 在途','Sends / accepted / unsuccessful attempts / active')}: {path.attempts} / {path.successes} / {path.failures} / {path.active_attempts}</small><p>{text("实际协议保活间隔","Effective protocol keepalive interval")}: {path.keepalive_ms||text("关闭或尚未协商","Off or not negotiated")} {path.keepalive_ms?"ms":""}</p></article>)}
++            {!policy&&<p>{text('核心未提供分阶段诊断','Core does not expose detailed policy')}</p>}
++          </>}
++          {tab===2&&<>
++            <p>{text('事件可重复，不等同失败请求数。明细限量保留，累计计数不受影响。','Events may repeat and are not failed-query counts. Recent details are bounded; cumulative counters are retained.')}</p>
++            <details><summary>{text('累计事件 / 结算前最后事件','Cumulative events / last event before settlement')}</summary>{counts(d.events)}{counts(d.failure_last_event)}</details>
++            {(policy?.events??[]).map(event=><article key={event.sequence} style={panelStyle}><strong>{event.kind===2&&event.phase===0&&event.code>=300&&event.code<=599?`HTTP ${event.code}`:name(kinds,event.kind)}</strong> · {event.ip} · IPv{event.family} · #{event.query_id||"—"}<div>{text('快照前','Before snapshot')} {(event.age_ms/1000).toFixed(1)} s · {name(phases,event.phase)}</div>{event.kind===1&&<div>{name(rejects,event.code)}</div>}{[4,10,11,12].includes(event.kind)&&event.code!==0&&<div>{text('响应 / 协议码','Response / protocol code')}: {event.code}</div>}{(event.elapsed_ms>0||event.limit_ms>0)&&<div>{text('耗时 / 门限','Elapsed / limit')}: {event.elapsed_ms} / {event.limit_ms} ms</div>}{event.kind===2&&<div>{event.message||text("尚无错误文本","No error text")} · {text('协议码 / 系统错误码','Protocol code / system error')}: {event.code} / {event.system_error}</div>}</article>)}
++            {policy?.events.length===0&&<p>{text('暂无事件','No events')}</p>}
++          </>}
++          {tab===3&&<>
++            <p>QPS: {d.qps||text('不限','unlimited')} · {text('HTTP 固定冷却','Fixed HTTP cooldown')}: {d.cooldown_ms} ms</p>
++            <p>{text('两族建连间隔','Family connection delay')}: {policy?.connect_delay_ms??'N/A'} ms</p>
++            <p>{text('协议保活间隔','Protocol keepalive interval')}: {policy?.keepalive_ms===0?text('关闭','Off'):String(policy?.keepalive_ms??'N/A')+' ms'}</p>
++            <small>{text('HTTP/2 使用 PING/ACK；HTTP/3 使用可忽略扩展帧维持 QUIC 活性，ACK 由 QUIC 库处理。上游仍可主动关闭连接。','HTTP/2 uses PING/ACK. HTTP/3 uses an ignorable extension frame; QUIC handles ACKs. Peers can still close connections.')}</small>
++            <p>{text('保活发送 / HTTP/2 ACK','Keepalive sent / HTTP2 ACK')}: {policy?.kind_counts[5]??0} / {policy?.kind_counts[6]??0}. {text('正常探测仅汇总，不挤占最近异常记录。','Healthy probes are counted without crowding out recent errors.')}</p>
++            <h3>{text('全局客户端线程' ,'Global client thread')}</h3><p>CPU {typeof loop?.cpu_percent==='number'?loop.cpu_percent.toFixed(2)+'%':'N/A'}</p><p>{text('采样窗口 / 距今','Sample window / age')}: {loop?.sample_wall_ms??0} / {loop?.sample_age_ms??0} ms</p>
++            <details><summary>{text('循环计数','Loop counters')}</summary><p>{text('空转 / 循环 / 唤醒','Empty polls / iterations / wakeups')}: {loop?.zero_wait_no_events??0} / {loop?.iterations??0} / {loop?.wakeups??0}</p></details>
++          </>}
++        </section>
++      </DialogContent><DialogActions><Button onClick={()=>{setOpen(false);}}>{text('关闭','Close')}</Button></DialogActions>
 +    </Dialog>
 +  </>;
 +}

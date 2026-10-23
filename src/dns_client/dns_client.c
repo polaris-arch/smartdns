@@ -41,6 +41,8 @@
 #include "query.h"
 #include "upstream_policy.h"
 #include "upstream_service.h"
+
+static _Thread_local unsigned response_reject_reason;
 #include "server_info.h"
 #include "wake_event.h"
 
@@ -172,14 +174,23 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 
 	/* notify caller dns query result */
 	if (query->callback) {
+        unsigned saved_reason = response_reject_reason;
+        response_reject_reason = DNS_REJECT_UNCLASSIFIED;
 		ret = query->callback(query->domain, DNS_QUERY_RESULT, server_info, packet, inpacket, inpacket_len,
 							  query->user_ptr);
 
+        unsigned reject_reason = response_reject_reason;
+        response_reject_reason = saved_reason;
         int accepted = (ret == DNS_CLIENT_ACTION_OK || ret == DNS_CLIENT_ACTION_OK_WAIT) &&
             (packet->head.rcode == DNS_RC_NOERROR || packet->head.rcode == DNS_RC_NXDOMAIN);
         if (!accepted) _dns_service_diagnostic_event(query, server_info,
             packet->head.rcode != DNS_RC_NOERROR && packet->head.rcode != DNS_RC_NXDOMAIN ?
             DNS_EVENT_DNS_RCODE : DNS_EVENT_DNS_REJECTED);
+        if (!accepted) {
+            int bad_rcode = packet->head.rcode != DNS_RC_NOERROR && packet->head.rcode != DNS_RC_NXDOMAIN;
+            _dns_service_detail(query, server_info, bad_rcode ? DNS_DETAIL_DNS_RCODE : DNS_DETAIL_DNS_REJECT,
+                DNS_PHASE_RESPONSE, bad_rcode ? packet->head.rcode : reject_reason, 0, 0);
+        }
         _dns_service_query_result(query, server_info, accepted);
 		if (ret == DNS_CLIENT_ACTION_RETRY || ret == DNS_CLIENT_ACTION_DROP) {
 			/* remove this result */
@@ -523,7 +534,7 @@ struct dns_query_budget *dns_client_query_budget_new(const char *group_name)
 {
     struct dns_server_group *selected = _dns_client_get_dnsserver_group(group_name);
     if (!selected) return NULL;
-    unsigned int members = 0;
+    unsigned int members = 0, lifetime = 0;
     pthread_mutex_lock(&client.server_list_lock);
     struct dns_server_group *groups[2] = {selected, _dns_client_get_group("fallback")};
     for (int i = 0; i < 2; i++) {
@@ -531,10 +542,13 @@ struct dns_query_budget *dns_client_query_budget_new(const char *group_name)
         struct dns_server_group_member *member;
         list_for_each_entry(member, &groups[i]->head, list) {
             if (members < UINT_MAX / DNS_QUERY_RETRY) members++;
+            unsigned member_lifetime = member->service && member->service->config.query_timeout_ms ?
+                member->service->config.query_timeout_ms : DNS_QUERY_LIFETIME;
+            if (member_lifetime > lifetime) lifetime = member_lifetime;
         }
     }
     pthread_mutex_unlock(&client.server_list_lock);
-    return dns_query_budget_new(members ? members * DNS_QUERY_RETRY : 1, DNS_QUERY_RETRY * DNS_QUERY_TIMEOUT);
+    return dns_query_budget_new(members ? members * DNS_QUERY_RETRY : 1, lifetime ? lifetime : DNS_QUERY_LIFETIME);
 }
 
 int dns_client_query(const char *domain, int qtype, dns_client_callback callback, void *user_ptr,
@@ -579,6 +593,7 @@ int dns_client_query(const char *domain, int qtype, dns_client_callback callback
 		query->budget = options->budget;
 		dns_query_budget_get(query->budget);
 	}
+	query->lifetime_ms = DNS_QUERY_LIFETIME;
 	query->has_result = 0;
     query->result_service = NULL;
 	query->server_group = query->bootstrap_only ? _dns_client_get_group("bootstrap-dns") :
@@ -598,11 +613,13 @@ int dns_client_query(const char *domain, int qtype, dns_client_callback callback
             unsigned count = 0;
             struct dns_server_group_member *member;
             list_for_each_entry(member, &query->server_group->head, list) count++;
-            query->budget = dns_query_budget_new(count * DNS_QUERY_RETRY, DNS_QUERY_RETRY * DNS_QUERY_TIMEOUT);
+            query->budget = dns_query_budget_new(count * DNS_QUERY_RETRY, DNS_QUERY_LIFETIME);
         } else query->budget = dns_client_query_budget_new(group_name);
         if (!query->budget) goto errout;
     }
 
+    unsigned remaining = dns_query_budget_remaining_ms(query->budget);
+    if (remaining) query->lifetime_ms = remaining;
 	query->conf = dns_server_get_rule_group(options->conf_group_name);
 	if (query->conf == NULL) {
 		tlog(TLOG_ERROR, "get dns config group %s failed.", options->conf_group_name);
@@ -658,6 +675,7 @@ errout:
 
 static void _dns_client_period_run_second(void)
 {
+	_dns_services_network_tick();
 	_dns_client_check_tcp();
 	_dns_client_check_servers();
 	_dns_client_add_pending_servers();
@@ -692,7 +710,7 @@ static void _dns_client_period_run(unsigned int msec)
 		 * Deferral never grants a fresh lifetime or creates duplicate active work. */
 		if (query->terminal) {
 			/* already completed by a callback */
-		} else if (now - query->created_tick >= DNS_QUERY_RETRY * DNS_QUERY_TIMEOUT ||
+		} else if (now - query->created_tick >= query->lifetime_ms ||
 				   !dns_query_budget_remaining_ms(query->budget)) {
 			_dns_client_query_remove(query);
 		} else if (atomic_read(&query->dns_request_sent) == 0) {
@@ -849,10 +867,25 @@ static void *_dns_client_work(void *arg)
                     server_info->active_attempts);
             _dns_client_loop_diagnostic_ready(server_info, event->events, now, live_event);
             pthread_mutex_unlock(&server_info->lock);
-            if (live_event && _dns_client_process(server_info, event, now) < 0 && server_info->service &&
-                !_dns_policy_service_cooldown(server_info->service, get_tick_count())) {
-                _dns_service_diagnostic_event(NULL, server_info, DNS_EVENT_IO_OR_PROTOCOL);
-                _dns_service_endpoint_failure(server_info);
+            if (live_event) {
+                server_info->service_error_phase = DNS_PHASE_SOCKET;
+                server_info->service_error_code = server_info->service_system_error = 0;
+                server_info->service_tls_error = 0;
+                int processed = _dns_client_process(server_info, event, now);
+                if (processed < 0 && server_info->service &&
+                    !_dns_policy_service_cooldown(server_info->service, get_tick_count())) {
+                    if (server_info->service_normal_close) {
+                        _dns_service_detail(NULL, server_info, DNS_DETAIL_IDLE_CLOSE,
+                            server_info->service_error_phase, 0, 0, 0);
+                    } else {
+                        _dns_service_diagnostic_event(NULL, server_info, DNS_EVENT_IO_OR_PROTOCOL);
+                        _dns_service_detail(NULL, server_info, DNS_DETAIL_TRANSPORT_ERROR,
+                            server_info->service_error_phase, server_info->service_error_code, 0, 0);
+                        _dns_service_endpoint_failure(server_info);
+                    }
+                }
+                if (processed >= 0 && (server_info->type == DNS_SERVER_HTTP3 || server_info->type == DNS_SERVER_QUIC))
+                    _dns_service_transport_changed(server_info);
             }
             _dns_services_flush_pending();
 		}
@@ -863,6 +896,11 @@ static void *_dns_client_work(void *arg)
 	client.epoll_fd = -1;
 
 	return NULL;
+}
+
+void dns_client_response_reject_reason(unsigned reason)
+{
+    response_reject_reason = reason < DNS_REJECT_COUNT ? reason : DNS_REJECT_UNCLASSIFIED;
 }
 
 int dns_client_init(void)

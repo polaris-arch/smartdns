@@ -23,6 +23,9 @@ struct dns_upstream_pool_config {
     unsigned max_backends;
     unsigned ip_count;
     char ips[DNS_UPSTREAM_BACKENDS_MAX][DNS_UPSTREAM_IP_TEXT_MAX];
+    unsigned family; /* 0 dual, 4 IPv4, 6 IPv6. Applies to transport only. */
+    unsigned response_timeout_ms, query_timeout_ms, connect_timeout_ms, connect_delay_ms;
+    unsigned keepalive_ms, keepalive_disabled, connect_delay_set;
 };
 int dns_client_add_service(const char *host, int port, dns_server_type_t type,
     const struct client_dns_server_flags *flags, const struct dns_upstream_pool_config *pool);
@@ -61,6 +64,46 @@ struct dns_upstream_endpoint_snapshot_v1 {
 int dns_client_get_service_snapshot_v1(struct dns_upstream_service_snapshot_v1 *out, unsigned capacity);
 int dns_client_get_service_endpoints_v1(const char *service_id,
     struct dns_upstream_endpoint_snapshot_v1 *out, unsigned capacity);
+
+/* Independent bounded policy/detail ABI. Never extend callers' snapshot-v1. */
+#define DNS_UPSTREAM_DETAIL_EVENTS 32
+#define DNS_UPSTREAM_DETAIL_PATHS 128
+enum dns_upstream_detail_kind { DNS_DETAIL_RESPONSE_TIMEOUT, DNS_DETAIL_DNS_REJECT,
+    DNS_DETAIL_TRANSPORT_ERROR, DNS_DETAIL_IDLE_CLOSE, DNS_DETAIL_GOAWAY,
+    DNS_DETAIL_KEEPALIVE_SENT, DNS_DETAIL_KEEPALIVE_ACK, DNS_DETAIL_KEEPALIVE_TIMEOUT,
+    DNS_DETAIL_CONNECT_TIMEOUT, DNS_DETAIL_QUERY_TIMEOUT, DNS_DETAIL_HTTP_429, DNS_DETAIL_HTTP_503, DNS_DETAIL_DNS_RCODE, DNS_DETAIL_COUNT };
+enum dns_upstream_phase { DNS_PHASE_RESPONSE, DNS_PHASE_CONNECT, DNS_PHASE_TLS,
+    DNS_PHASE_HTTP2, DNS_PHASE_HTTP3, DNS_PHASE_SOCKET, DNS_PHASE_POLICY };
+enum dns_upstream_reject_reason { DNS_REJECT_UNCLASSIFIED, DNS_REJECT_FILTERED,
+    DNS_REJECT_TRUNCATED, DNS_REJECT_NO_USABLE_RECORDS, DNS_REJECT_COMPLETED,
+    DNS_REJECT_QUESTION, DNS_REJECT_COUNT };
+enum dns_upstream_path_state { DNS_PATH_ELIGIBLE, DNS_PATH_FAMILY_DISABLED,
+    DNS_PATH_NO_ROUTE, DNS_PATH_NO_SOURCE, DNS_PATH_BINDING_ERROR, DNS_PATH_UNKNOWN };
+struct dns_upstream_event_v1 {
+    uint64_t sequence, tick_ms, age_ms;
+    char ip[DNS_UPSTREAM_IP_TEXT_MAX];
+    unsigned kind, phase, family, port, elapsed_ms, limit_ms, query_id;
+    int code, system_error;
+    uint64_t tls_error;
+    char message[128];
+};
+struct dns_upstream_path_v1 {
+    char ip[DNS_UPSTREAM_IP_TEXT_MAX], source[DNS_UPSTREAM_IP_TEXT_MAX], interface[64];
+    unsigned family, state, selected, connected, active_attempts, keepalive_ms;
+    int system_error;
+    uint64_t attempts, successes, failures;
+};
+struct dns_upstream_policy_snapshot_v1 {
+    unsigned struct_size, version, family, response_timeout_ms, query_timeout_ms;
+    unsigned connect_timeout_ms, connect_delay_ms, keepalive_ms, event_count, path_count;
+    uint64_t sequence, dropped_events, kind_counts[DNS_DETAIL_COUNT], reject_counts[DNS_REJECT_COUNT];
+    uint64_t response_histogram[9]; /* <=10,25,50,100,250,500,1000,2000,above; timeouts separate */
+    struct dns_upstream_event_v1 events[DNS_UPSTREAM_DETAIL_EVENTS];
+    struct dns_upstream_path_v1 paths[DNS_UPSTREAM_DETAIL_PATHS];
+};
+int dns_client_get_service_policy_v1(const char *service_id, struct dns_upstream_policy_snapshot_v1 *out);
+/* A callback can attach a semantic rejection reason without changing its action. */
+void dns_client_response_reject_reason(unsigned reason);
 
 /* Independent ABI: do not extend snapshot_v1, which older callers allocate. */
 enum dns_service_wait_v1 {

@@ -1,3 +1,4 @@
+#include "upstream_service.h"
 /* HTTP/3 connection control. Static-only QPACK; no additional QUIC connection. */
 #include "client_http3_control.h"
 #include "smartdns/util.h"
@@ -20,6 +21,7 @@ struct dns_http3_control {
     struct h3_peer_stream peer[H3_SLOTS];
     unsigned int seen;
     int settings, goaway;
+    unsigned keepalive_pending, keepalive_offset;
     uint64_t goaway_id, fatal;
     unsigned long epoch;
     unsigned int accepts, bytes, transitions, rotate;
@@ -238,10 +240,39 @@ static int h3_control_poll(struct dns_server_info *s)
     c->rotate = (c->rotate + 1) % H3_SLOTS;
     return 0;
 }
+int _dns_http3_keepalive(struct dns_server_info *s)
+{
+    struct dns_http3_control *c = s->http3_control;
+    if (!c || !c->local || c->sent != 7) return 0;
+    if (c->fatal || c->goaway) return -1;
+    static const unsigned char grease[] = {0x21, 0}; /* RFC 9114 7.2.8 */
+    c->keepalive_pending = 1;
+    size_t written = 0;
+    int ok = SSL_write_ex(c->local, grease + c->keepalive_offset,
+        sizeof(grease) - c->keepalive_offset, &written);
+    if (!ok) {
+        int error = SSL_get_error(c->local, ok);
+        if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
+            s->service_error_phase = DNS_PHASE_HTTP3; s->service_error_code = error;
+            s->service_system_error = errno; return -1;
+        }
+    }
+    c->keepalive_offset += written;
+    if (c->keepalive_offset < sizeof(grease)) return 0;
+    c->keepalive_pending = c->keepalive_offset = 0; return 1;
+}
 int _dns_http3_control_poll(struct dns_server_info *s)
 {
     pthread_mutex_lock(&s->lock);
+    int was_draining = s->http3_control && s->http3_control->goaway;
     int ret = h3_control_poll(s);
+    if (!was_draining && s->http3_control && s->http3_control->goaway) {
+        s->service_draining = 1;
+        _dns_service_detail(NULL, s, DNS_DETAIL_GOAWAY, DNS_PHASE_HTTP3, 0, 0, 0);
+    }
+    if (ret < 0 && s->http3_control) {
+        s->service_error_phase = DNS_PHASE_HTTP3; s->service_error_code = s->http3_control->fatal;
+    }
     pthread_mutex_unlock(&s->lock);
     return ret;
 }
@@ -306,6 +337,7 @@ int _dns_http3_control_test_feed(struct dns_server_info *s, unsigned slot, const
 int _dns_http3_control_poll(struct dns_server_info *s) { (void)s; return -1; }
 int _dns_http3_request_allowed(struct dns_server_info *s, uint64_t id, int started) { (void)s; (void)id; (void)started; return 0; }
 int _dns_http3_is_draining(struct dns_server_info *s) { (void)s; return 0; }
+int _dns_http3_keepalive(struct dns_server_info *s) { (void)s; return -1; }
 int _dns_http3_connection_error(struct dns_server_info *s, uint64_t code) { (void)s; (void)code; return -1; }
 uint64_t _dns_http3_error(struct dns_server_info *s) { (void)s; return 0; }
 int _dns_http3_control_shutdown(struct dns_server_info *s) { (void)s; return 0; }

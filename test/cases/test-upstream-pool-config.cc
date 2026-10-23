@@ -181,3 +181,28 @@ TEST_F(UpstreamPoolConfig, FixedCooldownMillisecondsDefaultBoundsAndStrictGramma
     reset(); ASSERT_EQ(parse({"server-https", "https://one.example/", "-quota-group", "shared", "-upstream-cooldown-ms", "1000"}), 0);
     EXPECT_LT(parse({"server-https", "https://two.example/", "-quota-group", "shared", "-upstream-cooldown-ms", "2000"}), 0);
 }
+
+TEST_F(UpstreamPoolConfig, PathPolicyDefaultsAndExplicitZeroRemainDistinct) {
+    ASSERT_EQ(parse({"server-https","https://resolver.example/","-upstream-ip-pool"}),0);
+    const auto &a=dns_conf.servers[0];
+    EXPECT_EQ(a.upstream_family,0U);EXPECT_EQ(a.upstream_response_timeout_ms,1000U);
+    EXPECT_EQ(a.upstream_query_timeout_ms,3000U);EXPECT_EQ(a.upstream_connect_timeout_ms,3000U);
+    EXPECT_EQ(a.upstream_connect_delay_ms,250U);EXPECT_EQ(a.upstream_keepalive_ms,30000U);
+    reset();
+    ASSERT_EQ(parse({"server-https","https://resolver.example/","-upstream-ip-pool","-upstream-family","ipv6",
+        "-upstream-connect-delay-ms","0","-upstream-keepalive-ms","0"}),0);
+    EXPECT_EQ(dns_conf.servers[0].upstream_family,6U);EXPECT_EQ(dns_conf.servers[0].upstream_connect_delay_ms,0U);
+    EXPECT_EQ(dns_conf.servers[0].upstream_keepalive_disabled,1U);
+}
+TEST_F(UpstreamPoolConfig, PathPolicyRejectsInvalidUnitsBoundsAndLegacyUse) {
+    for (const auto &pair:std::vector<std::pair<std::string,std::string>>{
+        {"-upstream-family","auto"},{"-upstream-response-timeout-ms","49"},
+        {"-upstream-query-timeout-ms","60001"},{"-upstream-connect-timeout-ms","-1"},
+        {"-upstream-connect-delay-ms","2001"},{"-upstream-keepalive-ms","999"},
+        {"-upstream-keepalive-ms","1e3"},{"-upstream-response-timeout-ms","10001"}}) {
+        reset(); EXPECT_EQ(parse({"server-https","https://resolver.example/","-upstream-ip-pool",pair.first,pair.second}),-1);
+    }
+    reset(); EXPECT_EQ(parse({"server-https","https://resolver.example/","-upstream-family","dual"}),-1);
+    reset(); EXPECT_EQ(parse({"server-https","https://resolver.example/","-upstream-ip-pool","-upstream-family","dual","-upstream-family","ipv4"}),-1);
+    reset(); EXPECT_EQ(parse({"server-https","https://resolver.example/","-upstream-ip-pool","-upstream-query-timeout-ms","1000"}),-1);
+}

@@ -158,6 +158,9 @@ struct http2_ctx {
 
 	/* Connection state */
 	int status; /* 0: connected, <0: error code */
+    unsigned draining;
+    uint32_t goaway_last, goaway_error;
+    uint64_t ping_cookie, ping_acked;
 	int handshake_complete;
 	int settings_received;
 	int preface_received; /* Server: has received client preface */
@@ -1754,6 +1757,11 @@ static int _http2_process_frames(struct http2_ctx *ctx)
 				ctx->status = HTTP2_ERR_PROTOCOL;
 				return HTTP2_ERR_PROTOCOL;
 			}
+            if (flags & HTTP2_FLAG_ACK) {
+                uint64_t cookie = 0;
+                for (unsigned i = 0; i < 8; i++) cookie = (cookie << 8) | payload[i];
+                if (cookie == ctx->ping_cookie) ctx->ping_acked = cookie;
+            }
 			/* Echo PING */
 			if (!(flags & HTTP2_FLAG_ACK)) {
 				uint8_t pong[HTTP2_FRAME_HEADER_SIZE + 8];
@@ -1784,8 +1792,19 @@ static int _http2_process_frames(struct http2_ctx *ctx)
 				ctx->status = HTTP2_ERR_PROTOCOL;
 				return -1;
 			}
-			ctx->status = HTTP2_ERR_EOF;
-			break;
+            if (stream_id != 0) { ctx->status = HTTP2_ERR_PROTOCOL; return ctx->status; }
+            uint32_t last = (((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) | ((uint32_t)payload[2] << 8) | payload[3]) & HTTP2_MAX_STREAM_ID;
+            uint32_t code = ((uint32_t)payload[4] << 24) | ((uint32_t)payload[5] << 16) | ((uint32_t)payload[6] << 8) | payload[7];
+            if (ctx->draining && last > ctx->goaway_last) { ctx->status = HTTP2_ERR_PROTOCOL; return ctx->status; }
+            ctx->draining = 1; ctx->goaway_last = last; ctx->goaway_error = code;
+            if (code) { ctx->status = HTTP2_ERR_PROTOCOL; return ctx->status; }
+            struct http2_stream *pending;
+            list_for_each_entry(pending, &ctx->streams, node) {
+                if (_http2_is_local_stream_id(ctx, pending->stream_id) && pending->stream_id > last) {
+                    pending->reset_received = 1; pending->state = HTTP2_STREAM_CLOSED;
+                }
+            }
+            break;
 		default:
 			/* Ignore unknown frames */
 			break;
@@ -2209,6 +2228,9 @@ static int _http2_ctx_poll(struct http2_ctx *ctx, struct http2_poll_item *items,
 		*ret_count = count;
 	}
 
+    if (ctx->draining && !ctx->active_local_streams && !ctx->active_peer_streams && count == 0) {
+        pthread_mutex_unlock(&ctx->mutex); return HTTP2_ERR_EOF;
+    }
 	if (ret < 0 && ret != HTTP2_ERR_EAGAIN && count == 0) {
 		pthread_mutex_unlock(&ctx->mutex);
 		return ret;
@@ -2258,7 +2280,7 @@ struct http2_stream *http2_stream_new(struct http2_ctx *ctx)
 	}
 
 	pthread_mutex_lock(&ctx->mutex);
-	if (ctx->status < 0) {
+	if (ctx->status < 0 || ctx->draining) {
 		pthread_mutex_unlock(&ctx->mutex);
 		errno = ECONNRESET;
 		return NULL;
@@ -3129,4 +3151,39 @@ char *http2_stream_get_query_param(struct http2_stream *stream, const char *name
 	}
 
 	return ret;
+}
+
+int http2_ctx_ping(struct http2_ctx *ctx, uint64_t cookie)
+{
+    if (!ctx || !cookie) return -1;
+    pthread_mutex_lock(&ctx->mutex);
+    int result = -1;
+    if (ctx->handshake_complete && !ctx->draining && ctx->status >= 0) {
+        uint8_t frame[17]; _http2_write_frame_header(frame, 8, HTTP2_FRAME_PING, 0, 0);
+        for (unsigned i = 0; i < 8; i++) frame[9+i] = cookie >> ((7-i)*8);
+        result = _http2_send_frame(ctx, frame, sizeof(frame));
+        if (result >= 0) ctx->ping_cookie = cookie;
+    }
+    pthread_mutex_unlock(&ctx->mutex); return result;
+}
+int http2_ctx_ping_acked(struct http2_ctx *ctx, uint64_t cookie)
+{
+    if (!ctx) return 0;
+    pthread_mutex_lock(&ctx->mutex); int result = cookie && ctx->ping_acked == cookie;
+    pthread_mutex_unlock(&ctx->mutex); return result;
+}
+int http2_ctx_draining(struct http2_ctx *ctx, uint32_t *last, uint32_t *error)
+{
+    if (!ctx) return 0;
+    pthread_mutex_lock(&ctx->mutex); int result = ctx->draining;
+    if (last) *last = ctx->goaway_last;
+    if (error) *error = ctx->goaway_error;
+    pthread_mutex_unlock(&ctx->mutex); return result;
+}
+
+int http2_ctx_handshake_ready(struct http2_ctx *ctx)
+{
+    if (!ctx) return 0;
+    pthread_mutex_lock(&ctx->mutex); int result = ctx->handshake_complete;
+    pthread_mutex_unlock(&ctx->mutex); return result;
 }

@@ -99,6 +99,7 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 	unsigned char *spki = NULL;
 	int drop_packet_latency_ms = 0;
 	int tcp_keepalive = -1;
+    unsigned path_options_seen = 0;
 	int is_bootstrap_dns = 0;
 	const char *host_ip = NULL;
 	unsigned int host_ip_occurrences = 0;
@@ -146,6 +147,12 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		{"upstream-ip-pool", no_argument, NULL, 273},
 		{"max-upstream-backends", required_argument, NULL, 274},
 		{"upstream-cooldown-ms", required_argument, NULL, 275},
+        {"upstream-family", required_argument, NULL, 276},
+        {"upstream-response-timeout-ms", required_argument, NULL, 277},
+        {"upstream-query-timeout-ms", required_argument, NULL, 278},
+        {"upstream-connect-timeout-ms", required_argument, NULL, 279},
+        {"upstream-connect-delay-ms", required_argument, NULL, 280},
+        {"upstream-keepalive-ms", required_argument, NULL, 281},
 		{NULL, no_argument, NULL, 0}
 	};
 	/* clang-format on */
@@ -357,6 +364,31 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 			server->fallback = 1;
 			break;
 		}
+        case 276:
+            if (path_options_seen & 1) return -1;
+            path_options_seen |= 1;
+            if (!strcmp(optarg, "dual")) server->upstream_family = 0;
+            else if (!strcmp(optarg, "ipv4")) server->upstream_family = 4;
+            else if (!strcmp(optarg, "ipv6")) server->upstream_family = 6;
+            else return -1;
+            break;
+        case 277: case 278: case 279: case 280: case 281: {
+            unsigned bit = 1U << (opt - 275);
+            if (path_options_seen & bit) return -1;
+            path_options_seen |= bit;
+            if (!*optarg) return -1;
+            for (const char *p = optarg; *p; p++) if (*p < '0' || *p > '9') return -1;
+            errno = 0; char *end = NULL; unsigned long v = strtoul(optarg, &end, 10);
+            unsigned max = opt == 278 ? 60000 : opt == 281 ? 600000 : opt == 280 ? 2000 : 10000;
+            unsigned min = opt == 280 || opt == 281 ? 0 : 50;
+            if (errno || *end || v < min || v > max || (opt == 281 && v && v < 1000)) return -1;
+            if (opt == 277) server->upstream_response_timeout_ms = v;
+            if (opt == 278) server->upstream_query_timeout_ms = v;
+            if (opt == 279) server->upstream_connect_timeout_ms = v;
+            if (opt == 280) server->upstream_connect_delay_ms = v + 1; /* zero is an explicit immediate race */
+            if (opt == 281) { server->upstream_keepalive_ms = v; server->upstream_keepalive_disabled = !v; }
+            break;
+        }
 		case 275: {
             if (!*optarg) return -1;
             for (const char *digit = optarg; *digit; digit++) if (*digit < '0' || *digit > '9') return -1;
@@ -404,7 +436,7 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		}
 		default:
 			/* Do not silently turn malformed opt-in options into defaults. */
-			if (optopt == 271 || optopt == 272 || optopt == 273 || optopt == 274 || optopt == 258) return -1;
+			if ((optopt >= 275 && optopt <= 281) || optopt == 271 || optopt == 272 || optopt == 273 || optopt == 274 || optopt == 258) return -1;
 			if (optind > optind_last) {
 				tlog(TLOG_WARN, "unknown server option: %s at '%s:%d'.", argv[optind - 1], conf_get_conf_file(),
 					 conf_get_current_lineno());
@@ -421,6 +453,15 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 			tlog(TLOG_ERROR, "upstream-ip-pool requires a domain authority and cannot use proxy, bootstrap, mDNS or legacy RR");
 			return -1;
 		}
+        if (!server->upstream_response_timeout_ms) server->upstream_response_timeout_ms = 1000;
+        if (!server->upstream_query_timeout_ms) server->upstream_query_timeout_ms = 3000;
+        if (!server->upstream_connect_timeout_ms) server->upstream_connect_timeout_ms = 3000;
+        if (!server->upstream_connect_delay_ms) server->upstream_connect_delay_ms = 251;
+        server->upstream_connect_delay_ms--;
+        if (!server->upstream_keepalive_ms && !server->upstream_keepalive_disabled) server->upstream_keepalive_ms = 30000;
+        if (server->upstream_response_timeout_ms > server->upstream_query_timeout_ms ||
+            server->upstream_connect_timeout_ms > server->upstream_query_timeout_ms) return -1;
+        if ((path_options_seen & (1U << 6)) && type != DNS_SERVER_HTTPS && type != DNS_SERVER_HTTP3) return -1;
 		if (!server->max_upstream_backends) server->max_upstream_backends = 4;
 		if (server->max_upstream_connections > server->max_upstream_backends) return -1;
 		if (host_ip && _config_pool_ips(server, host_ip)) return -1;
@@ -429,6 +470,9 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 				server->server, server->pool_ip_count, server->max_upstream_backends,
 				server->pool_ip_count - server->max_upstream_backends);
 	} else {
+        if (path_options_seen || server->upstream_family || server->upstream_response_timeout_ms || server->upstream_query_timeout_ms ||
+            server->upstream_connect_timeout_ms || server->upstream_connect_delay_ms || server->upstream_keepalive_ms ||
+            server->upstream_keepalive_disabled) return -1;
 		if (server->max_upstream_backends || legacy_host_ip_invalid || legacy_connection_invalid) return -1;
 		/* Preserve the legacy single-digit 1..4 grammar, including rejection of 01. */
 		if (connection_limit_text && (connection_limit_text[0] < '1' || connection_limit_text[0] > '4' ||

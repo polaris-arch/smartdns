@@ -365,3 +365,24 @@ TEST_F(ClientH2FlowOwner, FailedWakePublicationWithdrawsBothQueueReferences) {
     EXPECT_EQ(_dns_attempt_retire(&query.query, &server, 0), 1);
     EXPECT_EQ(_dns_attempt_retire(&query.query, &server, 0), 0);
 }
+
+TEST_F(ClientH2FlowOwner, PingAckUsesControlFrameWithoutDnsStreamOrRequestBudget) {
+    const uint64_t cookie=0x123456789abcdef0ULL;
+    auto before=observed.size();ASSERT_GE(http2_ctx_ping(server.http2_ctx,cookie),0);
+    Pump(20);EXPECT_TRUE(http2_ctx_ping_acked(server.http2_ctx,cookie));
+    bool found=false;
+    for(size_t offset=24;offset+9<=observed.size();){
+        size_t n=(observed[offset]<<16)|(observed[offset+1]<<8)|observed[offset+2];
+        if(offset+9+n>observed.size())break;
+        if(observed[offset+3]==6&&!(observed[offset+4]&1)){EXPECT_EQ(n,8U);EXPECT_EQ(observed[offset+8],0);found=true;}
+        offset+=9+n;
+    }
+    EXPECT_TRUE(found);EXPECT_GT(observed.size(),before);EXPECT_TRUE(list_empty(&server.conn_stream_list));
+}
+TEST_F(ClientH2FlowOwner, GracefulGoawayStopsAdmissionAndDoesNotBecomeProtocolError) {
+    ASSERT_TRUE(Frame(7,0,{0,0,0,0,0,0,0,0}));
+    epoll_event e{};e.events=EPOLLIN|EPOLLOUT;
+    for(unsigned i=0;i<10&&!http2_ctx_draining(server.http2_ctx,nullptr,nullptr);i++)_dns_client_process_http2(&server,&e,get_tick_count());
+    uint32_t last=99,error=99;EXPECT_TRUE(http2_ctx_draining(server.http2_ctx,&last,&error));
+    EXPECT_EQ(last,0U);EXPECT_EQ(error,0U);EXPECT_EQ(http2_stream_new(server.http2_ctx),nullptr);
+}

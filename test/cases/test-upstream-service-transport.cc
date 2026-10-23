@@ -7,6 +7,7 @@
 #include "gtest/gtest.h"
 extern "C" {
 #include "dns_client/dns_client.h"
+#include "smartdns/upstream_service.h"
 }
 #include <arpa/inet.h>
 #include <atomic>
@@ -160,11 +161,15 @@ public:
             return SSL_select_next_proto(const_cast<unsigned char **>(out), len, protocol, sizeof(protocol), in, size)
                 == OPENSSL_NPN_NEGOTIATED ? SSL_TLSEXT_ERR_OK : SSL_TLSEXT_ERR_ALERT_FATAL;
         }, nullptr);
-        fd_ = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        int family = strchr(ip, ':') ? AF_INET6 : AF_INET;
+        fd_ = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
         int yes = 1; setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-        sockaddr_in address{}; address.sin_family = AF_INET; address.sin_port = htons(port);
-        if (inet_pton(AF_INET, ip, &address.sin_addr) != 1 ||
-            bind(fd_, reinterpret_cast<sockaddr *>(&address), sizeof(address)) || listen(fd_, 4)) return false;
+        sockaddr_storage address{};socklen_t size;
+        void *target;
+        if(family==AF_INET){auto *a=reinterpret_cast<sockaddr_in *>(&address);a->sin_family=family;a->sin_port=htons(port);target=&a->sin_addr;size=sizeof(*a);}
+        else{auto *a=reinterpret_cast<sockaddr_in6 *>(&address);a->sin6_family=family;a->sin6_port=htons(port);target=&a->sin6_addr;size=sizeof(*a);}
+        if (inet_pton(family, ip, target) != 1 ||
+            bind(fd_, reinterpret_cast<sockaddr *>(&address), size) || listen(fd_, 4)) return false;
         run_ = true;
         accept_ = std::thread([this] {
             while (run_) {
@@ -433,4 +438,123 @@ void late_h2_cancel_case() {
 TEST(UpstreamServiceTransport, LateCancelledH2ResponseDoesNotSpinClientLoop) {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT({ late_h2_cancel_case(); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
+}
+
+namespace {
+void path_transport_case(unsigned cap, bool delayed_response, bool keepalive) {
+    PoolTlsPeer peer;const unsigned port=62976,listener=62776;
+    if(delayed_response)peer.on_request=[](){std::this_thread::sleep_for(std::chrono::milliseconds(700));return false;};
+    ASSERT_TRUE(peer.Start("127.0.0.1",port,true));
+    int stall=-1;
+    if(cap){
+        stall=socket(AF_INET6,SOCK_STREAM|SOCK_CLOEXEC,0);ASSERT_GE(stall,0);
+        int yes=1;setsockopt(stall,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
+        sockaddr_in6 a{};a.sin6_family=AF_INET6;a.sin6_port=htons(port);inet_pton(AF_INET6,"::1",&a.sin6_addr);
+        ASSERT_EQ(bind(stall,reinterpret_cast<sockaddr *>(&a),sizeof(a)),0);ASSERT_EQ(listen(stall,2),0);
+    }
+    {
+        smartdns::Server resolver(smartdns::Server::CREATE_MODE_THREAD);
+        std::string options=cap?"-host-ip ::1,127.0.0.1 -max-upstream-connections "+std::to_string(cap)+" -upstream-connect-timeout-ms 600":"-host-ip 127.0.0.1";
+        options+=keepalive?" -upstream-keepalive-ms 1000":" -upstream-keepalive-ms 0";
+        ASSERT_TRUE(resolver.Start("bind 127.0.0.1:"+std::to_string(listener)+
+            "\nserver-https https://policy.transport.example:"+std::to_string(port)+"/dns-query -no-check-certificate -alpn h2 -upstream-ip-pool "+options+
+            "\ncache-size 0\ncache-persist no\nprefetch-domain no\nserve-expired no\ndualstack-ip-selection no\nspeed-check-mode none\nresponse-mode fastest-response\n"));
+        auto started=std::chrono::steady_clock::now();ASSERT_TRUE(query_udp("policy-first.example",listener));
+        auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count();
+        if(cap==2)EXPECT_LT(elapsed,600);if(cap==1){EXPECT_GE(elapsed,550);EXPECT_LT(elapsed,1500);}
+        if(delayed_response){EXPECT_GE(elapsed,650);EXPECT_LT(elapsed,1500);}
+        dns_upstream_service_snapshot_v1 info{};ASSERT_EQ(dns_client_get_service_snapshot_v1(&info,1),1);
+        EXPECT_EQ(info.attempt_count,1U);EXPECT_EQ(peer.requests,1U);
+        dns_upstream_policy_snapshot_v1 policy{};ASSERT_EQ(dns_client_get_service_policy_v1(info.service_id,&policy),0);
+        EXPECT_EQ(policy.kind_counts[DNS_DETAIL_RESPONSE_TIMEOUT],0U);
+        if(keepalive){
+            auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(2500);
+            do{std::this_thread::sleep_for(std::chrono::milliseconds(20));ASSERT_EQ(dns_client_get_service_policy_v1(info.service_id,&policy),0);}
+            while(!policy.kind_counts[DNS_DETAIL_KEEPALIVE_ACK]&&std::chrono::steady_clock::now()<deadline);
+            EXPECT_GE(policy.kind_counts[DNS_DETAIL_KEEPALIVE_SENT],1U);EXPECT_GE(policy.kind_counts[DNS_DETAIL_KEEPALIVE_ACK],1U);
+            ASSERT_EQ(dns_client_get_service_snapshot_v1(&info,1),1);EXPECT_EQ(info.attempt_count,1U);EXPECT_EQ(peer.requests,1U);
+            ASSERT_TRUE(query_udp("policy-second.example",listener));EXPECT_EQ(peer.requests,2U);EXPECT_EQ(peer.connections,1U);
+        }
+    }
+    if(stall>=0)close(stall);
+}
+}
+TEST(UpstreamServiceTransport, H2SlowValidResponseDoesNotTriggerLegacy500msRetry){
+    ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({path_transport_case(0,true,false);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+TEST(UpstreamServiceTransport, DualFamilyStaggerFallsBackBeforeStalledTlsTimeout){
+    ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({path_transport_case(2,false,false);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+TEST(UpstreamServiceTransport, OneConnectionCapCannotRaceBothFamilies){
+    ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({path_transport_case(1,false,false);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+TEST(UpstreamServiceTransport, H2IdlePingAcknowledgedWithoutDnsBudgetAndReusesSocket){
+    ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({path_transport_case(0,false,true);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+
+namespace {
+void dual_family_case(const char *family,unsigned rate){
+    PoolTlsPeer a,b;a.address_negatives=b.address_negatives=true;
+    ASSERT_TRUE(a.Start("127.0.0.1",62975,true));ASSERT_TRUE(b.Start("::1",62975,true));
+    smartdns::Server resolver(smartdns::Server::CREATE_MODE_THREAD);
+    std::string policy=std::string(" -upstream-family ")+family;
+    if(rate)policy+=" -max-query-rate "+std::to_string(rate)+" -query-burst 1";
+    ASSERT_TRUE(resolver.Start("bind 127.0.0.1:62775\nserver-https https://dual.transport.example:62975/dns-query -upstream-ip-pool -host-ip 127.0.0.1,::1 -max-upstream-connections 2 -no-check-certificate -alpn h2"+policy+
+        "\ncache-size 0\ncache-persist no\nprefetch-domain no\nserve-expired no\ndualstack-ip-selection no\nspeed-check-mode none\nresponse-mode fastest-response\n"));
+    for(unsigned i=0;i<16;i++)ASSERT_TRUE(query_udp("family-"+std::to_string(i)+".example",62775,i%2?DNS_T_AAAA:DNS_T_A));
+    dns_upstream_service_snapshot_v1 info{};
+    auto end=std::chrono::steady_clock::now()+std::chrono::seconds(1);
+    do{ASSERT_EQ(dns_client_get_service_snapshot_v1(&info,1),1);if(info.success_count==16&&!info.in_flight)break;poll(nullptr,0,5);}while(std::chrono::steady_clock::now()<end);
+    EXPECT_EQ(info.attempt_count,16U);EXPECT_EQ(info.success_count,16U);EXPECT_EQ(info.failure_count,0U);
+    if(!strcmp(family,"ipv4")){EXPECT_EQ(a.requests,16U);EXPECT_EQ(b.requests,0U);}
+    else if(!strcmp(family,"ipv6")){EXPECT_EQ(a.requests,0U);EXPECT_EQ(b.requests,16U);}
+    else{EXPECT_EQ(a.requests,8U);EXPECT_EQ(b.requests,8U);EXPECT_EQ(a.connections,1U);EXPECT_EQ(b.connections,1U);}
+    dns_upstream_policy_snapshot_v1 details{};ASSERT_EQ(dns_client_get_service_policy_v1(info.service_id,&details),0);
+    EXPECT_EQ(details.path_count,2U);EXPECT_EQ(details.kind_counts[DNS_DETAIL_RESPONSE_TIMEOUT],0U);
+}
+}
+TEST(UpstreamServiceTransport, ForcedIPv4StillCarriesValidAaaaNodata){
+    ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({dual_family_case("ipv4",0);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+TEST(UpstreamServiceTransport, ForcedIPv6UsesActualIpv6TlsSocket){
+    ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({dual_family_case("ipv6",0);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+TEST(UpstreamServiceTransport, DualFamily20BalancesPerIpAndSharesQps){
+    ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({dual_family_case("dual",20);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+TEST(UpstreamServiceTransport, DualFamily40BalancesPerIpAndSharesQps){
+    ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({dual_family_case("dual",40);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+
+namespace {
+void capped_reuse_case(unsigned rate){
+    PoolTlsPeer a,b,c,d;
+    ASSERT_TRUE(a.Start("127.0.0.1",62974,true));ASSERT_TRUE(b.Start("127.0.0.2",62974,true));
+    ASSERT_TRUE(c.Start("127.0.0.3",62974,true));ASSERT_TRUE(d.Start("127.0.0.4",62974,true));
+    smartdns::Server resolver(smartdns::Server::CREATE_MODE_THREAD);
+    ASSERT_TRUE(resolver.Start("bind 127.0.0.1:62774\nserver-https https://capped.transport.example:62974/dns-query -upstream-ip-pool -host-ip 127.0.0.1,127.0.0.2,127.0.0.3,127.0.0.4 -max-upstream-connections 2 -no-check-certificate -alpn h2 -upstream-keepalive-ms 0 -max-query-rate "+std::to_string(rate)+
+        "\ncache-size 0\ncache-persist no\nprefetch-domain no\nserve-expired no\ndualstack-ip-selection no\nspeed-check-mode none\nresponse-mode fastest-response\n"));
+    auto started=std::chrono::steady_clock::now();unsigned max_connections=0;
+    for(unsigned i=0;i<80;i++){
+        std::this_thread::sleep_until(started+std::chrono::milliseconds(i*1000/rate));
+        auto query_started=std::chrono::steady_clock::now();
+        ASSERT_TRUE(query_udp("reuse-"+std::to_string(i)+".example",62774));
+        ASSERT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-query_started).count(),600);
+
+        dns_upstream_service_snapshot_v1 info{};ASSERT_EQ(dns_client_get_service_snapshot_v1(&info,1),1);
+        if(info.connection_count>max_connections)max_connections=info.connection_count;EXPECT_LE(info.connection_count,2U);
+    }
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count(),80000/rate+1500);
+    unsigned hits[]={a.requests,b.requests,c.requests,d.requests};
+    unsigned least=hits[0],most=hits[0];for(unsigned hit:hits){if(hit<least)least=hit;if(hit>most)most=hit;}
+    EXPECT_GT(least,0U);EXPECT_LE(most-least,rate);
+    EXPECT_LT(a.connections+b.connections+c.connections+d.connections,16U);
+    EXPECT_EQ(a.requests+b.requests+c.requests+d.requests,80U);EXPECT_EQ(max_connections,2U);
+}
+}
+TEST(UpstreamServiceTransport, FourIpsTwoConnectionsReuseAndRotateAt20Qps){
+    ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({capped_reuse_case(20);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+TEST(UpstreamServiceTransport, FourIpsTwoConnectionsReuseAndRotateAt40Qps){
+    ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({capped_reuse_case(40);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }

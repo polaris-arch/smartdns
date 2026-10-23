@@ -17,6 +17,7 @@
  */
 
 #define _GNU_SOURCE
+#include "upstream_service.h"
 
 #include "client_tls.h"
 #include "client_http2.h"
@@ -102,7 +103,14 @@ static int _ssl_get_error_ext(struct dns_server_info *server, SSL *ssl, int ret)
 		return SSL_ERROR_SYSCALL;
 	}
 
+    int system_error = errno;
 	err = SSL_get_error(ssl, ret);
+    if (err != SSL_ERROR_NONE && err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+        server->service_error_phase = DNS_PHASE_TLS;
+        server->service_error_code = err; server->service_system_error = system_error;
+        server->service_tls_error = ERR_peek_error();
+        if (err == SSL_ERROR_ZERO_RETURN && !server->active_attempts) server->service_normal_close = 1;
+    }
 	pthread_mutex_unlock(&server->lock);
 	return err;
 }
@@ -1139,6 +1147,8 @@ int _dns_client_process_tls(struct dns_server_info *server_info, struct epoll_ev
 		}
 
 		server_info->status = DNS_SERVER_STATUS_CONNECTED;
+        /* Warm connections have no DNS owner to wake the service scheduler. */
+        _dns_service_endpoint_ready(server_info);
 		memset(&fd_event, 0, sizeof(fd_event));
 		fd_event.events = EPOLLIN | EPOLLOUT;
 		fd_event.data.ptr = server_info;

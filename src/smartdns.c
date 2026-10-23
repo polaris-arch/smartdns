@@ -125,7 +125,7 @@ static void _show_version(void)
 	char str_ver[256] = {0};
 	_smartdns_get_version(str_ver, sizeof(str_ver));
 	printf("smartdns %s\n", str_ver);
-    printf("features: smartdns-upstream-service-pool-v1 smartdns-upstream-fixed-cooldown-v1\n");
+    printf("features: smartdns-upstream-service-pool-v1 smartdns-upstream-path-policy-v1 smartdns-upstream-fixed-cooldown-v1\n");
 }
 
 static int _smartdns_load_from_resolv_file(const char *resolv_file)
@@ -291,6 +291,14 @@ static int _smartdns_add_servers(void)
 		if (server->upstream_ip_pool) {
 			struct dns_upstream_pool_config pool = {0};
 			pool.max_backends = server->max_upstream_backends;
+            pool.family = server->upstream_family;
+            pool.response_timeout_ms = server->upstream_response_timeout_ms;
+            pool.query_timeout_ms = server->upstream_query_timeout_ms;
+            pool.connect_timeout_ms = server->upstream_connect_timeout_ms;
+            pool.connect_delay_ms = server->upstream_connect_delay_ms;
+            pool.connect_delay_set = 1;
+            pool.keepalive_ms = server->upstream_keepalive_ms;
+            pool.keepalive_disabled = server->upstream_keepalive_disabled;
 			pool.ip_count = server->pool_ip_count;
 			memcpy(pool.ips, server->pool_ips, sizeof(pool.ips));
 			ret = dns_client_add_service(server->server, server->port, server->type, &flags, &pool);

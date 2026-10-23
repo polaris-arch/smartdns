@@ -37,6 +37,11 @@ struct dns_upstream_service {
     pthread_mutex_t lock;
     /* Leaf lock: never acquire endpoint/query/policy/service locks while held. */
     pthread_mutex_t turn_lock;
+    pthread_mutex_t detail_lock; /* leaf: never acquire other locks while held */
+    struct dns_upstream_policy_snapshot_v1 detail;
+    uint64_t path_epoch;
+    unsigned long path_refresh_due, race_due, connection_due;
+    unsigned race_family;
     char id[DNS_UPSTREAM_SERVICE_ID_MAX], host[DNS_MAX_HOSTNAME];
     int port;
     dns_server_type_t type;
@@ -78,6 +83,7 @@ void _dns_service_write_result(struct dns_query_struct *q, struct dns_server_inf
     unsigned generation, int accepted, int retryable);
 void _dns_service_attempt_active(struct dns_query_struct *q, struct dns_upstream_service *service, int delta);
 void _dns_service_query_result(struct dns_query_struct *q, struct dns_server_info *endpoint, int accepted);
+void _dns_service_query_expired(struct dns_query_struct *q, struct dns_upstream_service *s);
 void _dns_service_query_terminal(struct dns_query_struct *q);
 void _dns_service_query_free(struct dns_query_struct *q);
 void _dns_service_prepare_connection(struct dns_server_info *endpoint);
@@ -85,9 +91,19 @@ int _dns_service_connection_acquire(struct dns_server_info *endpoint);
 void _dns_service_connection_release(struct dns_server_info *endpoint);
 void _dns_service_endpoint_failure(struct dns_server_info *endpoint);
 void _dns_service_endpoint_ready(struct dns_server_info *endpoint);
+void _dns_service_transport_changed(struct dns_server_info *endpoint);
 int _dns_service_endpoint_eligible(struct dns_server_info *endpoint, unsigned long now);
 int _dns_service_has_ecs(struct dns_upstream_service *s);
 void _dns_service_diagnostic_event(struct dns_query_struct *q, struct dns_server_info *ep, unsigned event);
+void _dns_service_detail(struct dns_query_struct *q, struct dns_server_info *ep,
+    unsigned kind, unsigned phase, int code, unsigned elapsed, unsigned limit);
+void _dns_service_response_time(struct dns_server_info *ep, unsigned elapsed);
+void _dns_paths_refresh(struct dns_upstream_service *s, unsigned long now);
+void _dns_paths_network_tick(void);
+void _dns_services_network_tick(void);
+void _dns_paths_close(void);
+int _dns_path_allowed(struct dns_upstream_service *s, const char *ip);
+void _dns_service_connection_tick(struct dns_upstream_service *s, unsigned long now);
 void _dns_service_diagnostic_http(struct dns_query_struct *q, struct dns_server_info *ep, int status);
 void _dns_client_loop_diagnostic_start(unsigned long now);
 void _dns_client_loop_diagnostic_poll(unsigned long now, int timeout, int events);

@@ -30,6 +30,7 @@ void _dns_service_put(struct dns_upstream_service *s)
     if (!s || atomic_dec_return(&s->refs)) return;
     _dns_policy_service_release(s);
     free(s->desired);
+    pthread_mutex_destroy(&s->detail_lock);
     pthread_mutex_destroy(&s->turn_lock);
     pthread_mutex_destroy(&s->lock);
     free(s);
@@ -45,6 +46,10 @@ static void service_queue(struct dns_upstream_service *s)
         s->pending_next = head;
     } while (!__atomic_compare_exchange_n(&pending_services, &head, s, 0, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE));
     _dns_client_do_wakeup_event();
+}
+void _dns_service_transport_changed(struct dns_server_info *endpoint)
+{
+    if (endpoint) service_queue(endpoint->service);
 }
 /* A coalesced intrusive state-change hint, with its own query pin. Transport
  * code can publish while holding q->lock without taking the membership lock. */
@@ -158,8 +163,15 @@ static void service_reconcile(struct dns_upstream_service *s, unsigned long now)
 {
     struct dns_server_info *retire[DNS_UPSTREAM_BACKENDS_MAX * 2];
     unsigned retire_count = 0;
+    if (!s->desired) return;
+    _dns_paths_refresh(s, now);
     pthread_mutex_lock(&s->lock);
-    const struct dns_discovery_snapshot *set = s->desired;
+    struct dns_discovery_snapshot eligible_set = *s->desired;
+    eligible_set.count = 0;
+    for (unsigned i = 0; i < s->desired->count; i++)
+        if (_dns_path_allowed(s, s->desired->addresses[i].text))
+            eligible_set.addresses[eligible_set.count++] = s->desired->addresses[i];
+    const struct dns_discovery_snapshot *set = &eligible_set;
     if (!set) { pthread_mutex_unlock(&s->lock); return; }
     for (unsigned i = 0; i < s->member_count; i++) {
         struct dns_server_info *ep = s->members[i];
@@ -227,7 +239,7 @@ static void service_reconcile(struct dns_upstream_service *s, unsigned long now)
     s->stale = set->stale;
     s->freshness_until = set->expires;
     s->freshness_known = set->count != 0;
-    unsigned long due = ULONG_MAX;
+    unsigned long due = s->path_refresh_due;
     for (unsigned i = 0; i < s->member_count; i++) {
         struct dns_server_info *ep = s->members[i];
         if (ep->service_revoked && ep->service_drain_until < due) due = ep->service_drain_until;
@@ -250,6 +262,7 @@ static void service_discovered(const struct dns_discovery_snapshot *snapshot, vo
     qsort(ordered.addresses, ordered.count, sizeof(ordered.addresses[0]), discovery_address_compare);
     snapshot = &ordered;
     *s->desired = *snapshot;
+    s->path_refresh_due = 0;
     unsigned v4[DNS_DISCOVERY_ADDRESS_LIMIT], v6[DNS_DISCOVERY_ADDRESS_LIMIT];
     unsigned n4 = 0, n6 = 0, kept = 0;
     for (unsigned i = 0; i < snapshot->count; i++) {
@@ -273,7 +286,12 @@ int dns_client_add_service(const char *host, int port, dns_server_type_t type,
     const struct client_dns_server_flags *flags, const struct dns_upstream_pool_config *pool)
 {
     if (!host || !flags || !pool || !pool->max_backends || pool->max_backends > DNS_UPSTREAM_BACKENDS_MAX ||
-        pool->ip_count > DNS_UPSTREAM_BACKENDS_MAX || flags->proxyname[0] || flags->upstream_round_robin ||
+        pool->ip_count > DNS_UPSTREAM_BACKENDS_MAX ||
+        (pool->family && pool->family != 4 && pool->family != 6) ||
+        pool->response_timeout_ms > 10000 || pool->query_timeout_ms > 60000 ||
+        pool->connect_timeout_ms > 10000 || pool->connect_delay_ms > 2000 || pool->keepalive_ms > 600000 ||
+        (pool->query_timeout_ms && (pool->response_timeout_ms > pool->query_timeout_ms ||
+            pool->connect_timeout_ms > pool->query_timeout_ms)) || flags->proxyname[0] || flags->upstream_round_robin ||
         type == DNS_SERVER_MDNS || type >= DNS_SERVER_TYPE_END || !check_is_ipaddr(host) ||
         flags->max_upstream_connections > pool->max_backends) return -1;
     pthread_mutex_lock(&registry_lock);
@@ -282,10 +300,15 @@ int dns_client_add_service(const char *host, int port, dns_server_type_t type,
     if (!s) { pthread_mutex_unlock(&registry_lock); return -1; }
     s->desired = calloc(1, sizeof(*s->desired));
     if (!s->desired) { free(s); pthread_mutex_unlock(&registry_lock); return -1; }
-    atomic_set(&s->refs, 1); pthread_mutex_init(&s->lock, NULL); pthread_mutex_init(&s->turn_lock, NULL);
+    atomic_set(&s->refs, 1); pthread_mutex_init(&s->lock, NULL); pthread_mutex_init(&s->turn_lock, NULL); pthread_mutex_init(&s->detail_lock, NULL);
     INIT_LIST_HEAD(&s->list); INIT_LIST_HEAD(&s->timer); INIT_LIST_HEAD(&s->waiters);
     normalize_host(s->host, host, sizeof(s->host));
     s->port = port; s->type = type; s->flags = *flags; s->config = *pool;
+    if (!s->config.response_timeout_ms) s->config.response_timeout_ms = 1000;
+    if (!s->config.query_timeout_ms) s->config.query_timeout_ms = 3000;
+    if (!s->config.connect_timeout_ms) s->config.connect_timeout_ms = 3000;
+    if (!s->config.connect_delay_ms && !s->config.connect_delay_set) s->config.connect_delay_ms = 250;
+    if (!s->config.keepalive_ms && !s->config.keepalive_disabled) s->config.keepalive_ms = 30000;
     s->timer_due = ULONG_MAX;
     if (_dns_policy_service_init(s)) { _dns_service_put(s); pthread_mutex_unlock(&registry_lock); return -1; }
     list_add_tail(&s->list, &services);
@@ -441,7 +464,7 @@ static struct dns_service_observation *service_observe(struct dns_upstream_servi
 }
 int _dns_service_endpoint_eligible(struct dns_server_info *ep, unsigned long now)
 {
-    return !__atomic_load_n(&ep->service_revoked, __ATOMIC_ACQUIRE) &&
+    return !__atomic_load_n(&ep->service_draining, __ATOMIC_ACQUIRE) && !__atomic_load_n(&ep->service_revoked, __ATOMIC_ACQUIRE) &&
         now >= __atomic_load_n(&ep->service_retry_at, __ATOMIC_ACQUIRE) &&
         (!ep->service || now < __atomic_load_n(&ep->service_valid_until, __ATOMIC_ACQUIRE));
 }
@@ -451,11 +474,14 @@ struct dns_server_info *_dns_service_select(struct dns_upstream_service *s, stru
     struct dns_service_observation *o = service_observe(s, q);
     if (!o || !__atomic_load_n(&o->registered, __ATOMIC_ACQUIRE) ||
         __atomic_load_n(&o->terminal, __ATOMIC_ACQUIRE) || __atomic_load_n(&o->settled, __ATOMIC_ACQUIRE)) return NULL;
+    unsigned long now = get_tick_count();
+    if (q->created_tick && s->config.query_timeout_ms && now >= q->created_tick && now - q->created_tick >= s->config.query_timeout_ms) {
+        _dns_service_query_expired(q, s); return NULL;
+    }
     if (__atomic_load_n(&o->active_attempts, __ATOMIC_ACQUIRE)) return NULL;
     if (!__atomic_load_n(&s->selected_count, __ATOMIC_ACQUIRE)) {
         __atomic_store_n(&o->last_wait, DNS_WAIT_NO_BACKEND, __ATOMIC_RELAXED); return NULL;
     }
-    unsigned long now = get_tick_count();
     if (now < __atomic_load_n(&s->next_eligible, __ATOMIC_ACQUIRE)) {
         unsigned why = __atomic_load_n(&s->next_wait, __ATOMIC_RELAXED);
         __atomic_store_n(&o->last_wait, why ? why : DNS_WAIT_SCHEDULER, __ATOMIC_RELAXED); return NULL;
@@ -487,7 +513,7 @@ struct dns_server_info *_dns_service_select(struct dns_upstream_service *s, stru
     for (unsigned pass = 0; pass < 2; pass++) {
         for (unsigned i = 0; i < s->member_count; i++) {
             struct dns_server_info *ep = s->members[i];
-            if (!_dns_service_endpoint_eligible(ep, now) ||
+            if (ep->service_rotation || !_dns_service_endpoint_eligible(ep, now) ||
                 (pass == 0 ? ep->service_member_id <= s->cursor : ep->service_member_id > s->cursor)) continue;
             if (count < DNS_UPSTREAM_BACKENDS_MAX) { candidates[count++] = ep; dns_client_server_info_get(ep); }
         }
@@ -503,9 +529,23 @@ struct dns_server_info *_dns_service_select(struct dns_upstream_service *s, stru
     pthread_mutex_unlock(&s->turn_lock);
     pthread_mutex_unlock(&s->lock);
     struct dns_server_info *chosen = NULL;
+    unsigned unavailable_wait = DNS_WAIT_NO_BACKEND;
     for (unsigned i = 0; i < count; i++) {
         struct dns_server_info *ep = candidates[i];
         if (eligible && !eligible(ep, context)) continue;
+        if (ep->type != DNS_SERVER_UDP && (ep->status != DNS_SERVER_STATUS_CONNECTED ||
+            !__atomic_load_n(&ep->service_protocol_ready, __ATOMIC_ACQUIRE))) {
+            unavailable_wait = DNS_WAIT_WRITE;
+            unsigned cap = s->flags.max_upstream_connections ? s->flags.max_upstream_connections : s->selected_count;
+            if (ep->fd < 0 && cap && __atomic_load_n(&s->connections, __ATOMIC_ACQUIRE) >= cap) continue;
+            unsigned long since = ep->fd < 0 ? q->created_tick : ep->service_connect_tick;
+            if (i == 0 && now >= since && now - since < s->config.connect_delay_ms) {
+                __atomic_store_n(&s->next_eligible, since + s->config.connect_delay_ms, __ATOMIC_RELEASE);
+                __atomic_store_n(&s->next_wait, DNS_WAIT_WRITE, __ATOMIC_RELAXED);
+                break; /* bounded warmup for the RR turn, without owning a DNS attempt */
+            }
+            continue;
+        }
         if (_dns_attempt_begin(q, ep) != DNS_ADMIT_OK) continue;
         unsigned gen = _dns_attempt_generation(q, ep);
         pthread_mutex_lock(&s->turn_lock);
@@ -629,7 +669,10 @@ void _dns_service_diagnostic_http(struct dns_query_struct *q, struct dns_server_
     /* Backpressure events are counted once in the shared policy hook, including
      * canceled HTTP/1 FIFO owners. Here only associate that evidence with q. */
     if (status == 429 || status == 503) diagnostic_last_event(q, ep, event);
-    else _dns_service_diagnostic_event(q, ep, event);
+    else {
+        _dns_service_diagnostic_event(q, ep, event);
+        _dns_service_detail(q, ep, DNS_DETAIL_TRANSPORT_ERROR, DNS_PHASE_RESPONSE, status, 0, 0);
+    }
 }
 void _dns_service_query_result(struct dns_query_struct *q, struct dns_server_info *ep, int accepted)
 {
@@ -650,14 +693,28 @@ void _dns_service_query_result(struct dns_query_struct *q, struct dns_server_inf
     }
     pthread_mutex_unlock(&q->lock);
 }
+void _dns_service_query_expired(struct dns_query_struct *q, struct dns_upstream_service *s)
+{
+    pthread_mutex_lock(&q->lock);
+    for (struct dns_service_observation *o = q->service_observations; o; o = o->next) {
+        if (o->service != s || o->terminal) continue;
+        __atomic_store_n(&o->end_reason, DNS_END_DEADLINE, __ATOMIC_RELAXED);
+        __atomic_store_n(&o->terminal, 1, __ATOMIC_RELEASE);
+        pthread_mutex_lock(&s->turn_lock);
+        if (s->turn_observation == o) turn_cancel_locked(s);
+        pthread_mutex_unlock(&s->turn_lock); observation_hint(o, 1);
+    }
+    pthread_mutex_unlock(&q->lock);
+}
 void _dns_service_query_terminal(struct dns_query_struct *q)
 {
     pthread_mutex_lock(&q->lock);
     unsigned long now = get_tick_count();
     unsigned reason = q->has_result ? DNS_END_OTHER_RESULT :
-        (now >= q->created_tick && now - q->created_tick >= DNS_QUERY_RETRY * DNS_QUERY_TIMEOUT) ? DNS_END_DEADLINE :
+        (dns_query_budget_timed_out(q->budget) || (now >= q->created_tick && now - q->created_tick >= (q->lifetime_ms ? q->lifetime_ms : DNS_QUERY_LIFETIME))) ? DNS_END_DEADLINE :
         dns_query_budget_exhausted(q->budget) ? DNS_END_BUDGET_OR_CANCEL : DNS_END_OTHER;
     for (struct dns_service_observation *o = q->service_observations; o; o = o->next) {
+        if (__atomic_load_n(&o->terminal, __ATOMIC_ACQUIRE)) continue;
         __atomic_store_n(&o->end_reason, reason == DNS_END_OTHER_RESULT && q->result_service == o->service ?
             DNS_END_UNACCEPTED_RESULT : reason, __ATOMIC_RELAXED);
         __atomic_store_n(&o->terminal, 1, __ATOMIC_RELEASE);
@@ -697,17 +754,30 @@ void _dns_service_prepare_connection(struct dns_server_info *target)
         candidates[count++] = s->members[i]; dns_client_server_info_get(s->members[i]);
     }
     pthread_mutex_unlock(&s->lock);
-    for (unsigned i = 0; i < count; i++) {
-        struct dns_server_info *ep = candidates[i];
-        pthread_mutex_lock(&ep->lock);
-        if (__atomic_load_n(&s->connections, __ATOMIC_ACQUIRE) >= cap &&
+    unsigned long now = get_tick_count();
+    int rotating = 0;
+    for (unsigned i = 0; i < count; i++) if (candidates[i]->service_rotation) rotating = 1;
+    /* Reuse healthy connections for at least a second when the IP set exceeds
+     * the physical cap. Rotate one slot at a time, never one TLS handshake per query. */
+    for (unsigned i = 0; i < count && __atomic_load_n(&s->connections, __ATOMIC_ACQUIRE) >= cap; i++) {
+        struct dns_server_info *ep = candidates[i]; pthread_mutex_lock(&ep->lock);
+        if ((!ep->service_connect_tick || now - ep->service_connect_tick >= 1000) &&
             ep->service_connection_held && !ep->active_attempts && !ep->process_depth &&
             ep->status != DNS_SERVER_STATUS_CONNECTING && !ep->send_buff.len &&
             !ep->http2_write_owner && !ep->ssl_want_write && list_empty(&ep->conn_stream_list))
             _dns_client_close_socket(ep);
         pthread_mutex_unlock(&ep->lock);
-        dns_client_server_info_release(ep);
     }
+    if (!rotating && __atomic_load_n(&s->connections, __ATOMIC_ACQUIRE) >= cap) {
+        for (unsigned i = 0; i < count; i++) {
+            struct dns_server_info *ep = candidates[i]; pthread_mutex_lock(&ep->lock);
+            int drain = ep->status == DNS_SERVER_STATUS_CONNECTED && ep->active_attempts &&
+                (!ep->service_connect_tick || now - ep->service_connect_tick >= 1000);
+            if (drain) __atomic_store_n(&ep->service_rotation, 1, __ATOMIC_RELEASE);
+            pthread_mutex_unlock(&ep->lock); if (drain) break;
+        }
+    }
+    for (unsigned i = 0; i < count; i++) dns_client_server_info_release(candidates[i]);
 }
 int _dns_service_connection_acquire(struct dns_server_info *ep)
 {
@@ -770,6 +840,7 @@ static void service_flush(struct dns_upstream_service *s, unsigned long now)
             if (s->discovery) _dns_discovery_start(s->discovery);
         }
     }
+    _dns_service_connection_tick(s, now);
     struct dns_query_struct *release[DNS_MAX_SERVERS * 2];
     unsigned release_count = 0;
     pthread_mutex_lock(&s->lock);
@@ -856,6 +927,8 @@ static void service_flush(struct dns_upstream_service *s, unsigned long now)
         if (retry > now && retry < due) due = retry;
     }
     if (s->next_eligible > now && s->next_eligible < due) due = s->next_eligible;
+    if (s->connection_due < due) due = s->connection_due;
+    if (s->path_refresh_due > now && s->path_refresh_due < due) due = s->path_refresh_due;
     pthread_mutex_unlock(&s->lock);
     service_timer(s, due);
     if (lease_endpoint) {
@@ -914,6 +987,7 @@ void _dns_services_stop(void)
 void _dns_services_remove_all(void)
 {
     _dns_services_flush_pending();
+    _dns_paths_close();
     struct dns_upstream_service *s, *tmp;
     list_for_each_entry_safe(s, tmp, &services, list) {
         unsigned state = __atomic_load_n(&s->turn_state, __ATOMIC_ACQUIRE);
@@ -1016,6 +1090,51 @@ int dns_client_get_service_diagnostics_v1(const char *id, struct dns_upstream_se
     }
     pthread_mutex_unlock(&registry_lock);
     return result;
+}
+int dns_client_get_service_policy_v1(const char *id, struct dns_upstream_policy_snapshot_v1 *out)
+{
+    if (!id || !out) return -1;
+    int result = -1;
+    pthread_mutex_lock(&registry_lock);
+    struct dns_upstream_service *s;
+    list_for_each_entry(s, &services, list) {
+        if (strcmp(s->id, id)) continue;
+        pthread_mutex_lock(&s->detail_lock); *out = s->detail; pthread_mutex_unlock(&s->detail_lock);
+        out->struct_size = sizeof(*out); out->version = 1;
+        out->family = s->config.family; out->response_timeout_ms = s->config.response_timeout_ms;
+        out->query_timeout_ms = s->config.query_timeout_ms; out->connect_timeout_ms = s->config.connect_timeout_ms;
+        out->connect_delay_ms = s->config.connect_delay_ms;
+        out->keepalive_ms = s->config.keepalive_disabled || (s->type != DNS_SERVER_HTTPS && s->type != DNS_SERVER_HTTP3) ? 0 : s->config.keepalive_ms;
+        unsigned long now = get_tick_count();
+        for (unsigned i = 0; i < out->event_count; i++) out->events[i].age_ms = now >= out->events[i].tick_ms ? now - out->events[i].tick_ms : 0;
+        pthread_mutex_lock(&s->lock);
+        for (unsigned i = 0; i < out->path_count; i++) for (unsigned j = 0; j < s->member_count; j++) {
+            struct dns_server_info *ep = s->members[j];
+            if (strcmp(ep->ip, out->paths[i].ip)) continue;
+            out->paths[i].selected = !ep->service_revoked;
+            out->paths[i].connected = ep->status == DNS_SERVER_STATUS_CONNECTED;
+            out->paths[i].keepalive_ms = out->paths[i].connected ? ep->service_keepalive_interval_ms : 0;
+            out->paths[i].active_attempts = __atomic_load_n(&ep->active_attempts, __ATOMIC_RELAXED);
+            out->paths[i].attempts = __atomic_load_n(&ep->service_attempt_count, __ATOMIC_RELAXED);
+            out->paths[i].successes = __atomic_load_n(&ep->service_success_count, __ATOMIC_RELAXED);
+            out->paths[i].failures = __atomic_load_n(&ep->service_failure_count, __ATOMIC_RELAXED);
+        }
+        pthread_mutex_unlock(&s->lock); result = 0; break;
+    }
+    pthread_mutex_unlock(&registry_lock); return result;
+}
+void _dns_services_network_tick(void)
+{
+    _dns_paths_network_tick();
+    struct dns_upstream_service *s;
+    list_for_each_entry(s, &services, list) {
+        if (!s->started || s->stopping) continue;
+        /* The bounded route cache also handles changes not reported by netlink,
+         * including rule updates and a temporarily unavailable monitor socket. */
+        unsigned long now = get_tick_count();
+        _dns_paths_refresh(s, now);
+        service_reconcile(s, now); service_queue(s);
+    }
 }
 int dns_client_get_service_snapshot_v1(struct dns_upstream_service_snapshot_v1 *out, unsigned capacity)
 {

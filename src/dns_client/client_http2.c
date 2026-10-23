@@ -1,4 +1,3 @@
-#include "upstream_service.h"
 /*************************************************************************
  *
  * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
@@ -18,6 +17,7 @@
  */
 
 #define _GNU_SOURCE
+#include "upstream_service.h"
 
 #include "client_http2.h"
 #include "upstream_policy.h"
@@ -28,6 +28,7 @@
 #include "server_info.h"
 
 #include "smartdns/http2.h"
+#include "smartdns/util.h"
 
 #include <errno.h>
 #include <string.h>
@@ -799,11 +800,27 @@ static int _dns_client_http2_process_read(struct dns_server_info *server_info)
 		return -1;
 	}
 
+    if (server_info->service && !server_info->service_protocol_ready) {
+        __atomic_store_n(&server_info->service_protocol_ready, 1, __ATOMIC_RELEASE);
+        _dns_service_endpoint_ready(server_info);
+    }
 	/* Poll and process streams until no more ready */
 	while (loop_count++ < MAX_LOOP_COUNT) {
 		/* Poll for stream readiness */
 		ret = http2_ctx_poll_readable(http2_ctx, poll_items, 128, &poll_count);
+        if (server_info->service_ping_tick && http2_ctx_ping_acked(http2_ctx, server_info->service_ping_cookie)) {
+            _dns_service_detail(NULL, server_info, DNS_DETAIL_KEEPALIVE_ACK, DNS_PHASE_HTTP2, 0,
+                get_tick_count() - server_info->service_ping_tick, 5000);
+            server_info->service_ping_tick = 0;
+        }
+        uint32_t goaway_error = 0;
+        if (http2_ctx_draining(http2_ctx, NULL, &goaway_error) && !server_info->service_draining) {
+            server_info->service_draining = 1;
+            _dns_service_detail(NULL, server_info, DNS_DETAIL_GOAWAY, DNS_PHASE_HTTP2, goaway_error, 0, 0);
+        }
 		if (ret < 0) {
+            if (!server_info->service_error_code) { server_info->service_error_phase = DNS_PHASE_HTTP2; server_info->service_error_code = ret; }
+            if (ret == HTTP2_ERR_EOF && !server_info->active_attempts) server_info->service_normal_close = 1;
 			if (ret != HTTP2_ERR_EOF) {
 				tlog(TLOG_DEBUG, "http2 poll failed, ret=%d", ret);
 			}

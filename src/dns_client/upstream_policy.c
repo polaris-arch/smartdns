@@ -90,6 +90,12 @@ unsigned int dns_query_budget_remaining_ms(struct dns_query_budget *b)
 	pthread_mutex_unlock(&b->lock);
 	return left > UINT_MAX ? UINT_MAX : (unsigned int)left;
 }
+int dns_query_budget_timed_out(struct dns_query_budget *b)
+{
+    if (!b) return 0;
+    pthread_mutex_lock(&b->lock); int expired = !b->cancelled && get_tick_count() >= b->deadline;
+    pthread_mutex_unlock(&b->lock); return expired;
+}
 int dns_query_budget_exhausted(struct dns_query_budget *b)
 {
 	if (!b) return 0;
@@ -215,6 +221,9 @@ void _dns_policy_http_error(struct dns_server_info *s, int status, const char *v
 {
 	if ((status != 429 && status != 503) || !s->policy) return;
     _dns_service_diagnostic_event(NULL, s, status == 429 ? DNS_EVENT_HTTP_429 : DNS_EVENT_HTTP_503);
+    _dns_service_detail(NULL, s, status == 429 ? DNS_DETAIL_HTTP_429 : DNS_DETAIL_HTTP_503,
+        s->type == DNS_SERVER_HTTP3 ? DNS_PHASE_HTTP3 : DNS_PHASE_HTTP2, status, 0,
+        s->service && s->service->flags.upstream_cooldown_ms ? s->service->flags.upstream_cooldown_ms : 1000);
 	unsigned long now = get_tick_count();
 	uint64_t delay = 0;
 	int valid = _dns_policy_retry_after_ms(value, time(NULL), &delay) == 0;
@@ -279,6 +288,10 @@ int _dns_attempt_begin(struct dns_query_struct *q, struct dns_server_info *s)
     pthread_mutex_lock(&s->lock);
     pthread_mutex_lock(&q->lock);
     struct dns_query_attempt *a = find_attempt(q, s);
+    /* Selection can race idle-slot rotation. Recheck readiness while holding the
+     * endpoint lock, before reserving an attempt that would pin a closed socket. */
+    if (s->service && s->type != DNS_SERVER_UDP &&
+        (!__atomic_load_n(&s->service_protocol_ready, __ATOMIC_ACQUIRE) || s->status != DNS_SERVER_STATUS_CONNECTED)) goto out;
     if (s->type == DNS_SERVER_HTTP3 && _dns_http3_is_draining(s)) goto out;
     if (q->terminal || (a && (a->sends >= DNS_QUERY_RETRY || a->replied)) || dns_query_budget_exhausted(q->budget)) {
         ret = DNS_ADMIT_DONE; goto out;
@@ -414,6 +427,7 @@ void _dns_attempt_response_sample(struct dns_query_struct *q, struct dns_server_
          * generation tag too. Exclude all ambiguous retries rather than invent RTT. */
         unsigned long now = get_tick_count();
         if (a->sends == 1 && now >= a->sent_tick) {
+            _dns_service_response_time(s, now - a->sent_tick);
             __atomic_add_fetch(&s->service->stats.attempt_rtt_sum_ms, now - a->sent_tick, __ATOMIC_RELAXED);
             __atomic_add_fetch(&s->service->stats.attempt_rtt_samples, 1, __ATOMIC_RELAXED);
         } else __atomic_add_fetch(&s->service->stats.attempt_rtt_ambiguous_count, 1, __ATOMIC_RELAXED);
@@ -519,11 +533,17 @@ void _dns_attempt_expire(struct dns_query_struct *q, unsigned long now)
 {
     for (;;) {
         struct dns_server_info *server = NULL;
-        unsigned int generation = 0;
+        unsigned int generation = 0, elapsed = 0, limit = 0, service_deadline = 0;
         pthread_mutex_lock(&q->lock);
         struct dns_query_attempt *a;
         for (a = q->attempts; a; a = a->next) {
-            if (a->active && a->sent_tick && now - a->sent_tick >= DNS_QUERY_TIMEOUT) {
+            unsigned response_limit = a->server->service && a->server->service->config.response_timeout_ms ? a->server->service->config.response_timeout_ms : DNS_QUERY_TIMEOUT;
+            int deadline = a->server->service && q->created_tick && a->server->service->config.query_timeout_ms && now >= q->created_tick &&
+                now - q->created_tick >= a->server->service->config.query_timeout_ms;
+            if (a->active && (deadline || (a->sent_tick && now - a->sent_tick >= response_limit))) {
+                elapsed = deadline ? now - q->created_tick : a->sent_tick ? now - a->sent_tick : now - q->created_tick;
+                limit = deadline ? a->server->service->config.query_timeout_ms : response_limit;
+                service_deadline = deadline;
                 server = a->server; generation = a->generation;
                 dns_client_server_info_get(server); break;
             }
@@ -531,8 +551,11 @@ void _dns_attempt_expire(struct dns_query_struct *q, unsigned long now)
         pthread_mutex_unlock(&q->lock);
         if (!server) break;
         if (_dns_attempt_retire(q, server, generation)) {
-            _dns_service_diagnostic_event(q, server, DNS_EVENT_ATTEMPT_TIMEOUT);
-            _dns_service_endpoint_failure(server);
+            if (!service_deadline) _dns_service_diagnostic_event(q, server, DNS_EVENT_ATTEMPT_TIMEOUT);
+            _dns_service_detail(q, server, service_deadline ? DNS_DETAIL_QUERY_TIMEOUT : DNS_DETAIL_RESPONSE_TIMEOUT,
+                DNS_PHASE_RESPONSE, 0, elapsed, limit);
+            if (service_deadline) _dns_service_query_expired(q, server->service);
+            else _dns_service_endpoint_failure(server);
             if (server->type == DNS_SERVER_TCP || server->type == DNS_SERVER_TLS ||
                 (server->type == DNS_SERVER_HTTPS && strncmp(server->alpn_selected, "h2", 2)))
                 _dns_client_close_socket(server); /* no late FIFO response may claim a newer attempt */

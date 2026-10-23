@@ -19,6 +19,7 @@
  */
 
 #include "client_socket.h"
+#include "smartdns/util.h"
 #include "client_http3.h"
 #include "client_https.h"
 #include "client_mdns.h"
@@ -48,6 +49,12 @@ int _dns_client_create_socket(struct dns_server_info *server_info)
         return -1;
     }
 
+    server_info->service_connect_tick = get_tick_count();
+    server_info->service_keepalive_tick = server_info->service_connect_tick;
+    server_info->service_ping_tick = 0; server_info->service_draining = 0;
+    server_info->service_protocol_ready = 0; server_info->service_rotation = 0;
+    server_info->service_tls_error = 0; server_info->service_system_error = server_info->service_error_code = 0;
+    server_info->service_normal_close = 0;
 	time(&server_info->last_send);
 	time(&server_info->last_recv);
 

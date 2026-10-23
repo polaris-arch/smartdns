@@ -433,6 +433,9 @@ struct dns_servers {
 	unsigned int upstream_ip_pool;
 	unsigned int pool_compat_skip;
 	unsigned int max_upstream_backends;
+	unsigned int upstream_family;
+	unsigned int upstream_response_timeout_ms, upstream_query_timeout_ms, upstream_connect_timeout_ms;
+	unsigned int upstream_connect_delay_ms, upstream_keepalive_ms, upstream_keepalive_disabled;
 	unsigned int pool_ip_count;
 	char pool_ips[64][DNS_MAX_IPLEN];
 	char quota_group[DNS_MAX_CNAME_LEN];

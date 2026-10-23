@@ -17,6 +17,7 @@
  */
 
 #include "answer.h"
+#include "smartdns/upstream_service.h"
 #include "address.h"
 #include "dns_server.h"
 #include "ip_rule.h"
@@ -520,6 +521,7 @@ int _dns_server_process_answer(struct dns_request *request, const char *domain, 
 			 packet->head.rcode, packet->head.id);
 		request->rcode = DNS_RC_NOERROR;
 		request->passthrough = 1;
+        dns_client_response_reject_reason(DNS_REJECT_FILTERED);
 		return DNS_CLIENT_ACTION_RETRY;
 	}
 
@@ -527,6 +529,7 @@ int _dns_server_process_answer(struct dns_request *request, const char *domain, 
 		request->has_soa == 0) {
 		tlog(TLOG_DEBUG, "result is truncated, %s qtype: %d, rcode: %d, id: %d, retry.", domain, request->qtype,
 			 packet->head.rcode, packet->head.id);
+        dns_client_response_reject_reason(DNS_REJECT_TRUNCATED);
 		return DNS_CLIENT_ACTION_RETRY;
 	}
 
@@ -539,6 +542,7 @@ int _dns_server_process_answer(struct dns_request *request, const char *domain, 
 		}
 
 		/* need retry for some server. */
+        dns_client_response_reject_reason(DNS_REJECT_NO_USABLE_RECORDS);
 		return DNS_CLIENT_ACTION_MAY_RETRY;
 	}
 

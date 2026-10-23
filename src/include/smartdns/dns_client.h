@@ -89,6 +89,7 @@ void dns_query_budget_get(struct dns_query_budget *budget);
 void dns_query_budget_put(struct dns_query_budget *budget);
 void dns_query_budget_cancel(struct dns_query_budget *budget);
 int dns_query_budget_exhausted(struct dns_query_budget *budget);
+int dns_query_budget_timed_out(struct dns_query_budget *budget);
 unsigned int dns_query_budget_remaining_ms(struct dns_query_budget *budget);
 int dns_client_group_has_ecs(const char *group_name);
 

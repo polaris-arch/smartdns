@@ -1,4 +1,3 @@
-#include "upstream_service.h"
 /*************************************************************************
  *
  * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
@@ -18,6 +17,7 @@
  */
 
 #define _GNU_SOURCE
+#include "upstream_service.h"
 
 #define _GNU_SOURCE
 #include "smartdns/http_parse.h"
@@ -596,7 +596,9 @@ void _dns_client_check_tcp(void)
 
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
 		if (server_info->type == DNS_SERVER_QUIC || server_info->type == DNS_SERVER_HTTP3) {
-			if (server_info->ssl) {
+            /* Pool QUIC is driven by its exact event deadline and drains decoded
+             * streams under the transport guard. Do not consume its UDP input here. */
+			if (server_info->ssl && !server_info->service) {
 				_ssl_do_handevent(server_info);
 				if (SSL_get_shutdown(server_info->ssl) != 0) {
 					_dns_client_close_socket_ext(server_info, 1);
@@ -614,6 +616,8 @@ void _dns_client_check_tcp(void)
 			}
 		} else if (server_info->status == DNS_SERVER_STATUS_CONNECTED) {
 			if (server_info->last_recv + DNS_TCP_IDLE_TIMEOUT < now) {
+                _dns_service_detail(NULL, server_info, DNS_DETAIL_IDLE_CLOSE, DNS_PHASE_SOCKET, 0, 0,
+                    DNS_TCP_IDLE_TIMEOUT * 1000);
 				/*disconnect if the server is not responding */
 				server_info->recv_buff.len = 0;
 				server_info->send_buff.len = 0;

@@ -22,6 +22,8 @@ pub struct UpstreamDiagnostics {
     pub failure_last_event: BTreeMap<String, u64>,
     pub events: BTreeMap<String, u64>,
     pub client_loop: serde_json::Value,
+    #[serde(default)]
+    pub policy: Option<serde_json::Value>,
 }
 
 fn named(names: &[&str], values: &[u64]) -> Result<BTreeMap<String, u64>, String> {
@@ -48,7 +50,7 @@ impl UpstreamDiagnostics {
             version: 1, qps: raw.qps, burst: raw.burst, cooldown_ms: raw.cooldown_ms,
             failure_end: named(ENDS, &raw.failure_end)?, skip_end: named(ENDS, &raw.skip_end)?,
             skip_wait: named(WAITS, &raw.skip_wait)?, failure_last_event: named(&last, &raw.failure_last_event)?,
-            events: named(EVENTS, &raw.events)?, client_loop: serde_json::Value::Null,
+            events: named(EVENTS, &raw.events)?, client_loop: serde_json::Value::Null, policy: None,
         })
     }
 
@@ -75,6 +77,31 @@ impl UpstreamDiagnostics {
                 "zero_wait_no_events": loop_raw.zero_wait_no_events, "ready_events": loop_raw.ready_events,
                 "wakeups": loop_raw.wakeups, "periodic_runs": loop_raw.periodic_runs,
             });
+        }
+        let mut policy: smartdns_c::dns_upstream_policy_snapshot_v1 = unsafe { std::mem::zeroed() };
+        if unsafe { smartdns_c::dns_client_get_service_policy_v1(id.as_ptr(), &mut policy) } == 0
+            && policy.version == 1 && policy.struct_size as usize == std::mem::size_of_val(&policy)
+            && policy.event_count as usize <= policy.events.len() && policy.path_count as usize <= policy.paths.len() {
+            let string = |s: &[std::ffi::c_char]| {
+                let bytes: Vec<u8> = s.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
+            let events: Vec<_> = policy.events[..policy.event_count as usize].iter().map(|e| serde_json::json!({
+                "sequence": e.sequence, "query_id":e.query_id, "age_ms":e.age_ms, "ip":string(&e.ip), "family":e.family,
+                "port":e.port, "kind":e.kind, "phase":e.phase, "code":e.code, "system_error":e.system_error,
+                "elapsed_ms":e.elapsed_ms, "limit_ms":e.limit_ms, "tls_error":e.tls_error, "message":string(&e.message)
+            })).collect();
+            let paths: Vec<_> = policy.paths[..policy.path_count as usize].iter().map(|p| serde_json::json!({
+                "ip":string(&p.ip), "source":string(&p.source), "interface":string(&p.interface),
+                "family":p.family, "state":p.state, "selected":p.selected != 0, "connected":p.connected != 0,
+                "active_attempts":p.active_attempts, "keepalive_ms":p.keepalive_ms, "attempts":p.attempts, "successes":p.successes, "failures":p.failures
+            })).collect();
+            value.policy = Some(serde_json::json!({"version":1,"family":policy.family,
+                "response_timeout_ms":policy.response_timeout_ms,"query_timeout_ms":policy.query_timeout_ms,
+                "connect_timeout_ms":policy.connect_timeout_ms,"connect_delay_ms":policy.connect_delay_ms,
+                "keepalive_ms":policy.keepalive_ms,"sequence":policy.sequence,"dropped_events":policy.dropped_events,
+                "kind_counts":policy.kind_counts.to_vec(),"reject_counts":policy.reject_counts.to_vec(),
+                "response_histogram":policy.response_histogram.to_vec(),"paths":paths,"events":events}));
         }
         Ok((base, value))
     }

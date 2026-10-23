@@ -533,6 +533,13 @@ static int _pool_same_legacy_semantics(const struct dns_servers *a, const struct
 		a->set_mark == b->set_mark && a->drop_packet_latency_ms == b->drop_packet_latency_ms &&
 		a->tcp_keepalive == b->tcp_keepalive && a->max_query_rate == b->max_query_rate &&
 		a->query_burst == b->query_burst && a->upstream_cooldown_ms == b->upstream_cooldown_ms &&
+        a->upstream_family == b->upstream_family &&
+        a->upstream_response_timeout_ms == b->upstream_response_timeout_ms &&
+        a->upstream_query_timeout_ms == b->upstream_query_timeout_ms &&
+        a->upstream_connect_timeout_ms == b->upstream_connect_timeout_ms &&
+        a->upstream_connect_delay_ms == b->upstream_connect_delay_ms &&
+        a->upstream_keepalive_ms == b->upstream_keepalive_ms &&
+        a->upstream_keepalive_disabled == b->upstream_keepalive_disabled &&
         a->max_upstream_connections == b->max_upstream_connections &&
 		a->fallback == b->fallback && a->subnet_all_query_types == b->subnet_all_query_types &&
 		a->skip_check_cert == b->skip_check_cert && !strcmp(a->spki, b->spki) &&

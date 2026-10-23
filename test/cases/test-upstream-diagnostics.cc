@@ -26,3 +26,30 @@ TEST(UpstreamDiagnostics, LoopSeparatesEmptyZeroWaitsReadinessWakeupsAndCpuWindo
     EXPECT_EQ(dns_client_get_loop_diagnostics_v1(nullptr), -1);
     EXPECT_EQ(dns_client_get_service_diagnostics_v1(nullptr, nullptr, nullptr), -1);
 }
+
+TEST(UpstreamDiagnostics, EvidenceRingIsBoundedOrderedAndSeparateFromQueryOutcomes) {
+    dns_upstream_service service{};dns_server_info endpoint{};
+    pthread_mutex_init(&service.detail_lock,nullptr);endpoint.service=&service;endpoint.port=443;
+    strcpy(endpoint.ip,"::1");
+    for(unsigned i=0;i<40;i++)_dns_service_detail(nullptr,&endpoint,DNS_DETAIL_RESPONSE_TIMEOUT,DNS_PHASE_RESPONSE,0,700+i,700);
+    EXPECT_EQ(service.detail.event_count,32U);EXPECT_EQ(service.detail.dropped_events,8U);
+    EXPECT_EQ(service.detail.kind_counts[DNS_DETAIL_RESPONSE_TIMEOUT],40U);
+    EXPECT_EQ(service.detail.events[0].sequence,40U);EXPECT_EQ(service.detail.events[31].sequence,9U);
+    EXPECT_EQ(service.detail.events[0].family,6U);EXPECT_EQ(service.stats.query_count,0U);
+    _dns_service_response_time(&endpoint,63);_dns_service_response_time(&endpoint,701);
+    EXPECT_EQ(service.detail.response_histogram[3],1U);EXPECT_EQ(service.detail.response_histogram[6],1U);
+    _dns_service_detail(nullptr,&endpoint,DNS_DETAIL_DNS_REJECT,DNS_PHASE_RESPONSE,DNS_REJECT_FILTERED,0,0);
+    EXPECT_EQ(service.detail.reject_counts[DNS_REJECT_FILTERED],1U);
+    EXPECT_EQ(service.detail.kind_counts[DNS_DETAIL_RESPONSE_TIMEOUT],40U);
+    pthread_mutex_destroy(&service.detail_lock);
+}
+
+TEST(UpstreamDiagnostics, OtherHttpStatusRetainsActualCodeWithoutInventingSocketFailure) {
+    dns_upstream_service s{};dns_server_info ep{};ep.service=&s;
+    pthread_mutex_init(&s.detail_lock,nullptr);
+    _dns_service_diagnostic_http(nullptr,&ep,403);
+    EXPECT_EQ(s.diagnostics.events[DNS_EVENT_HTTP_OTHER],1U);
+    EXPECT_EQ(s.detail.event_count,1U);EXPECT_EQ(s.detail.events[0].code,403);
+    EXPECT_EQ(s.detail.events[0].phase,DNS_PHASE_RESPONSE);EXPECT_EQ(s.detail.events[0].system_error,0);
+    EXPECT_EQ(s.stats.failure_count,0U);pthread_mutex_destroy(&s.detail_lock);
+}

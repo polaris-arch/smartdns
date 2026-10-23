@@ -355,6 +355,10 @@ void http2_stream_set_ex_data(struct http2_stream *stream, void *data);
  */
 void *http2_stream_get_ex_data(struct http2_stream *stream);
 
+int http2_ctx_handshake_ready(struct http2_ctx *ctx);
+int http2_ctx_ping(struct http2_ctx *ctx, uint64_t cookie);
+int http2_ctx_ping_acked(struct http2_ctx *ctx, uint64_t cookie);
+int http2_ctx_draining(struct http2_ctx *ctx, uint32_t *last, uint32_t *error);
 #ifdef __cplusplus
 }
 #endif

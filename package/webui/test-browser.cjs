@@ -153,10 +153,17 @@ async function capture(label) {
     const button = tr.getByRole('button', { name: /诊断|Diagnostics/ });
     await button.click();
     const dialog = page.getByRole('dialog');
-    const section = dialog.locator('section[aria-label]');
+    const section = dialog.getByRole('tabpanel');
     await section.waitFor({ state: 'visible' });
+    assert.equal(await dialog.getByRole('tab').count(), 4);
+    await dialog.getByRole('tab').nth(1).click();
+    assert.match(await section.textContent(), /连接地址族|Transport family/);
+    await capture('upstream-backends-and-latency');
+    await dialog.getByRole('tab').nth(2).click();
+    await capture('upstream-recent-events');
+    await dialog.getByRole('tab').nth(3).click();
     assert((await section.textContent()).includes(pools[0].diagnostics.cooldown_ms + ' ms'));
-    assert.match(await section.textContent(), /客户端线程 CPU|client thread CPU/);
+    assert.match(await section.textContent(), /全局客户端线程|Global client thread/);
     const bounds = await dialog.boundingBox();
     assert(bounds && bounds.width >= 500 && bounds.x >= 0 && bounds.x + bounds.width <= 1600);
     const contentBounds = await section.evaluate(el => ({content: el.scrollWidth, viewport: el.clientWidth}));
@@ -169,6 +176,7 @@ async function capture(label) {
     await dialog.waitFor({ state: 'visible' });
     const mobile = await dialog.boundingBox();
     assert(mobile && mobile.x >= 0 && mobile.x + mobile.width <= 390);
+    await dialog.getByRole('tab').nth(1).click();
     const mobileContent = await section.evaluate(el => ({content: el.scrollWidth, viewport: el.clientWidth}));
     assert(mobileContent.content <= mobileContent.viewport + 1, 'mobile diagnostic text must remain readable');
     await capture('upstream-diagnostics-mobile');

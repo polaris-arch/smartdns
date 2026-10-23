@@ -739,7 +739,14 @@ fn test_rest_api_service_pool_configuration_and_backend_identity() {
         let (code, body) = client.get("/api/upstream-server").unwrap();
         assert_eq!(code, 200);
         let rows = http_api_msg::api_msg_parse_upstream_server_list(&body).unwrap();
-        if rows.iter().filter(|row| row.service.as_ref().map(|v| v.pool_enabled).unwrap_or(false)).count() == 3 {
+        let pools: Vec<_> = rows.iter().filter(|row| row.service.as_ref().map(|v| v.pool_enabled).unwrap_or(false)).collect();
+        let ready = pools.len()==3 && pools.iter().all(|row| {
+            let service=row.service.as_ref().unwrap();
+            service.freshness_status=="non_expiring" && service.diagnostics.as_ref()
+                .and_then(|d|d.policy.as_ref()).and_then(|p|p.get("paths")).and_then(serde_json::Value::as_array)
+                .map(|paths|paths.len()==2).unwrap_or(false)
+        });
+        if ready {
             if let Ok(path) = std::env::var("SMARTDNS_SERVICE_API_EVIDENCE") {
                 std::fs::write(path, &body).unwrap();
             }
@@ -754,6 +761,10 @@ fn test_rest_api_service_pool_configuration_and_backend_identity() {
         let details = pool.service.as_ref().unwrap();
         assert_eq!(details.freshness_status, "non_expiring");
         assert_eq!(details.freshness_remaining_ms, None);
+        let policy=details.diagnostics.as_ref().unwrap().policy.as_ref().unwrap();
+        assert_eq!(policy["version"],1);assert_eq!(policy["response_timeout_ms"],1000);
+        assert_eq!(policy["query_timeout_ms"],3000);assert_eq!(policy["paths"].as_array().unwrap().len(),2);
+        assert!(policy["events"].as_array().unwrap().len()<=32);
     }
     let ids: std::collections::HashSet<_> = pools.iter()
         .map(|row| &row.service.as_ref().unwrap().service_id).collect();
