@@ -32,6 +32,9 @@
 #include <vector>
 
 #include "smartdns/upstream_service.h"
+extern "C" {
+#include "dns_client/dns_client.h"
+}
 
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC) && OPENSSL_VERSION_NUMBER >= 0x30500000L
 namespace {
@@ -272,6 +275,52 @@ private:
     bool h3_ = false; int fd_ = -1; SSL_CTX *ctx_ = nullptr; SSL *listener_ = nullptr;
     std::atomic<bool> run_{false}; std::thread worker_;
 };
+void quic_error_ready_case(bool h3) {
+    auto peer = std::make_unique<PoolQuicPeer>();
+    unsigned port = h3 ? 62994 : 62993, listen = h3 ? 62794 : 62793;
+    ASSERT_TRUE(peer->Start("127.0.0.1", port, h3));
+    smartdns::Server resolver(smartdns::Server::CREATE_MODE_THREAD);
+    std::string config = "bind 127.0.0.1:" + std::to_string(listen) + "\nserver " + (h3 ? "h3://" : "quic://") +
+        "resolver.quic-error.example:" + std::to_string(port) + (h3 ? "/dns-query" : "") +
+        " -upstream-ip-pool -host-ip 127.0.0.1 -no-check-certificate\n"
+        "cache-size 0\ncache-persist no\nprefetch-domain no\nserve-expired no\n"
+        "dualstack-ip-selection no\nspeed-check-mode none\nresponse-mode fastest-response\nlog-level error\n";
+    ASSERT_TRUE(resolver.Start(config));
+    ASSERT_TRUE(query_udp("warm.quic-error.example", listen));
+    dns_server_info *endpoint = nullptr, *candidate;
+    pthread_mutex_lock(&client.server_list_lock);
+    list_for_each_entry(candidate, &client.dns_server_list, list) {
+        if (candidate->type == (h3 ? DNS_SERVER_HTTP3 : DNS_SERVER_QUIC)) { endpoint = candidate; break; }
+    }
+    pthread_mutex_unlock(&client.server_list_lock);
+    ASSERT_NE(endpoint, nullptr);
+    pthread_mutex_lock(&endpoint->lock);
+    peer.reset();
+    int fd = endpoint->fd;
+    unsigned char discard[2048];
+    while (recv(fd, discard, sizeof(discard), MSG_DONTWAIT) > 0) {}
+    int sent = send(fd, "x", 1, MSG_DONTWAIT);
+    pollfd ready{fd, POLLIN | POLLERR, 0};
+    int polled = poll(&ready, 1, 200);
+    dns_client_loop_diagnostics_v1 before{}, after{};
+    int got_before = dns_client_get_loop_diagnostics_v1(&before);
+    pthread_mutex_unlock(&endpoint->lock);
+    fprintf(stderr, "QUIC error fixture: h3=%d sent=%d poll=%d revents=0x%x snapshot=%d\n",
+            h3, sent, polled, ready.revents, got_before);
+    ASSERT_EQ(sent, 1); ASSERT_EQ(polled, 1); ASSERT_TRUE(ready.revents & POLLERR);
+    ASSERT_FALSE(ready.revents & POLLIN); ASSERT_EQ(got_before, 0);
+    poll(nullptr, 0, 1200);
+    ASSERT_EQ(dns_client_get_loop_diagnostics_v1(&after), 0);
+    int pending_error = 0; socklen_t length = sizeof(pending_error);
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &pending_error, &length); // bounded cleanup on the old implementation
+    printf("QUIC error result: h3=%d iterations=%llu ready=%llu pending_error=%d\n", h3,
+            (unsigned long long)(after.iterations - before.iterations),
+            (unsigned long long)(after.ready_events - before.ready_events), pending_error);
+    fflush(stdout);
+    EXPECT_LT(after.iterations - before.iterations, 1000U)
+        << "error-only ready events=" << after.ready_events - before.ready_events
+        << ", pending socket error=" << pending_error;
+}
 void quic_pool_case(bool h3) {
     PoolQuicPeer first, second;
     std::mutex lock; std::vector<unsigned> order;
@@ -321,5 +370,21 @@ TEST(UpstreamServiceQuic, RealH3DualBackendRoundRobinAndConnectionReuse) {
     ASSERT_EXIT({ quic_pool_case(true); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
 #else
     GTEST_SKIP() << "Real pool H3 listener requires OpenSSL >= 3.5 QUIC; mandatory in quic CI profile";
+#endif
+}
+TEST(UpstreamServiceQuic, ErrorOnlyDoqReadinessDoesNotSpin) {
+#if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC) && OPENSSL_VERSION_NUMBER >= 0x30500000L
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT({ quic_error_ready_case(false); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
+#else
+    GTEST_SKIP() << "Real QUIC listener requires OpenSSL >= 3.5 QUIC; mandatory in quic CI profile";
+#endif
+}
+TEST(UpstreamServiceQuic, ErrorOnlyH3ReadinessDoesNotSpin) {
+#if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC) && OPENSSL_VERSION_NUMBER >= 0x30500000L
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT({ quic_error_ready_case(true); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
+#else
+    GTEST_SKIP() << "Real QUIC listener requires OpenSSL >= 3.5 QUIC; mandatory in quic CI profile";
 #endif
 }

@@ -847,6 +847,7 @@ static void *_dns_client_work(void *arg)
             int live_event = server_info->fd >= 0 &&
                 (!server_info->service || !__atomic_load_n(&server_info->service_revoked, __ATOMIC_ACQUIRE) ||
                     server_info->active_attempts);
+            _dns_client_loop_diagnostic_ready(server_info, event->events, now, live_event);
             pthread_mutex_unlock(&server_info->lock);
             if (live_event && _dns_client_process(server_info, event, now) < 0 && server_info->service &&
                 !_dns_policy_service_cooldown(server_info->service, get_tick_count())) {

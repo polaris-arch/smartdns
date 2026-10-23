@@ -91,6 +91,7 @@ void _dns_service_diagnostic_event(struct dns_query_struct *q, struct dns_server
 void _dns_service_diagnostic_http(struct dns_query_struct *q, struct dns_server_info *ep, int status);
 void _dns_client_loop_diagnostic_start(unsigned long now);
 void _dns_client_loop_diagnostic_poll(unsigned long now, int timeout, int events);
+void _dns_client_loop_diagnostic_ready(struct dns_server_info *ep, unsigned events, unsigned long now, int eligible);
 void _dns_client_loop_diagnostic_wake(void);
 void _dns_client_loop_diagnostic_period(void);
 

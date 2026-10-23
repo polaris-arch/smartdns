@@ -2,6 +2,7 @@
  * GPL-3.0-or-later. */
 #include "upstream_service.h"
 #include "smartdns/util.h"
+#include "smartdns/tlog.h"
 #include <string.h>
 #include <time.h>
 #include <sys/syscall.h>
@@ -11,6 +12,8 @@ static struct dns_client_loop_diagnostics_v1 loop;
 static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long last_tick;
 static uint64_t last_cpu;
+static unsigned long ready_window, last_ready_warning;
+static unsigned window_polls, ready_reports;
 
 static int thread_cpu(uint64_t *value)
 {
@@ -35,6 +38,7 @@ void _dns_client_loop_diagnostic_start(unsigned long now)
     loop.thread_id = syscall(SYS_gettid);
 #endif
     last_tick = now; last_cpu = 0;
+    ready_window = now; last_ready_warning = 0; window_polls = ready_reports = 0;
     loop.cpu_clock_available = thread_cpu(&last_cpu) == 0;
     loop.cpu_total_ns = last_cpu; loop.sample_cpu_ns = 0;
     loop.sample_wall_ms = 0; loop.sample_tick_ms = now;
@@ -42,6 +46,12 @@ void _dns_client_loop_diagnostic_start(unsigned long now)
 }
 void _dns_client_loop_diagnostic_poll(unsigned long now, int timeout, int events)
 {
+    if (now < ready_window || now - ready_window >= 1000) {
+        ready_window = now; window_polls = ready_reports = 0;
+    }
+    if (++window_polls == 4096 && (!last_ready_warning || now - last_ready_warning >= 30000)) {
+        last_ready_warning = now; ready_reports = 4;
+    }
     __atomic_add_fetch(&loop.iterations, 1, __ATOMIC_RELAXED);
     if (!timeout) {
         __atomic_add_fetch(&loop.zero_waits, 1, __ATOMIC_RELAXED);
@@ -57,6 +67,17 @@ void _dns_client_loop_diagnostic_poll(unsigned long now, int timeout, int events
     loop.sample_wall_ms = now - last_tick; loop.sample_tick_ms = now;
     pthread_mutex_unlock(&sample_lock);
     last_tick = now; last_cpu = cpu;
+}
+/* Client thread only; caller already holds ep->lock. No per-query data or
+ * extra clocks. At most four descriptor samples per 30 seconds. */
+void _dns_client_loop_diagnostic_ready(struct dns_server_info *ep, unsigned events, unsigned long now, int eligible)
+{
+    if (!ready_reports) return;
+    ready_reports--;
+    tlog(TLOG_WARN, "client epoll burst: polls=%u window_ms=%lu sample fd=%d type=%d alpn=%s endpoint=%s:%d "
+         "events=0x%x eligible=%d revoked=%u active_attempts=%u",
+         window_polls, now >= ready_window ? now - ready_window : 0, ep->fd, ep->type, ep->alpn_selected,
+         ep->ip, ep->port, events, eligible, ep->service_revoked, ep->active_attempts);
 }
 void _dns_client_loop_diagnostic_wake(void)
 { __atomic_add_fetch(&loop.wakeups, 1, __ATOMIC_RELAXED); }

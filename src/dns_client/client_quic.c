@@ -695,7 +695,9 @@ int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_e
         _dns_client_close_socket(server_info);
         return -1;
     }
-	if (event->events & EPOLLIN) {
+	/* An ICMP/socket error can be reported without EPOLLIN. Let QUIC consume
+	 * the network event instead of leaving a level-triggered error pending. */
+	if (event->events & (EPOLLIN | EPOLLERR)) {
 		_ssl_do_handevent(server_info);
 
 		/* connection is closed, reconnect */
