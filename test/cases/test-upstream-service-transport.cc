@@ -5,6 +5,9 @@
 #include "smartdns/http2.h"
 #include "smartdns/util.h"
 #include "gtest/gtest.h"
+extern "C" {
+#include "dns_client/dns_client.h"
+}
 #include <arpa/inet.h>
 #include <atomic>
 #include <cerrno>
@@ -13,6 +16,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <functional>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -142,6 +146,7 @@ public:
     std::atomic<unsigned> requests{0}, connections{0};
     std::function<bool()> on_request;
     bool address_negatives = false;
+    bool close_after_reply = false;
     const char *retry_after = "1";
     bool Start(const char *ip, unsigned port, bool h2) {
         h2_ = h2;
@@ -282,6 +287,7 @@ private:
                     answered.erase(stream); http2_stream_close(stream); it = bodies.erase(it);
                 } else ++it;
             }
+            if (close_after_reply && requests && bodies.empty()) break;
             pollfd p{SSL_get_fd(ssl), static_cast<short>(POLLIN | (http2_ctx_want_write(ctx) ? POLLOUT : 0)), 0}; poll(&p, 1, 5);
         }
         for (auto &body : bodies) http2_stream_close(body.first);
@@ -309,8 +315,11 @@ bool query_udp(const std::string &name, unsigned port, int qtype = DNS_T_A)
     if (good) {
         length = recv(fd, wire, sizeof(wire), 0);
         good = length > 0 && !dns_decode(packet, sizeof(storage), wire, length) &&
-            packet->head.id == 4321 && packet->head.rcode == DNS_RC_NOERROR && packet->head.ancount == (qtype == DNS_T_A ? 1 : 0) &&
-            (qtype == DNS_T_A || packet->head.nscount == 1);
+            packet->head.id == 4321 && packet->head.rcode == DNS_RC_NOERROR &&
+            packet->head.ancount == (qtype == DNS_T_ANY ? 2 : qtype == DNS_T_A ? 1 : 0) &&
+            (qtype != DNS_T_AAAA || packet->head.nscount == 1);
+        if (!good) fprintf(stderr, "Transport fixture reply: qtype=%d bytes=%d rcode=%d answers=%d authority=%d\n",
+            qtype, length, packet->head.rcode, packet->head.ancount, packet->head.nscount);
     }
     close(fd);
     return good;
@@ -390,4 +399,38 @@ TEST(UpstreamServiceTransport, RealH2Nodata20CompletesServiceWithoutDuplicateAtt
 TEST(UpstreamServiceTransport, RealH2Nodata40CompletesServiceWithoutDuplicateAttempt) {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT({ transport_case(true, false, 40); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
+}
+
+namespace {
+void late_h2_cancel_case() {
+    PoolTlsPeer delayed; delayed.close_after_reply = true; delayed.address_negatives = true;
+    delayed.on_request = [] { poll(nullptr, 0, 200); return false; };
+    ASSERT_TRUE(delayed.Start("127.0.0.1", 62995, true));
+    smartdns::MockServer fast;
+    ASSERT_TRUE(fast.Start("udp://127.0.0.1:62996", [&](auto *r) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!delayed.requests && std::chrono::steady_clock::now() < deadline) poll(nullptr, 0, 1);
+        dns_add_domain(r->response_packet, r->domain.c_str(), r->qtype, r->qclass);
+        smartdns::MockServer::AddIP(r, r->domain, r->qtype == DNS_T_AAAA ? "2001:db8::90" : "192.0.2.90", 60);
+        return smartdns::SERVER_REQUEST_OK;
+    }));
+    smartdns::Server resolver(smartdns::Server::CREATE_MODE_THREAD);
+    ASSERT_TRUE(resolver.Start("bind 127.0.0.1:62795\nserver 127.0.0.1:62996\n"
+        "server-https https://localhost:62995/dns-query -host-ip 127.0.0.1 -no-check-certificate -alpn h2\n"
+        "cache-size 0\ncache-persist no\nprefetch-domain no\nserve-expired no\n"
+        "dualstack-ip-selection no\nspeed-check-mode none\nresponse-mode fastest-response\nany-response-mode address\nlog-level error\n"));
+    dns_client_loop_diagnostics_v1 before{}, after{};
+    ASSERT_EQ(dns_client_get_loop_diagnostics_v1(&before), 0);
+    ASSERT_TRUE(query_udp("late-cancelled.transport.example", 62795, DNS_T_ANY));
+    poll(nullptr, 0, 800);
+    ASSERT_EQ(dns_client_get_loop_diagnostics_v1(&after), 0);
+    std::cout << "Late H2 response/EOF: iterations=" << after.iterations - before.iterations
+        << " ready=" << after.ready_events - before.ready_events << std::endl;
+    EXPECT_EQ(delayed.requests.load(), 2u);
+    EXPECT_LT(after.iterations - before.iterations, 1000u);
+}
+}
+TEST(UpstreamServiceTransport, LateCancelledH2ResponseDoesNotSpinClientLoop) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT({ late_h2_cancel_case(); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
 }

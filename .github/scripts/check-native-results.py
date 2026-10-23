@@ -6,6 +6,10 @@ import xml.etree.ElementTree as ET
 
 # Explicit names: deleting/renaming a required fixture must update this reviewed gate.
 COMMON = set("""
+ClientH2FlowOwner.PeerCloseWithoutOrphanMustReachEOF
+ClientH2FlowOwner.LateCancelledResponseAndPeerCloseMustReachEOF
+ClientH2FlowOwner.LateCancelledResponseDoesNotRetainReadinessOrBreakSibling
+UpstreamServiceTransport.LateCancelledH2ResponseDoesNotSpinClientLoop
 UpstreamPolicy.RecoveryPreservesExplicitRateAndFixedCooldown
 UpstreamServiceState.DiagnosticResultProvenanceDoesNotCallOwnRejectedResultAnotherWinner
 UpstreamServiceState.FixedCooldownDefaultsAndDoesNotGrowOrFollowRetryAfter

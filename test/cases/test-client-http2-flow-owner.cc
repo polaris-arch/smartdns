@@ -87,10 +87,10 @@ protected:
         for (unsigned i = 0; i < rounds; i++) { PumpPeer(); EXPECT_GE(PumpClient(), 0); }
         PumpPeer();
     }
-    bool Frame(unsigned type, unsigned id, const std::vector<unsigned char> &payload) {
+    bool Frame(unsigned type, unsigned id, const std::vector<unsigned char> &payload, unsigned flags = 0) {
         std::vector<unsigned char> data(9 + payload.size());
         data[0] = payload.size() >> 16; data[1] = payload.size() >> 8; data[2] = payload.size();
-        data[3] = type; data[4] = 0;
+        data[3] = type; data[4] = flags;
         data[5] = id >> 24; data[6] = id >> 16; data[7] = id >> 8; data[8] = id;
         memcpy(data.data()+9, payload.data(), payload.size());
         return SSL_write(peer, data.data(), data.size()) == static_cast<int>(data.size());
@@ -217,6 +217,49 @@ TEST_F(ClientH2FlowOwner, WindowUpdateAfterDeadlineCannotEmitExpiredBody) {
     ASSERT_EQ(dns_query_budget_remaining_ms(expired.query.budget), 0u);
     ASSERT_TRUE(Frame(8, first, {0,0,0xff,0xff})); Pump();
     EXPECT_EQ(DataBytes(first), 0u); EXPECT_EQ(atomic_read(&expired.query.dns_request_sent), 0);
+}
+
+TEST_F(ClientH2FlowOwner, PeerCloseWithoutOrphanMustReachEOF) {
+    SSL_shutdown(peer);
+    EXPECT_LT(PumpClient(), 0);
+}
+
+TEST_F(ClientH2FlowOwner, LateCancelledResponseAndPeerCloseMustReachEOF) {
+    FlowQuery canceled(&server);
+    int first = Queue(canceled); ASSERT_GT(first, 0);
+    ASSERT_TRUE(Frame(8, first, {0,0,0xff,0xff})); Pump();
+    ASSERT_EQ(DataBytes(first), 12u);
+    canceled.DetachLikeQueryTeardown();
+    ASSERT_EQ(_dns_client_conn_prune(&server), 0);
+    ASSERT_TRUE(list_empty(&server.conn_stream_list));
+    // A response already in flight may legally arrive after our CANCEL.
+    ASSERT_TRUE(Frame(1, first, {0x88}, 4)); // :status 200, END_HEADERS
+    ASSERT_TRUE(Frame(0, first, std::vector<unsigned char>(12), 1)); // END_STREAM
+    SSL_shutdown(peer);
+    int ret = 0;
+    for (unsigned i = 0; i < 4 && ret == 0; ++i) ret = PumpClient();
+    EXPECT_LT(ret, 0) << "orphan readiness must not hide TLS EOF indefinitely";
+}
+
+TEST_F(ClientH2FlowOwner, LateCancelledResponseDoesNotRetainReadinessOrBreakSibling) {
+    FlowQuery canceled(&server), live(&server);
+    int first = Queue(canceled); ASSERT_GT(first, 0);
+    ASSERT_TRUE(Frame(8, first, {0,0,0xff,0xff})); Pump();
+    ASSERT_EQ(DataBytes(first), 12u);
+    canceled.DetachLikeQueryTeardown();
+    ASSERT_EQ(_dns_client_conn_prune(&server), 0);
+    int second = Queue(live); ASSERT_GT(second, first);
+    ASSERT_TRUE(Frame(1, first, {0x88}, 4));
+    ASSERT_TRUE(Frame(0, first, std::vector<unsigned char>(12), 1));
+    ASSERT_GE(PumpClient(), 0);
+    http2_poll_item items[16]{}; int count = 0;
+    ASSERT_GE(http2_ctx_poll_readable(server.http2_ctx, items, 16, &count), 0);
+    EXPECT_EQ(count, 0) << "cancelled response has no consumer and must not stay ready";
+    for (int i = 0; i < count; i++) if (items[i].stream) http2_stream_put(items[i].stream);
+    ASSERT_NE(server.http2_write_owner, nullptr);
+    EXPECT_EQ(server.http2_write_owner->query, &live.query);
+    ASSERT_TRUE(Frame(8, second, {0,0,0xff,0xff})); Pump();
+    EXPECT_EQ(DataBytes(second), 12u);
 }
 
 namespace {

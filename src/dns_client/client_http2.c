@@ -824,7 +824,10 @@ static int _dns_client_http2_process_read(struct dns_server_info *server_info)
 
 			conn_stream = (struct dns_conn_stream *)http2_stream_get_ex_data(stream);
 			if (conn_stream == NULL) {
-				http2_stream_put(stream);
+				/* A late response can recreate a cancelled stream without an
+				 * owner. Discard it, consuming this poll reference, so its ready
+				 * body cannot mask connection EOF forever. */
+				http2_stream_abort(stream);
 				continue;
 			}
 
