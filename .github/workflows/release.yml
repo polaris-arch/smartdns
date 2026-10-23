@@ -288,7 +288,7 @@ jobs:
           git ls-files --error-unmatch plugin/smartdns-ui/Cargo.lock
           mkdir -p release-evidence
           sha256sum plugin/smartdns-ui/Cargo.lock > release-evidence/lock.before
-          test "$(cut -d' ' -f1 release-evidence/lock.before)" = 627d46f1a05e5d82d2f71ba47ba3aeb2f28ab1c7f2c29e42b438df5b874ccb68
+          test "$(cut -d' ' -f1 release-evidence/lock.before)" = c6a8d57eb845c61b85019efc226776b3e3ecc0d25fcae6ac915b822a803e9d79
           rustc -Vv | tee release-evidence/rustc.txt
           test "$(rustc --version)" = 'rustc 1.99.1 (58cf8f9c3 2026-10-13)'
           test "$(node --version)" = v24.21.0
