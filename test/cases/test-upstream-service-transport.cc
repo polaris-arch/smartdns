@@ -391,6 +391,51 @@ void transport_case(bool h2, bool throttle, unsigned nodata_rate = 0, unsigned c
     EXPECT_EQ(first.requests + second.requests, queries + (throttle ? 1 : 0));
     EXPECT_LE(std::abs(static_cast<int>(first.requests) - static_cast<int>(second.requests)), 1);
     EXPECT_EQ(first.connections, 1U); EXPECT_EQ(second.connections, 1U);
+    if (h2 && throttle) {
+        dns_upstream_policy_snapshot_v1 detail{};
+        ASSERT_EQ(dns_client_get_service_policy_v1(snapshot.service_id, &detail), 0);
+        EXPECT_EQ(detail.kind_counts[DNS_DETAIL_HTTP_429], 1U);
+        dns_upstream_event_context_snapshot_v1 context{};
+        ASSERT_EQ(dns_client_get_service_event_context_v1(snapshot.service_id, &context), 0);
+        unsigned observed = 0;
+        for (unsigned i = 0; i < detail.event_count; i++) if (detail.events[i].kind == DNS_DETAIL_HTTP_429) {
+            observed++;
+            bool matched = false;
+            for (unsigned j = 0; j < context.event_count; j++) if (context.events[j].sequence == detail.events[i].sequence) {
+                matched = true; EXPECT_GT(context.events[j].unix_ms, 0U);
+                EXPECT_EQ(context.events[j].qtype, DNS_T_A);
+                EXPECT_STREQ(context.events[j].domain, "transport-0.example");
+            }
+            EXPECT_TRUE(matched);
+        }
+        EXPECT_EQ(observed, 1U);  // one real wire 429, not one event per poll
+    }
+    if (h2 && !throttle && !nodata_rate) {
+        dns_server_info *endpoints[8]{};
+        int n = dns_client_get_server_info_lists(endpoints, 8);
+        ASSERT_GT(n, 0);
+        time_t boundary = time(nullptr);
+        for (int i = 0; i < n; i++) {
+            // Legacy idle scans use the list lock; TLS reads use the endpoint
+            // lock. Try rather than wait under the outer lock to avoid inversion.
+            for (;;) {
+                pthread_mutex_lock(&client.server_list_lock);
+                if (!pthread_mutex_trylock(&endpoints[i]->lock)) break;
+                pthread_mutex_unlock(&client.server_list_lock); poll(nullptr, 0, 1);
+            }
+            endpoints[i]->last_recv = boundary - 2;
+            pthread_mutex_unlock(&endpoints[i]->lock); pthread_mutex_unlock(&client.server_list_lock);
+        }
+        EXPECT_TRUE(query_udp("activity-check.example", listen, DNS_T_A));
+        bool received = false;
+        for (int i = 0; i < n; i++) {
+            pthread_mutex_lock(&endpoints[i]->lock);
+            received |= endpoints[i]->last_recv >= boundary;
+            pthread_mutex_unlock(&endpoints[i]->lock);
+            dns_client_server_info_release(endpoints[i]);
+        }
+        EXPECT_TRUE(received); // H2 data must refresh legacy idle accounting too.
+    }
     std::lock_guard<std::mutex> guard(lock);
     for (size_t i = 1; i < wire_backend.size(); i++) EXPECT_NE(wire_backend[i - 1], wire_backend[i]);
     if (throttle) {

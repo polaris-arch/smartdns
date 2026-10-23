@@ -217,11 +217,11 @@ int _dns_policy_retry_after_ms(const char *value, time_t now, uint64_t *delay)
     }
     return -1;
 }
-void _dns_policy_http_error(struct dns_server_info *s, int status, const char *value)
+void _dns_policy_http_error_query(struct dns_query_struct *q, struct dns_server_info *s, int status, const char *value)
 {
 	if ((status != 429 && status != 503) || !s->policy) return;
-    _dns_service_diagnostic_event(NULL, s, status == 429 ? DNS_EVENT_HTTP_429 : DNS_EVENT_HTTP_503);
-    _dns_service_detail(NULL, s, status == 429 ? DNS_DETAIL_HTTP_429 : DNS_DETAIL_HTTP_503,
+    _dns_service_diagnostic_event(q, s, status == 429 ? DNS_EVENT_HTTP_429 : DNS_EVENT_HTTP_503);
+    _dns_service_detail(q, s, status == 429 ? DNS_DETAIL_HTTP_429 : DNS_DETAIL_HTTP_503,
         s->type == DNS_SERVER_HTTP3 ? DNS_PHASE_HTTP3 : DNS_PHASE_HTTP2, status, 0,
         s->service && s->service->flags.upstream_cooldown_ms ? s->service->flags.upstream_cooldown_ms : 1000);
 	unsigned long now = get_tick_count();
@@ -244,6 +244,9 @@ void _dns_policy_http_error(struct dns_server_info *s, int status, const char *v
     if (warn) tlog(TLOG_WARN, "upstream backpressure status=%d events=%llu cooldown_ms=%u retry_after_valid=%d retry_after_ms=%llu endpoint=%s:%d",
                   status, (unsigned long long)count, p->cooldown_ms, valid, (unsigned long long)delay, s->ip, s->port);
 }
+
+void _dns_policy_http_error(struct dns_server_info *s, int status, const char *value)
+{ _dns_policy_http_error_query(NULL, s, status, value); }
 
 static int same_destination(struct dns_server_info *a, struct dns_server_info *b)
 {

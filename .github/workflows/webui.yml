@@ -128,6 +128,7 @@ jobs:
         . package/webui/source.conf
         sh package/webui/test-prepare-source.sh "package/target/smartdns-webui-$SMARTDNS_WEBUI_COMMIT.tar.gz" 2>&1 | tee ci-webui/prepare.log
         node package/webui/test-table-identity.cjs package/target/smartdns-webui ci-webui/actual-service-api.json ci-webui/table-identity.json
+        node --experimental-strip-types package/webui/test-diagnostics-model.cjs package/target/smartdns-webui
         test -s package/target/smartdns-webui/out/dashboard/upstream-servers.html
         package_file=$(find ci-webui/packages -maxdepth 1 -name '*.tar.gz' -type f)
         test "$(printf '%s\n' "$package_file" | wc -l)" -eq 1

@@ -148,7 +148,7 @@ parse_next_section:
 		int status = http_head_get_httpcode(http_head);
         _dns_service_diagnostic_http(conn_stream->query, server_info, status);
 		if (status == 429 || status == 503) {
-			_dns_policy_http_error(server_info, status, http_head_get_fields_value(http_head, "retry-after"));
+			_dns_policy_http_error_query(conn_stream->query, server_info, status, http_head_get_fields_value(http_head, "retry-after"));
 		} else {
 			server_info->prohibit = 1;
 		}

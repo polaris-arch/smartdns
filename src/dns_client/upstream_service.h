@@ -39,6 +39,7 @@ struct dns_upstream_service {
     pthread_mutex_t turn_lock;
     pthread_mutex_t detail_lock; /* leaf: never acquire other locks while held */
     struct dns_upstream_policy_snapshot_v1 detail;
+    struct dns_upstream_event_context_v1 event_context[DNS_UPSTREAM_DETAIL_EVENTS];
     uint64_t path_epoch;
     unsigned long path_refresh_due, race_due, connection_due;
     unsigned race_family;
@@ -97,6 +98,8 @@ int _dns_service_has_ecs(struct dns_upstream_service *s);
 void _dns_service_diagnostic_event(struct dns_query_struct *q, struct dns_server_info *ep, unsigned event);
 void _dns_service_detail(struct dns_query_struct *q, struct dns_server_info *ep,
     unsigned kind, unsigned phase, int code, unsigned elapsed, unsigned limit);
+void _dns_service_detail_dns(struct dns_query_struct *q, struct dns_server_info *ep,
+    unsigned kind, unsigned phase, int code, struct dns_packet *packet);
 void _dns_service_response_time(struct dns_server_info *ep, unsigned elapsed);
 void _dns_paths_refresh(struct dns_upstream_service *s, unsigned long now);
 void _dns_paths_network_tick(void);

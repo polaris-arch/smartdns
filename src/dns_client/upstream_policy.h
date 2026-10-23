@@ -21,6 +21,8 @@ void _dns_policy_detach(struct dns_server_info *server);
 int _dns_policy_retry_after_ms(const char *value, time_t wall_now, uint64_t *delay);
 int _dns_http_age(unsigned char *data, int len, const char *value);
 void _dns_policy_http_error(struct dns_server_info *server, int status, const char *retry_after);
+void _dns_policy_http_error_query(struct dns_query_struct *query, struct dns_server_info *server,
+    int status, const char *retry_after);
 int _dns_attempt_wire_begin(struct dns_query_struct *query, struct dns_server_info *server, unsigned int generation);
 int _dns_attempt_begin(struct dns_query_struct *query, struct dns_server_info *server);
 int _dns_attempt_live(struct dns_query_struct *query, struct dns_server_info *server, unsigned int generation);

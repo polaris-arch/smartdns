@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <string.h>
+#include <time.h>
 
 static int route_events = -1;
 static uint64_t route_epoch = 1;
@@ -141,8 +142,8 @@ int _dns_path_allowed(struct dns_upstream_service *service, const char *ip)
     }
     pthread_mutex_unlock(&service->detail_lock); return result;
 }
-void _dns_service_detail(struct dns_query_struct *query, struct dns_server_info *endpoint,
-    unsigned kind, unsigned phase, int code, unsigned elapsed, unsigned limit)
+static void service_detail(struct dns_query_struct *query, struct dns_server_info *endpoint,
+    unsigned kind, unsigned phase, int code, unsigned elapsed, unsigned limit, struct dns_packet *packet)
 {
     if (!endpoint || !endpoint->service || kind >= DNS_DETAIL_COUNT) return;
     struct dns_upstream_service *service = endpoint->service;
@@ -155,9 +156,33 @@ void _dns_service_detail(struct dns_query_struct *query, struct dns_server_info 
     event.system_error = endpoint->service_system_error; event.elapsed_ms = elapsed; event.limit_ms = limit;
     event.port = endpoint->port; event.family = strchr(endpoint->ip, ':') ? 6 : 4;
     safe_strncpy(event.ip, endpoint->ip, sizeof(event.ip));
+    struct dns_upstream_event_context_v1 context = {0};
+    struct timespec wall;
+    if (clock_gettime(CLOCK_REALTIME, &wall) == 0 && wall.tv_sec >= 0)
+        context.unix_ms = (uint64_t)wall.tv_sec * 1000 + wall.tv_nsec / 1000000;
+    if (query) {
+        safe_strncpy(context.domain, query->domain, sizeof(context.domain));
+        context.qtype = query->qtype;
+    }
+    if (packet) {
+        context.dns_summary_valid = 1; context.rcode = packet->head.rcode;
+        context.truncated = packet->head.tc; context.answers = packet->head.ancount;
+        context.authority = packet->head.nscount; context.additional = packet->head.nrcount;
+        for (int section = DNS_RRS_AN; section < DNS_RRS_OPT; section++) {
+            int count = 0;
+            struct dns_rrs *rr = dns_get_rrs_start(packet, section, &count);
+            for (int i = 0; i < count && rr; i++, rr = dns_get_rrs_next(packet, rr)) {
+                context.a_records += rr->type == DNS_T_A;
+                context.aaaa_records += rr->type == DNS_T_AAAA;
+                context.cname_records += rr->type == DNS_T_CNAME;
+                context.soa_records += rr->type == DNS_T_SOA;
+            }
+        }
+    }
     pthread_mutex_lock(&service->detail_lock);
     struct dns_upstream_policy_snapshot_v1 *detail = &service->detail;
     event.sequence = ++detail->sequence; detail->kind_counts[kind]++;
+    context.sequence = event.sequence;
     if (kind == DNS_DETAIL_DNS_REJECT) detail->reject_counts[code >= 0 && code < DNS_REJECT_COUNT ? code : 0]++;
     /* Healthy idle probes stay in counters, preserving the bounded ring for failures and lifecycle events. */
     if (kind == DNS_DETAIL_KEEPALIVE_SENT || kind == DNS_DETAIL_KEEPALIVE_ACK) {
@@ -166,10 +191,18 @@ void _dns_service_detail(struct dns_query_struct *query, struct dns_server_info 
     if (detail->event_count == DNS_UPSTREAM_DETAIL_EVENTS) detail->dropped_events++;
     else detail->event_count++;
     memmove(&detail->events[1], &detail->events[0], (detail->event_count - 1) * sizeof(event));
+    memmove(&service->event_context[1], &service->event_context[0],
+        (detail->event_count - 1) * sizeof(context));
     detail->events[0] = event;
+    service->event_context[0] = context;
     pthread_mutex_unlock(&service->detail_lock);
-    (void)query;
 }
+void _dns_service_detail(struct dns_query_struct *query, struct dns_server_info *endpoint,
+    unsigned kind, unsigned phase, int code, unsigned elapsed, unsigned limit)
+{ service_detail(query, endpoint, kind, phase, code, elapsed, limit, NULL); }
+void _dns_service_detail_dns(struct dns_query_struct *query, struct dns_server_info *endpoint,
+    unsigned kind, unsigned phase, int code, struct dns_packet *packet)
+{ service_detail(query, endpoint, kind, phase, code, 0, 0, packet); }
 void _dns_service_response_time(struct dns_server_info *endpoint, unsigned elapsed)
 {
     if (!endpoint->service) return;

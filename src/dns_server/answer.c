@@ -354,13 +354,14 @@ static int _dns_server_process_answer_HTTPS(struct dns_rrs *rrs, struct dns_requ
 	return 0;
 }
 
-/* Prove this packet's empty address answer, never from accumulated request state.
+/* Prove this packet's negative answer, never from accumulated request state.
  * A referral, unrelated SOA, filtered positive or truncated reply is not NODATA. */
-int _dns_server_is_nodata(struct dns_packet *packet, const char *domain, int qtype)
+static int _dns_server_is_negative_response(struct dns_packet *packet, const char *domain, int qtype)
 {
 	char owner[DNS_MAX_CNAME_LEN];
 	int count = 0, type = 0, qclass = 0, ttl = 0;
-	if ((qtype != DNS_T_A && qtype != DNS_T_AAAA) || packet->head.rcode != DNS_RC_NOERROR ||
+	if (qtype <= 0 || qtype > 65535 ||
+        (packet->head.rcode != DNS_RC_NOERROR && packet->head.rcode != DNS_RC_NXDOMAIN) ||
 		packet->head.tc || packet->head.opcode != DNS_OP_QUERY || packet->head.ancount) return 0;
 	struct dns_rrs *rr = dns_get_rrs_start(packet, DNS_RRS_QD, &count);
 	if (count != 1 || !rr || dns_get_domain(rr, owner, sizeof(owner), &type, &qclass) ||
@@ -376,6 +377,11 @@ int _dns_server_is_nodata(struct dns_packet *packet, const char *domain, int qty
 			(domain_len == zone_len || domain[domain_len - zone_len - 1] == '.'))) return 1;
 	}
 	return 0;
+}
+
+int _dns_server_is_nodata(struct dns_packet *packet, const char *domain, int qtype)
+{
+    return packet->head.rcode == DNS_RC_NOERROR && _dns_server_is_negative_response(packet, domain, qtype);
 }
 
 int _dns_server_process_answer(struct dns_request *request, const char *domain, struct dns_packet *packet,
@@ -537,7 +543,9 @@ int _dns_server_process_answer(struct dns_request *request, const char *domain, 
 		if (cname[0] != '\0') {
 			return DNS_CLIENT_ACTION_OK;
 		}
-		if (_dns_server_is_nodata(packet, domain, request->qtype)) {
+		/* Earlier replies may already set request->rcode=NOERROR. Validate this
+		 * packet independently, including HTTPS NODATA and valid NXDOMAIN. */
+		if (_dns_server_is_negative_response(packet, domain, request->qtype)) {
 			return DNS_CLIENT_ACTION_OK_WAIT;
 		}
 

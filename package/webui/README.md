@@ -10,12 +10,24 @@ This replaces the moving `main.zip` generic build and OpenWrt's older
 `35cbf4a1940f5dd32670c69bd5cc02437ad073e7` webui pin.
 
 The optional REST fields include `service_id`, `pool_enabled`, `endpoint_ips` and
-`diagnostics`. The diagnostic disclosure keeps the existing success-rate formula
-and shows coherent query totals, separate terminal contexts, last wait states,
+`diagnostics` and `response_statistics`. For pooled rows, the success rate uses
+accepted / (accepted + unsuccessful terminal sent queries). Race cancellation,
+local cancellation, shutdown, unsent and in-flight work are excluded. No sample
+is displayed as an em dash, never as zero availability. Raw terminal counters
+are preserved; deadlines remain unsuccessful outcomes, not a network SLA.
+The responsive diagnostic dialog separates outcomes, backends/latency, events
+and runtime. It shows coherent query totals, separate terminal contexts, last wait states,
 last observed errors, event counts and the global client-thread CPU sample.
 Each outcome dimension closes to its own failure/skip total; events may repeat
 and must never be added to query counts. Fixed HTTP cooldown is 1000ms by default,
 configurable from 1 to 10000ms; Retry-After is recorded as evidence only.
+Recent events include capture-time Unix milliseconds, query name/type and DNS
+response summaries when available. An optional bounded event-context companion
+ABI is joined by sequence without changing policy-v1. Missing context stays
+missing. Short bursts are grouped for presentation with every original event
+available on expansion; grouping never changes cumulative counts. The UI names
+the browser timezone and keeps monotonic snapshot-relative ages separate from
+response elapsed time and HTTP cooldown.
 The mounted upstream table keeps one row per API service, shows its domain in
 Host and actual endpoint IP list in IP, and uses the stable service ID as the
 MaterialReactTable row identity. Ordinary rows retain the upstream's default

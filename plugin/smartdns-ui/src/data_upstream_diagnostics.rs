@@ -86,11 +86,28 @@ impl UpstreamDiagnostics {
                 let bytes: Vec<u8> = s.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
                 String::from_utf8_lossy(&bytes).into_owned()
             };
-            let events: Vec<_> = policy.events[..policy.event_count as usize].iter().map(|e| serde_json::json!({
+            let mut context: smartdns_c::dns_upstream_event_context_snapshot_v1 = unsafe { std::mem::zeroed() };
+            let context_valid = unsafe { smartdns_c::dns_client_get_service_event_context_v1(id.as_ptr(), &mut context) } == 0
+                && context.version == 1 && context.struct_size as usize == std::mem::size_of_val(&context)
+                && context.event_count as usize <= context.events.len();
+            let events: Vec<_> = policy.events[..policy.event_count as usize].iter().map(|e| {
+                // A concurrent writer may advance the companion ring. Missing
+                // context stays absent; never attach a different event's name.
+                let c = if context_valid { context.events[..context.event_count as usize].iter()
+                    .find(|c| c.sequence == e.sequence) } else { None };
+                serde_json::json!({
                 "sequence": e.sequence, "query_id":e.query_id, "age_ms":e.age_ms, "ip":string(&e.ip), "family":e.family,
                 "port":e.port, "kind":e.kind, "phase":e.phase, "code":e.code, "system_error":e.system_error,
-                "elapsed_ms":e.elapsed_ms, "limit_ms":e.limit_ms, "tls_error":e.tls_error, "message":string(&e.message)
-            })).collect();
+                "elapsed_ms":e.elapsed_ms, "limit_ms":e.limit_ms, "tls_error":e.tls_error, "message":string(&e.message),
+                "timestamp_ms": c.filter(|c| c.unix_ms > 0).map(|c| c.unix_ms),
+                "domain": c.filter(|c| c.domain[0] != 0).map(|c| string(&c.domain)),
+                "qtype": c.filter(|c| c.qtype != 0).map(|c| c.qtype),
+                "dns_response": c.filter(|c| c.dns_summary_valid != 0).map(|c| serde_json::json!({
+                    "rcode":c.rcode,"truncated":c.truncated != 0,"answers":c.answers,"authority":c.authority,
+                    "additional":c.additional,"a":c.a_records,"aaaa":c.aaaa_records,
+                    "cname":c.cname_records,"soa":c.soa_records
+                }))
+            })}).collect();
             let paths: Vec<_> = policy.paths[..policy.path_count as usize].iter().map(|p| serde_json::json!({
                 "ip":string(&p.ip), "source":string(&p.source), "interface":string(&p.interface),
                 "family":p.family, "state":p.state, "selected":p.selected != 0, "connected":p.connected != 0,

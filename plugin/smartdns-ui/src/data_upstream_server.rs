@@ -32,6 +32,35 @@ pub struct AttemptRttSamples {
     pub ambiguous_count: u64,
 }
 
+/// Terminal sent queries only. Races, local cancellation, shutdown, unsent and
+/// in-flight work are censored, never counted as an upstream failure/success.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResponseStatistics {
+    pub accepted: u64,
+    pub unsuccessful: u64,
+    pub samples: u64,
+    pub race_cancelled: u64,
+    pub local_cancelled: u64,
+    pub success_rate: Option<f64>,
+}
+
+impl ResponseStatistics {
+    fn from_diagnostics(success: u64, failures: u64,
+        diagnostics: &crate::data_upstream_diagnostics::UpstreamDiagnostics) -> Result<Self, String> {
+        let count = |key: &str| diagnostics.failure_end.get(key).copied().unwrap_or(0);
+        let race_cancelled = count("other_result");
+        let local_cancelled = count("budget_or_cancel").checked_add(count("shutdown"))
+            .ok_or("cancelled counter overflow")?;
+        let excluded = race_cancelled.checked_add(local_cancelled).ok_or("cancelled counter overflow")?;
+        let unsuccessful = failures.checked_sub(excluded).ok_or("inconsistent cancelled counter")?;
+        let samples = success.checked_add(unsuccessful).ok_or("response counter overflow")?;
+        Ok(Self { accepted: success, unsuccessful, samples, race_cancelled, local_cancelled,
+            success_rate: if samples == 0 { None } else {
+                Some((success as f64 / samples as f64 * 10000.0).round() / 100.0)
+            } })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServiceConfigIdentity {
     pub authority: String,
@@ -73,6 +102,8 @@ pub struct UpstreamServiceDetails {
     pub freshness_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<crate::data_upstream_diagnostics::UpstreamDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_statistics: Option<ResponseStatistics>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,7 +149,7 @@ impl UpstreamServerInfo {
             }
         } else { row.legacy_avg_time };
         let details = UpstreamServiceDetails {
-            service_id: service_id.clone(), diagnostics: None,
+            service_id: service_id.clone(), diagnostics: None, response_statistics: None,
             stats_semantics: if pool { "service-v1" } else { "legacy-endpoint-v1" }.into(),
             pool_enabled: pool,
             config_identity: ServiceConfigIdentity {
@@ -163,9 +194,18 @@ impl UpstreamServerInfo {
             let id = smartdns::snapshot_string(&row.service_id)?;
             let (base, diagnostics) = crate::data_upstream_diagnostics::UpstreamDiagnostics::fetch(&id)?;
             let mut result = Self::from_snapshot(&base)?;
-            result.service.as_mut().ok_or("missing service details")?.diagnostics = Some(diagnostics);
+            result.attach_diagnostics(diagnostics)?;
             Ok(result)
         }).collect()
+    }
+
+    fn attach_diagnostics(&mut self, diagnostics: crate::data_upstream_diagnostics::UpstreamDiagnostics) -> Result<(), String> {
+        let service = self.service.as_mut().ok_or("missing service details")?;
+        let statistics = ResponseStatistics::from_diagnostics(service.success_count, service.failure_count, &diagnostics)?;
+        self.query_success_rate = statistics.success_rate.unwrap_or(0.0);
+        service.response_statistics = Some(statistics);
+        service.diagnostics = Some(diagnostics);
+        Ok(())
     }
 }
 
@@ -220,6 +260,52 @@ mod tests {
         row.port = 443; row.transport = 3; row.pool_enabled = 1;
         row.backend_cap = 4; row.status = 1; row.security = 4;
         row
+    }
+
+    fn diagnostic_fixture(success: u64, end: [u64; 6], unsent: u64) -> UpstreamServerInfo {
+        let mut base = snapshot();
+        base.success_count = success; base.failure_count = end.iter().sum(); base.skip_count = unsent;
+        base.query_count = success + base.failure_count + unsent;
+        let mut raw: smartdns::smartdns_c::dns_upstream_service_diagnostics_v1 = unsafe { std::mem::zeroed() };
+        raw.version = 1; raw.struct_size = std::mem::size_of_val(&raw) as u32; raw.cooldown_ms = 1000;
+        raw.failure_end = end; raw.failure_last_event[0] = base.failure_count;
+        raw.skip_end[0] = unsent; raw.skip_wait[0] = unsent;
+        raw.events[0] = 999; // Event volume is deliberately unrelated to query outcomes.
+        let diagnostics = crate::data_upstream_diagnostics::UpstreamDiagnostics::from_snapshot(&base, &raw).unwrap();
+        let mut row = UpstreamServerInfo::from_snapshot(&base).unwrap();
+        row.attach_diagnostics(diagnostics).unwrap(); row
+    }
+
+    #[test]
+    fn response_rate_excludes_races_and_unsent_from_reported_597_query_example() {
+        let row = diagnostic_fixture(348, [20, 3, 0, 0, 0, 0], 226);
+        assert_eq!(row.query_success_rate, 99.15);
+        let stats = row.service.as_ref().unwrap().response_statistics.as_ref().unwrap();
+        assert_eq!((stats.samples, stats.unsuccessful, stats.race_cancelled), (351, 3, 20));
+        let json = api_msg_gen_upstream_server_list(&vec![row]);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let value = &parsed["upstream_server_list"][0];
+        assert_eq!(value["response_statistics"]["success_rate"], 99.15);
+        assert_eq!(value["query_success_rate"], 99.15);
+        assert_eq!(value["query_count"], 597);
+        assert_eq!(value["failure_count"], 23); // Preserve raw terminal-accounting compatibility.
+        let restored = api_msg_parse_upstream_server_list(&json).unwrap();
+        assert_eq!(restored[0].service.as_ref().unwrap().response_statistics.as_ref().unwrap().samples, 351);
+    }
+
+    #[test]
+    fn all_cancelled_queries_have_no_rate_sample_instead_of_zero_availability() {
+        let row = diagnostic_fixture(0, [7, 0, 0, 0, 0, 0], 3);
+        let stats = row.service.unwrap().response_statistics.unwrap();
+        assert_eq!(stats.samples, 0); assert_eq!(stats.success_rate, None);
+    }
+
+    #[test]
+    fn local_cancellation_is_excluded_but_deadlines_and_rejected_results_remain_visible() {
+        let row = diagnostic_fixture(2, [2, 1, 2, 1, 1, 1], 0);
+        let stats = row.service.unwrap().response_statistics.unwrap();
+        assert_eq!((stats.samples, stats.unsuccessful, stats.local_cancelled), (5, 3, 3));
+        assert_eq!(stats.success_rate, Some(40.0));
     }
 
     #[test]

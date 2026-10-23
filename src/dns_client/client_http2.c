@@ -716,7 +716,7 @@ static int _dns_client_http2_process_stream_one(struct dns_server_info *server_i
 		tlog(TLOG_DEBUG, "http2 server query from %s:%d failed, server return http code: %d", server_info->ip,
 			 server_info->port, status);
 		if (status == 429 || status == 503) {
-			_dns_policy_http_error(server_info, status, http2_stream_get_header(http2_stream, "retry-after"));
+			_dns_policy_http_error_query(conn_stream->query, server_info, status, http2_stream_get_header(http2_stream, "retry-after"));
 		} else {
 			server_info->prohibit = 1;
 		}

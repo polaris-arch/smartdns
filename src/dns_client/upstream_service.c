@@ -1091,6 +1091,22 @@ int dns_client_get_service_diagnostics_v1(const char *id, struct dns_upstream_se
     pthread_mutex_unlock(&registry_lock);
     return result;
 }
+int dns_client_get_service_event_context_v1(const char *id, struct dns_upstream_event_context_snapshot_v1 *out)
+{
+    if (!id || !out) return -1;
+    int result = -1;
+    pthread_mutex_lock(&registry_lock);
+    struct dns_upstream_service *s;
+    list_for_each_entry(s, &services, list) {
+        if (strcmp(s->id, id)) continue;
+        memset(out, 0, sizeof(*out)); out->struct_size = sizeof(*out); out->version = 1;
+        pthread_mutex_lock(&s->detail_lock);
+        out->event_count = s->detail.event_count;
+        memcpy(out->events, s->event_context, out->event_count * sizeof(out->events[0]));
+        pthread_mutex_unlock(&s->detail_lock); result = 0; break;
+    }
+    pthread_mutex_unlock(&registry_lock); return result;
+}
 int dns_client_get_service_policy_v1(const char *id, struct dns_upstream_policy_snapshot_v1 *out)
 {
     if (!id || !out) return -1;

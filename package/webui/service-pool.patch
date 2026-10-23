@@ -1,6 +1,6 @@
 --- a/src/lib/backend/server.ts
 +++ b/src/lib/backend/server.ts
-@@ -264,7 +264,41 @@
+@@ -264,7 +264,48 @@
      registrar: string;
  }
  
@@ -12,7 +12,10 @@
 +    paths: Array<{ip: string; source: string; interface: string; family: number; state: number;
 +      selected: boolean; connected: boolean; active_attempts: number; attempts: number; successes: number; failures: number; keepalive_ms: number}>;
 +    events: Array<{sequence: number; query_id: number; age_ms: number; ip: string; family: number; port: number;
-+      kind: number; phase: number; code: number; system_error: number; elapsed_ms: number; limit_ms: number; tls_error: number; message: string}>;
++      kind: number; phase: number; code: number; system_error: number; elapsed_ms: number; limit_ms: number; tls_error: number; message: string;
++      timestamp_ms?: number | null; domain?: string | null; qtype?: number | null;
++      dns_response?: {rcode: number; truncated: boolean; answers: number; authority: number; additional: number;
++        a: number; aaaa: number; cname: number; soa: number} | null}>;
 +}
 +
 +export interface UpstreamDiagnosticsData {
@@ -30,6 +33,10 @@
 +}
 +
  export interface UpStreamServers {
++    service_status?: string;
++    cooldown_remaining_ms?: number;
++    response_statistics?: {accepted: number; unsuccessful: number; samples: number; race_cancelled: number;
++      local_cancelled: number; success_rate: number | null};
 +    diagnostics?: UpstreamDiagnosticsData;
 +    query_count?: number;
 +    success_count?: number;
@@ -62,7 +69,7 @@
          header: t('IP'),
          enableSorting: false,
          size: 330,
-@@ -95,9 +97,9 @@
+@@ -95,9 +97,10 @@
          header: t('Success Rate'),
          enableSorting: true,
          size: 160,
@@ -70,11 +77,12 @@
 +        Cell: ({ cell, row }) => {
            const rate = cell.getValue<number>();
 -          return <span>{rate} %</span>;
-+          return <><span style={{whiteSpace: 'nowrap'}}>{rate} %</span><UpstreamDiagnostics server={row.original} /></>;
++          const poolRate = row.original.response_statistics?.success_rate;
++          return <><span style={{whiteSpace: 'nowrap'}} title={row.original.pool_enabled ? '已发请求结算：排除竞速取消、未发送及本地取消 / Sent outcomes excluding races, unsent and local cancellation' : undefined}>{row.original.pool_enabled ? (typeof poolRate === 'number' ? `${poolRate.toFixed(2)} %` : '—') : `${rate} %`}</span><UpstreamDiagnostics server={row.original} /></>;
          },
        },
        {
-@@ -107,10 +109,10 @@
+@@ -107,10 +110,10 @@
          size: 140,
          Cell: ({ cell }) => {
            const avgTime = cell.getValue<number>();
@@ -87,7 +95,7 @@
          },
        },
        {
-@@ -191,6 +193,7 @@
+@@ -191,6 +194,7 @@
    const table = useMaterialReactTable({
      columns,
      data,
@@ -97,10 +105,11 @@
      enableColumnOrdering: false,
 --- /dev/null
 +++ b/src/components/dashboard/upstream-servers/upstream-diagnostics.tsx
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,189 @@
 +import type * as React from 'react';
 +import { useState } from 'react';
-+import { Button, Dialog, DialogTitle, DialogContent, DialogActions, Tabs, Tab } from '@mui/material';
++import { Box, Button, Chip, Dialog, DialogTitle, DialogContent, DialogActions, Paper, Tabs, Tab, Typography } from '@mui/material';
++import { eventCategory, eventTime, groupEvents, type DiagnosticEvent } from './diagnostics-model';
 +import { type UpStreamServers } from '@/lib/backend/server';
 +import i18n from '@/components/core/i18n';
 +
@@ -124,60 +133,199 @@
 +const rejects = ['尚未分类|Unclassified','地址规则过滤|Address policy filter','截断需重试|Truncated response','无可用记录|No usable record','请求已完成|Request completed','问题节不匹配|Question mismatch'];
 +const routes = ['有匹配路由|Matching route','地址族已排除|Family excluded','无匹配路由|No matching route','无可用源地址|No source address','出口绑定不可用|Binding unavailable','路由未确认|Route unconfirmed'];
 +const phases = ['响应|Response','建连|Connect','TLS|TLS','HTTP/2|HTTP/2','HTTP/3|HTTP/3','Socket|Socket','策略|Policy'];
++const quantity=(value?:number):string => (value??0).toLocaleString();
++const count=(values:Record<string,number>,key:string):number => values[key]??0;
++
++function Panel({title,children}: {title:string;children:React.ReactNode}): React.JSX.Element {
++  return <Paper variant="outlined" sx={{p:{xs:1.5,sm:2},borderRadius:2,minWidth:0,boxShadow:'none'}}>
++    <Typography component="h3" sx={{fontSize:'1em',fontWeight:700,mb:1.5,mt:0}}>{title}</Typography>{children}
++  </Paper>;
++}
++
 +export function UpstreamDiagnostics({server}: {server: UpStreamServers}): React.JSX.Element | null {
-+  const [open,setOpen] = useState(false), [tab,setTab] = useState(0);
++  const [open,setOpen]=useState(false), [tab,setTab]=useState(0), [filter,setFilter]=useState('all');
 +  const d=server.diagnostics;
 +  if (!server.pool_enabled || !d) return null;
 +  const lang=i18n.language?.startsWith('zh') ? 0 : 1;
 +  const text=(cn:string,en:string):string => lang===0 ? cn : en;
 +  const name=(values:string[],index:number):string => values[index]?.split('|')[lang] ?? String(index);
-+  const policy=d.policy, loop=d.client_loop;
-+  const counts=(values:Record<string,number>):React.JSX.Element => <dl>{Object.entries(values).filter(([,n])=>n>0).map(([key,n])=><div key={key} style={{display:'flex',justifyContent:'space-between',gap:16,padding:'6px 0'}}><dt>{labels[key]?.[lang]??key}</dt><dd style={{margin:0}}>{n}</dd></div>)}</dl>;
++  const policy=d.policy, loop=d.client_loop, stats=server.response_statistics;
++  const state=({ready:text('就绪','Ready'),cooldown:text('冷却中','Cooling down'),degraded:text('部分后端可用','Partially available'),
++    discovering:text('发现后端中','Discovering'),unavailable:text('暂无可用后端','No eligible backend'),stale:text('使用旧地址','Using stale addresses')} as Record<string,string>)[server.service_status??'']??text('状态未确认','State unconfirmed');
++  const counts=(values:Record<string,number>):React.JSX.Element => <Box component="dl" sx={{m:0}}>
++    {Object.entries(values).filter(([,n])=>n>0).map(([key,n])=><Box key={key} sx={{display:'flex',justifyContent:'space-between',gap:2,py:.75,borderBottom:'1px solid',borderColor:'divider','&:last-child':{border:0}}}>
++      <Box component="dt" sx={{color:'text.secondary'}}>{labels[key]?.[lang]??key}</Box><Box component="dd" sx={{m:0,fontVariantNumeric:'tabular-nums',fontWeight:600}}>{quantity(n)}</Box>
++    </Box>)}
++    {!Object.values(values).some(n=>n>0)&&<Box sx={{color:'text.secondary',py:1}}>{text('暂无记录','No records')}</Box>}
++  </Box>;
 +  const hist=policy?.response_histogram??[], samples=hist.reduce((a,b)=>a+b,0);
 +  const quantile=(fraction:number):string => {
-+    if (!samples) return 'N/A'; let sum=0;
-+    for (const [i,count] of hist.entries()) {sum+=count;if(sum>=Math.ceil(samples*fraction))return i<8?'≤'+[10,25,50,100,250,500,1000,2000][i]+' ms':'>2000 ms';}
-+    return 'N/A';
++    if (!samples) return '—'; let sum=0;
++    for (const [i,n] of hist.entries()) {sum+=n;if(sum>=Math.ceil(samples*fraction))return i<8?'≤'+[10,25,50,100,250,500,1000,2000][i]+' ms':'>2000 ms';}
++    return '—';
 +  };
-+  const panelStyle={padding:'12px 0',borderBottom:'1px solid #ddd'};
++  const qtype=(value?:number|null):string => ({1:'A',28:'AAAA',65:'HTTPS',16:'TXT',15:'MX',255:'ANY',2:'NS',6:'SOA'} as Record<number,string>)[value??0]??String(value??'—');
++  const code=(value:number):string => ({0:'NOERROR',2:'SERVFAIL',3:'NXDOMAIN',5:'REFUSED'} as Record<number,string>)[value]??String(value);
++  const title=(event:DiagnosticEvent):string => event.kind===2&&event.phase===0&&event.code>=300&&event.code<=599?`HTTP ${event.code}`:name(kinds,event.kind);
++  const stamp=(event:DiagnosticEvent):React.JSX.Element => <Box component="span" sx={{fontVariantNumeric:'tabular-nums'}}>
++    {eventTime(event.timestamp_ms,lang===0?'zh-CN':'en-GB')??text('绝对时间未记录','Absolute time not recorded')}
++    <Box component="span" sx={{color:'text.secondary',ml:1}}>{text('采样前','Before snapshot')} {(event.age_ms/1000).toFixed(1)} s</Box>
++  </Box>;
++  const detail=(event:DiagnosticEvent):React.JSX.Element => <Box sx={{py:1.25,'& + &':{borderTop:'1px solid',borderColor:'divider'}}}>
++    <Box sx={{fontWeight:600,overflowWrap:'anywhere'}}>{event.domain||text('未关联域名','No domain context')} · {qtype(event.qtype)} · #{event.query_id||event.qtype?event.query_id:'—'}</Box>
++    <Box sx={{color:'text.secondary',mt:.25}}>{event.ip} · IPv{event.family} · {name(phases,event.phase)} · {text('事件','Event')} {event.sequence}</Box>
++    <Box sx={{mt:.5}}>{stamp(event)}</Box>
++    {event.kind===1&&<Box sx={{mt:.5}}>{name(rejects,event.code)}</Box>}
++    {event.kind===12&&<Box>DNS {code(event.code)}</Box>}
++    {event.dns_response&&<Box sx={{mt:.5,color:'text.secondary',fontVariantNumeric:'tabular-nums'}}>
++      DNS {code(event.dns_response.rcode)} · AN {event.dns_response.answers} / NS {event.dns_response.authority} / AR {event.dns_response.additional}
++      <br/>A {event.dns_response.a} · AAAA {event.dns_response.aaaa} · CNAME {event.dns_response.cname} · SOA {event.dns_response.soa}{event.dns_response.truncated?' · TC=1':''}
++    </Box>}
++    {[10,11].includes(event.kind)?<Box sx={{mt:.5}}>{text('固定冷却','Fixed cooldown')}: {event.limit_ms} ms</Box>:
++      (event.elapsed_ms>0||event.limit_ms>0)&&<Box sx={{mt:.5}}>{text('耗时 / 门限','Elapsed / limit')}: {event.elapsed_ms>0?event.elapsed_ms:'—'} / {event.limit_ms||'—'} ms</Box>}
++    {event.kind===2&&<Box sx={{mt:.5}}>{event.message||text('错误文本未记录','No error text')} · {text('协议码 / 系统码','Protocol / system code')}: {event.code} / {event.system_error}</Box>}
++  </Box>;
++  const groups=groupEvents((policy?.events??[]).filter(e=>filter==='all'||eventCategory(e)===filter));
++  const columns={display:'grid',gridTemplateColumns:{xs:'minmax(0,1fr)',sm:'repeat(2,minmax(0,1fr))'},gap:1.5};
 +  return <><Button size="small" onClick={()=>{setOpen(true);}}>{text('诊断','Diagnostics')}</Button>
-+    <Dialog open={open} onClose={()=>{setOpen(false);}} maxWidth="md" fullWidth>
-+      <DialogTitle sx={{overflowWrap:'anywhere'}}>{server.host} · {text('统计诊断','Diagnostics')}</DialogTitle>
-+      <DialogContent dividers>
-+        <div style={{display:'grid',gridTemplateColumns:'repeat(2,minmax(0,1fr))',gap:12}}>
-+          {[[text('已接受响应','Accepted responses'),server.success_count],[text('已发送未成功','Sent unsuccessful'),server.failure_count],[text('未发送','Unsent'),server.skip_count],[text('处理中','In progress'),server.in_flight]].map(([label,value])=><div key={String(label)} style={{padding:12,border:'1px solid #ddd',borderRadius:8}}><div>{label}</div><strong style={{fontSize:24}}>{value??0}</strong></div>)}
-+        </div>
-+        <p style={{fontSize:13}}>{text('总请求','Total requests')}: {server.query_count}. {text('表格比例包含未发送与取消，不等同网络可用率。','Table rate includes unsent and cancelled work; it is not network availability.')}</p>
-+        <Tabs value={tab} onChange={(_,v:number)=>{setTab(v);}} variant="scrollable" scrollButtons="auto" aria-label={text('诊断分类','Diagnostic categories')}>
-+          <Tab label={text('结果原因','Outcomes')}/><Tab label={text('后端与延迟','Backends & latency')}/><Tab label={text('事件明细','Events')}/><Tab label={text('运行状态','Runtime')}/>
++    <Dialog open={open} onClose={()=>{setOpen(false);}} maxWidth="lg" fullWidth aria-labelledby="upstream-diagnostics-title"
++      sx={{'& .MuiDialog-paper':{m:{xs:1,sm:3},width:{xs:'calc(100% - 16px)',sm:'calc(100% - 48px)'},maxWidth:1000,maxHeight:'92dvh',borderRadius:3,fontSize:'clamp(12px, .3vw + 10px, 14px)',lineHeight:1.65},'& .MuiTab-root':{fontSize:'inherit',minWidth:80,px:1.5},'& .MuiChip-root':{fontSize:'.86em'}}}>
++      <DialogTitle component="div" sx={{px:{xs:2,sm:3},py:2,borderBottom:'1px solid',borderColor:'divider',fontSize:'inherit'}}>
++        <Box sx={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:1}}>
++          <Typography component="h2" id="upstream-diagnostics-title" sx={{fontSize:'clamp(16px, 1vw + 12px, 20px)',fontWeight:700,m:0,overflowWrap:'anywhere'}}>{server.host}</Typography>
++          <Chip size="small" variant="outlined" color={server.service_status==='ready'?'success':server.service_status==='cooldown'?'warning':'default'} label={state}/>
++        </Box>
++        <Box sx={{fontSize:12,color:'text.secondary',mt:.25}}>{text('上游诊断','Upstream diagnostics')} · {text('请求结算、协议观测与连接状态','Query outcomes, protocol events and connections')}</Box>
++      </DialogTitle>
++      <DialogContent sx={{p:{xs:1.5,sm:2.5},bgcolor:'background.default','& details > summary':{cursor:'pointer',listStylePosition:'inside'},'& small':{fontSize:'.9em',color:'text.secondary'}}}>
++        {tab===0?<><Box sx={{display:'grid',gridTemplateColumns:{xs:'repeat(2,minmax(0,1fr))',sm:'repeat(4,minmax(0,1fr))'},gap:1,mt:1}}>
++          {[[text('已发请求成功率','Sent-query success rate'),typeof stats?.success_rate==='number'?stats.success_rate.toFixed(2)+'%':'—','primary.main'],
++            [text('已接受响应','Accepted responses'),quantity(server.success_count),'text.primary'],
++            [text('已发送未获有效结果','Sent without accepted result'),stats?quantity(stats.unsuccessful):'—','warning.main'],
++            [text('竞速取消（已发送）','Race cancelled (sent)'),stats?quantity(stats.race_cancelled):'—','text.secondary']].map(([label,value,color])=><Paper key={label} variant="outlined" sx={{p:1.5,borderRadius:2,boxShadow:'none',minWidth:0}}>
++              <Box sx={{color:'text.secondary',fontSize:'.9em',mb:.5}}>{label}</Box><Box sx={{fontSize:'clamp(19px, 1vw + 14px, 25px)',fontWeight:700,color,fontVariantNumeric:'tabular-nums',lineHeight:1.3}}>{value}</Box>
++            </Paper>)}
++        </Box>
++        <Box sx={{display:'flex',flexWrap:'wrap',gap:.75,color:'text.secondary',fontSize:'.9em',my:1.25}}>
++          <span>{text('总请求','Total queries')} {quantity(server.query_count)}</span><span>· {text('未发送','Unsent')} {quantity(server.skip_count)}</span>
++          <span>· {text('处理中','In flight')} {quantity(server.in_flight)}</span><span>· {text('成功率样本','Rate samples')} {stats?quantity(stats.samples):'—'}</span>
++        </Box>
++        <Box sx={{fontSize:'.9em',color:'text.secondary',mb:1.5}}>{text('成功率排除竞速取消、未发送、本地取消及处理中请求；期限到达仍属未成功结算，不等同独立网络可用率。','Rate excludes race cancellation, unsent, local cancellation and in-flight work. Expired sent queries remain unsuccessful outcomes; this is not independent network availability.')}</Box></>:
++          <Box sx={{display:'flex',flexWrap:'wrap',alignItems:'baseline',gap:1.25,py:1,color:'text.secondary',fontSize:'.9em'}}>
++            <Box component="span" sx={{color:'primary.main',fontWeight:700,fontSize:'1.15em'}}>{typeof stats?.success_rate==='number'?stats.success_rate.toFixed(2)+'%':'—'}</Box>
++            <span>{text('接受','Accepted')} {quantity(server.success_count)}</span><span>{text('未成功结算','Unsuccessful')} {stats?quantity(stats.unsuccessful):'—'}</span>
++            <span>{text('竞速取消','Race cancelled')} {stats?quantity(stats.race_cancelled):'—'}</span>
++          </Box>}
++        <Tabs value={tab} onChange={(_,v:number)=>{setTab(v);}} variant="scrollable" scrollButtons="auto" aria-label={text('诊断分类','Diagnostic categories')} sx={{mb:2,borderBottom:'1px solid',borderColor:'divider',minHeight:40}}>
++          <Tab label={text('结果概览','Outcomes')}/><Tab label={text('后端与延迟','Backends & latency')}/><Tab label={text('事件记录','Events')}/><Tab label={text('运行状态','Runtime')}/>
 +        </Tabs>
-+        <section role="tabpanel" style={{paddingTop:16,minHeight:180,overflowWrap:'anywhere'}}>
-+          {tab===0&&<><h3>{text('已发送未成功：如何结束','Sent unsuccessful: how it ended')}</h3>{counts(d.failure_end)}<h3>{text('未发送：为何结束','Unsent: why it ended')}</h3>{counts(d.skip_end)}<details><summary>{text('未发送前的等待阶段','Wait stage before unsent settlement')}</summary>{counts(d.skip_wait)}</details></>}
-+          {tab===1&&<>
-+            <p>{text('连接地址族','Transport family')}: {policy?.family===4?'IPv4':policy?.family===6?'IPv6':text('双栈，按出口匹配','Dual stack, matched to egress')}</p>
-+            <p>{text('响应 / 建连 / 总期限','Response / connect / total')}: {policy?.response_timeout_ms??'N/A'} / {policy?.connect_timeout_ms??'N/A'} / {policy?.query_timeout_ms??'N/A'} ms</p>
-+            <p>P50 {quantile(.5)} · P95 {quantile(.95)} · P99 {quantile(.99)}</p>
-+            <small>{text('直方图上界估计，仅含归属明确的响应；超时另记，不能从响应样本推断全部尾延迟。','Histogram upper-bound estimates from unambiguous responses. Timeouts are separate; response samples do not represent every request tail.')}</small>
-+            {(policy?.paths??[]).map(path=><article key={path.ip} style={panelStyle}><strong>{path.ip}</strong> · IPv{path.family}<p>{name(routes,path.state)} · {path.selected?text('池成员','Pool member'):text('未选入','Not selected')} · {path.connected?text('已连接','Connected'):text('未连接','Disconnected')}</p><p>{text('出口 / 源地址','Egress / source')}: {path.interface||'N/A'} / {path.source||'N/A'}</p><small>{text('发送 / 接受 / 未成功尝试 / 在途','Sends / accepted / unsuccessful attempts / active')}: {path.attempts} / {path.successes} / {path.failures} / {path.active_attempts}</small><p>{text("实际协议保活间隔","Effective protocol keepalive interval")}: {path.keepalive_ms||text("关闭或尚未协商","Off or not negotiated")} {path.keepalive_ms?"ms":""}</p></article>)}
-+            {!policy&&<p>{text('核心未提供分阶段诊断','Core does not expose detailed policy')}</p>}
-+          </>}
-+          {tab===2&&<>
-+            <p>{text('事件可重复，不等同失败请求数。明细限量保留，累计计数不受影响。','Events may repeat and are not failed-query counts. Recent details are bounded; cumulative counters are retained.')}</p>
-+            <details><summary>{text('累计事件 / 结算前最后事件','Cumulative events / last event before settlement')}</summary>{counts(d.events)}{counts(d.failure_last_event)}</details>
-+            {(policy?.events??[]).map(event=><article key={event.sequence} style={panelStyle}><strong>{event.kind===2&&event.phase===0&&event.code>=300&&event.code<=599?`HTTP ${event.code}`:name(kinds,event.kind)}</strong> · {event.ip} · IPv{event.family} · #{event.query_id||"—"}<div>{text('快照前','Before snapshot')} {(event.age_ms/1000).toFixed(1)} s · {name(phases,event.phase)}</div>{event.kind===1&&<div>{name(rejects,event.code)}</div>}{[4,10,11,12].includes(event.kind)&&event.code!==0&&<div>{text('响应 / 协议码','Response / protocol code')}: {event.code}</div>}{(event.elapsed_ms>0||event.limit_ms>0)&&<div>{text('耗时 / 门限','Elapsed / limit')}: {event.elapsed_ms} / {event.limit_ms} ms</div>}{event.kind===2&&<div>{event.message||text("尚无错误文本","No error text")} · {text('协议码 / 系统错误码','Protocol code / system error')}: {event.code} / {event.system_error}</div>}</article>)}
-+            {policy?.events.length===0&&<p>{text('暂无事件','No events')}</p>}
-+          </>}
-+          {tab===3&&<>
-+            <p>QPS: {d.qps||text('不限','unlimited')} · {text('HTTP 固定冷却','Fixed HTTP cooldown')}: {d.cooldown_ms} ms</p>
-+            <p>{text('两族建连间隔','Family connection delay')}: {policy?.connect_delay_ms??'N/A'} ms</p>
-+            <p>{text('协议保活间隔','Protocol keepalive interval')}: {policy?.keepalive_ms===0?text('关闭','Off'):String(policy?.keepalive_ms??'N/A')+' ms'}</p>
-+            <small>{text('HTTP/2 使用 PING/ACK；HTTP/3 使用可忽略扩展帧维持 QUIC 活性，ACK 由 QUIC 库处理。上游仍可主动关闭连接。','HTTP/2 uses PING/ACK. HTTP/3 uses an ignorable extension frame; QUIC handles ACKs. Peers can still close connections.')}</small>
-+            <p>{text('保活发送 / HTTP/2 ACK','Keepalive sent / HTTP2 ACK')}: {policy?.kind_counts[5]??0} / {policy?.kind_counts[6]??0}. {text('正常探测仅汇总，不挤占最近异常记录。','Healthy probes are counted without crowding out recent errors.')}</p>
-+            <h3>{text('全局客户端线程' ,'Global client thread')}</h3><p>CPU {typeof loop?.cpu_percent==='number'?loop.cpu_percent.toFixed(2)+'%':'N/A'}</p><p>{text('采样窗口 / 距今','Sample window / age')}: {loop?.sample_wall_ms??0} / {loop?.sample_age_ms??0} ms</p>
-+            <details><summary>{text('循环计数','Loop counters')}</summary><p>{text('空转 / 循环 / 唤醒','Empty polls / iterations / wakeups')}: {loop?.zero_wait_no_events??0} / {loop?.iterations??0} / {loop?.wakeups??0}</p></details>
-+          </>}
-+        </section>
-+      </DialogContent><DialogActions><Button onClick={()=>{setOpen(false);}}>{text('关闭','Close')}</Button></DialogActions>
++        <Box role="tabpanel" sx={{minHeight:180,overflowWrap:'anywhere'}}>
++          {tab===0&&<Box sx={{display:'grid',gap:1.5}}>
++            <Box sx={columns}><Panel title={text('已发送：未成功结算','Sent: unsuccessful outcomes')}>
++              {counts(Object.fromEntries(Object.entries(d.failure_end).filter(([key])=>!['other_result','budget_or_cancel','shutdown'].includes(key))))}
++            </Panel><Panel title={text('取消与未发送','Cancellation and unsent work')}>
++              {counts({other_result:count(d.failure_end,'other_result'),budget_or_cancel:count(d.failure_end,'budget_or_cancel'),shutdown:count(d.failure_end,'shutdown')})}
++              <Box sx={{mt:1.5,color:'text.secondary'}}>{text('以上为已发送后取消，均不计入成功率分母。未发送请求另列如下。','These sent cancellations are excluded from the success-rate denominator. Unsent queries are listed separately below.')}</Box>
++              <Box sx={{mt:1.5}}>{counts(d.skip_end)}</Box>
++            </Panel></Box>
++            <Panel title={text('未发送前的最后等待阶段','Last wait before unsent settlement')}>
++              {counts(d.skip_wait)}<Box sx={{mt:1,color:'text.secondary'}}>{text('描述请求结束前在等什么，不代表该阶段发生了网络故障。','Describes the final wait, not a network failure in that phase.')}</Box>
++            </Panel>
++            <Box component="details" sx={{p:1,color:'text.secondary'}}><summary>{text('查看统计口径','Statistics definitions')}</summary>
++              <p>{text('成功率 = 已接受响应 ÷（已接受响应 + 未成功结算）。一次请求可能重试多次，协议事件不能直接相加作为失败请求数。','Success rate = accepted / (accepted + unsuccessful terminal sent queries). A query can retry; protocol events cannot be summed into failed-query counts.')}</p>
++              <p>{text('原始已发送未成功（含取消）','Raw sent unsuccessful, including cancellation')}: {quantity(server.failure_count)} · {text('本地取消 / 停止','Local cancellation / shutdown')}: {quantity(stats?.local_cancelled)}</p>
++            </Box>
++          </Box>}
++          {tab===1&&<Box sx={{display:'grid',gap:1.5}}>
++            <Panel title={text('响应延迟','Response latency')}>
++              <Box sx={{mb:1,color:'text.secondary'}}>{text('连接地址族','Transport family')}: {policy?.family===4?'IPv4':policy?.family===6?'IPv6':text('双栈，按出口匹配','Dual stack, matched to egress')}</Box>
++              <Box sx={{display:'flex',gap:3,flexWrap:'wrap',fontVariantNumeric:'tabular-nums'}}>P50 {quantile(.5)} <span>P95 {quantile(.95)}</span><span>P99 {quantile(.99)}</span></Box>
++              <Box sx={{mt:1,color:'text.secondary'}}>{text('响应直方图的上界估计，超时单独记录；不包含等待发送时间。','Histogram upper-bound estimates. Timeouts are separate; admission waiting is excluded.')}</Box>
++              <Box sx={{mt:.5,color:'text.secondary'}}>{text('后端尝试计数包含取消与重试，不等同失败请求数。','Backend attempt counters include cancellation and retries; they are not failed-query counts.')}</Box>
++            </Panel>
++            <Box sx={columns}>{(policy?.paths??[]).map(path=><Panel key={path.ip} title={path.ip}>
++              <Box sx={{display:'flex',gap:.75,flexWrap:'wrap',mb:1}}><Chip size="small" label={'IPv'+String(path.family)}/><Chip size="small" variant="outlined" color={path.connected?'success':'default'} label={path.connected?text('已连接','Connected'):text('未连接','Disconnected')}/><Chip size="small" variant="outlined" label={name(routes,path.state)}/></Box>
++              <Box sx={{color:'text.secondary'}}>{text('出口','Egress')} {path.interface||'—'}<br/>{text('源地址','Source')} {path.source||'—'}</Box>
++              <Box sx={{display:'grid',gridTemplateColumns:'repeat(2,minmax(0,1fr))',gap:1,mt:1.5,fontVariantNumeric:'tabular-nums'}}>
++                {[[text('发送尝试','Attempts'),path.attempts],[text('接受','Accepted'),path.successes],[text('未成功尝试','Unsuccessful attempts'),path.failures],[text('在途','Active'),path.active_attempts]].map(([label,value])=><Box key={String(label)}><Box sx={{fontSize:'.9em',color:'text.secondary'}}>{label}</Box><strong>{quantity(Number(value))}</strong></Box>)}
++              </Box><Box sx={{mt:1.5,color:'text.secondary'}}>{text('实际协议保活间隔','Effective protocol keepalive interval')}: {path.keepalive_ms?String(path.keepalive_ms)+' ms':text('关闭或尚未协商','Off or not negotiated')}</Box>
++            </Panel>)}</Box>
++          </Box>}
++          {tab===2&&<Box sx={{display:'grid',gap:1.5}}>
++            <Panel title={text('累计观测事件','Cumulative observed events')}>
++              <Box sx={{display:'flex',flexWrap:'wrap',gap:.75}}>{Object.entries(d.events).filter(([,n])=>n>0).map(([key,n])=><Chip key={key} size="small" variant="outlined" color={key==='http_429'?'warning':'default'} label={`${labels[key]?.[lang]??key} · ${quantity(n)}`}/>)}</Box>
++              <Box sx={{mt:1,color:'text.secondary'}}>{text('一次请求可产生多个事件；累计观测不等同失败请求数。','One query may produce several events; observations are not failed-query counts.')}</Box>
++            </Panel>
++            <Box sx={{display:'flex',flexWrap:'wrap',gap:.5}}>{[['all',text('全部','All')],['http','HTTP'],['dns',text('DNS 响应','DNS responses')],['timeout',text('超时','Timeouts')],['connection',text('连接','Connections')]].map(([key,label])=><Button key={key} size="small" variant={filter===key?'contained':'text'} onClick={()=>{setFilter(key);}} sx={{fontSize:'inherit',textTransform:'none',minWidth:'auto',px:1.25}}>{label}</Button>)}</Box>
++            <Box sx={{color:'text.secondary',fontSize:'.9em'}}>{text('本地时区 · 相对年龄基于采样 · 同类事件可展开全部明细','Local timezone · ages at snapshot · expand bursts for original details')}</Box>
++            {groups.map(group=><Paper component="details" key={group.newest.sequence} variant="outlined" sx={{borderRadius:2,overflow:'hidden','&[open]':{borderColor:'primary.main'}}}>
++              <Box component="summary" sx={{p:1.5,'&:hover':{bgcolor:'action.hover'}}}>
++                <Box component="span" sx={{fontWeight:650}}>{title(group.newest)}</Box><Chip component="span" size="small" variant="outlined" sx={{ml:1,height:22}} label={`${quantity(group.events.length)} ${text('条','events')}`}/>
++                <Box sx={{mt:.5,ml:1.75,fontSize:'.9em',color:'text.secondary'}}>{group.ips.join(' · ')}</Box>
++                <Box sx={{mt:.5,ml:1.75,fontSize:'.9em'}}>{stamp(group.newest)}</Box>
++                {group.newest.domain&&![10,11].includes(group.newest.kind)&&<Box sx={{mt:.5,ml:1.75,color:'text.secondary',fontSize:'.9em'}}>{group.newest.domain} · {qtype(group.newest.qtype)}</Box>}
++              </Box><Box sx={{px:2,py:.5,borderTop:'1px solid',borderColor:'divider',bgcolor:'background.default','& > div + div':{borderTop:'1px solid',borderColor:'divider'}}}>{group.events.map(event=><Box key={event.sequence}>{detail(event)}</Box>)}</Box>
++            </Paper>)}
++            {groups.length===0&&<Panel title={text('暂无此类事件','No events in this category')}><Box sx={{color:'text.secondary'}}>{text('当前保留窗口内没有匹配记录。','No matching events in the retained window.')}</Box></Panel>}
++            <Box component="details" sx={{p:1,color:'text.secondary'}}><summary>{text('高级：结算前最后事件','Advanced: last event before settlement')}</summary>{counts(d.failure_last_event)}</Box>
++            <Box sx={{color:'text.secondary',fontSize:'.9em'}}>{text('最近明细最多保留 32 条；已移出窗口','Up to 32 recent details; evicted')} {quantity(policy?.dropped_events)}。{text('累计计数不受影响。','Cumulative counters are retained.')}</Box>
++          </Box>}
++          {tab===3&&<Box sx={columns}>
++            <Panel title={text('调度与期限','Scheduling and deadlines')}>
++              <Box>QPS: {d.qps||text('不限','Unlimited')}</Box>
++              <Box>{text('HTTP 固定冷却','Fixed HTTP cooldown')}: {d.cooldown_ms} ms</Box>
++              <Box>{text('采样时冷却剩余','Cooldown remaining at snapshot')}: {server.cooldown_remaining_ms??'—'} ms</Box>
++              <Box>{text('两族建连间隔','Family connection delay')}: {policy?.connect_delay_ms??'—'} ms</Box>
++              <Box>{text('响应 / 建连 / 总期限','Response / connect / total')}: {policy?.response_timeout_ms??'—'} / {policy?.connect_timeout_ms??'—'} / {policy?.query_timeout_ms??'—'} ms</Box>
++              <Box sx={{mt:1.5,color:'text.secondary'}}>{text('传输地址族','Transport family')}: {policy?.family===4?'IPv4':policy?.family===6?'IPv6':text('双栈，按出口匹配','Dual stack, matched to egress')}</Box>
++            </Panel>
++            <Panel title={text('连接保活','Protocol keepalive')}>
++              <Box>{text('配置间隔','Configured interval')}: {policy?.keepalive_ms?String(policy.keepalive_ms)+' ms':text('关闭','Off')}</Box>
++              <Box sx={{mt:1}}>{text('保活发送 / HTTP/2 ACK','Keepalive sent / HTTP2 ACK')}: {quantity(policy?.kind_counts[5])} / {quantity(policy?.kind_counts[6])}</Box>
++              <Box sx={{mt:1.5,color:'text.secondary'}}>{text('HTTP/2 使用 PING/ACK；HTTP/3 使用可忽略扩展帧，ACK 由 QUIC 库处理。正常保活仅汇总，不占最近异常窗口。','HTTP/2 uses PING/ACK; HTTP/3 uses ignorable extension frames with QUIC-managed ACKs. Healthy probes do not occupy the recent error window.')}</Box>
++            </Panel>
++            <Panel title={text('全局客户端线程','Global client thread')}>
++              <Box sx={{fontSize:20,fontWeight:650,fontVariantNumeric:'tabular-nums'}}>CPU {typeof loop?.cpu_percent==='number'?loop.cpu_percent.toFixed(2)+'%':'—'}</Box>
++              <Box sx={{color:'text.secondary',mt:1}}>{text('采样窗口 / 样本距今','Sample window / age')}: {loop?.sample_wall_ms??0} / {loop?.sample_age_ms??0} ms</Box>
++              <Box component="details" sx={{mt:1.5}}><summary>{text('循环计数','Loop counters')}</summary><Box>{text('空转 / 循环 / 唤醒','Empty polls / iterations / wakeups')}: {quantity(loop?.zero_wait_no_events)} / {quantity(loop?.iterations)} / {quantity(loop?.wakeups)}</Box></Box>
++            </Panel>
++          </Box>}
++        </Box>
++      </DialogContent><DialogActions sx={{px:2,py:1,borderTop:'1px solid',borderColor:'divider'}}><Button onClick={()=>{setOpen(false);}}>{text('关闭','Close')}</Button></DialogActions>
 +    </Dialog>
 +  </>;
++}
+--- /dev/null
++++ b/src/components/dashboard/upstream-servers/diagnostics-model.ts
+@@ -0,0 +1,31 @@
++import type { UpstreamPolicyData } from '@/lib/backend/server';
++
++export type DiagnosticEvent = UpstreamPolicyData['events'][number];
++export interface EventGroup { key: string; newest: DiagnosticEvent; events: DiagnosticEvent[]; ips: string[] }
++
++// Group a bounded burst for presentation only. Every original event remains
++// inspectable, with its own sequence, query, backend and capture timestamp.
++export function groupEvents(events: DiagnosticEvent[]): EventGroup[] {
++  const groups: EventGroup[] = [];
++  for (const event of events.toSorted((a,b) => b.sequence-a.sequence)) {
++    const key = [event.kind,event.phase,event.code,
++      ...([10,11].includes(event.kind) ? [] : [event.domain ?? '',event.qtype ?? 0])].join('|');
++    const group = groups.find(g => g.key === key && Math.abs(event.age_ms-g.newest.age_ms) <= 1500);
++    if (group) { group.events.push(event); if (!group.ips.includes(event.ip)) group.ips.push(event.ip); }
++    else groups.push({key,newest:event,events:[event],ips:[event.ip]});
++  }
++  return groups;
++}
++
++export function eventCategory(event: DiagnosticEvent): string {
++  if ([10,11].includes(event.kind)) return 'http';
++  if ([1,12].includes(event.kind)) return 'dns';
++  if ([0,7,8,9].includes(event.kind)) return 'timeout';
++  return 'connection';
++}
++
++export function eventTime(timestamp?: number | null, locale='zh-CN'): string | null {
++  if (typeof timestamp !== 'number' || !Number.isFinite(timestamp) || timestamp <= 0 || timestamp > 8640000000000000) return null;
++  return new Intl.DateTimeFormat(locale,{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',
++    second:'2-digit',fractionalSecondDigits:3,hourCycle:'h23',timeZoneName:'shortOffset'}).format(timestamp);
 +}

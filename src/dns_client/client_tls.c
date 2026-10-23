@@ -49,6 +49,9 @@ static ssize_t _ssl_read_ext(struct dns_server_info *server, SSL *ssl, void *buf
 		return SSL_ERROR_SYSCALL;
 	}
 	ret = SSL_read(ssl, buff, num);
+	/* HTTP/2 and HTTP/3 bypass the DNS-over-TCP packet parser. Refresh actual
+	 * receive activity here too, including protocol PING/ACK and control data. */
+	if (ret > 0) time(&server->last_recv);
 	pthread_mutex_unlock(&server->lock);
 	return ret;
 }

@@ -188,8 +188,8 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
             DNS_EVENT_DNS_RCODE : DNS_EVENT_DNS_REJECTED);
         if (!accepted) {
             int bad_rcode = packet->head.rcode != DNS_RC_NOERROR && packet->head.rcode != DNS_RC_NXDOMAIN;
-            _dns_service_detail(query, server_info, bad_rcode ? DNS_DETAIL_DNS_RCODE : DNS_DETAIL_DNS_REJECT,
-                DNS_PHASE_RESPONSE, bad_rcode ? packet->head.rcode : reject_reason, 0, 0);
+            _dns_service_detail_dns(query, server_info, bad_rcode ? DNS_DETAIL_DNS_RCODE : DNS_DETAIL_DNS_REJECT,
+                DNS_PHASE_RESPONSE, bad_rcode ? packet->head.rcode : reject_reason, packet);
         }
         _dns_service_query_result(query, server_info, accepted);
 		if (ret == DNS_CLIENT_ACTION_RETRY || ret == DNS_CLIENT_ACTION_DROP) {

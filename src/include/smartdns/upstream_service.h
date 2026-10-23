@@ -102,6 +102,20 @@ struct dns_upstream_policy_snapshot_v1 {
     struct dns_upstream_path_v1 paths[DNS_UPSTREAM_DETAIL_PATHS];
 };
 int dns_client_get_service_policy_v1(const char *service_id, struct dns_upstream_policy_snapshot_v1 *out);
+/* Optional companion to policy-v1: join by sequence, never by array position.
+ * Wall time is captured when the event occurs; monotonic ages survive NTP steps. */
+struct dns_upstream_event_context_v1 {
+    uint64_t sequence, unix_ms;
+    char domain[256];
+    unsigned qtype, dns_summary_valid, rcode, truncated;
+    unsigned answers, authority, additional, a_records, aaaa_records, cname_records, soa_records;
+};
+struct dns_upstream_event_context_snapshot_v1 {
+    unsigned struct_size, version, event_count;
+    struct dns_upstream_event_context_v1 events[DNS_UPSTREAM_DETAIL_EVENTS];
+};
+int dns_client_get_service_event_context_v1(const char *service_id,
+    struct dns_upstream_event_context_snapshot_v1 *out);
 /* A callback can attach a semantic rejection reason without changing its action. */
 void dns_client_response_reject_reason(unsigned reason);
 

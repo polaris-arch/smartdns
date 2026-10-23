@@ -5,6 +5,7 @@
 #include "gtest/gtest.h"
 extern "C" {
 #include "dns_server/answer.h"
+#include "dns_server/dns_server.h"
 }
 #include <arpa/inet.h>
 #include <atomic>
@@ -156,7 +157,33 @@ TEST(UpstreamNodata, RequiresMatchingCompleteInClassAuthorityProof)
     soa->data[4] = DNS_C_IN; soa->len = 5;
     EXPECT_FALSE(_dns_server_is_nodata(packet, "empty.example", DNS_T_AAAA));
     ASSERT_TRUE(negative_packet(packet, sizeof(storage), "empty.example", DNS_T_HTTPS, "example"));
-    EXPECT_FALSE(_dns_server_is_nodata(packet, "empty.example", DNS_T_HTTPS));
+    EXPECT_TRUE(_dns_server_is_nodata(packet, "empty.example", DNS_T_HTTPS));
+}
+
+TEST(UpstreamNodata, CompleteHttpsNegativeDoesNotDependOnEarlierProviderRcode)
+{
+    alignas(dns_packet) unsigned char storage[DNS_PACKSIZE];
+    auto *packet = reinterpret_cast<dns_packet *>(storage);
+    dns_conf_group conf{};
+    for (int qtype : {DNS_T_AAAA, DNS_T_HTTPS}) for (int rcode : {DNS_RC_NOERROR, DNS_RC_NXDOMAIN}) {
+        ASSERT_TRUE(negative_packet(packet, sizeof(storage), "empty.example", qtype, "example"));
+        packet->head.rcode = rcode;
+        dns_request request{}; request.conf = &conf; request.qtype = static_cast<dns_type_t>(qtype);
+        request.rcode = DNS_RC_NOERROR; strcpy(request.domain, "empty.example");
+        // Another provider already supplied usable data. A negative reply must
+        // remain a valid provider response without completing that whole race.
+        atomic_set(&request.ip_map_num, 1);
+        int passthrough = 0;
+        EXPECT_EQ(_dns_server_process_answer(&request, "empty.example", packet, 0, &passthrough),
+            DNS_CLIENT_ACTION_OK_WAIT) << "qtype=" << qtype << " rcode=" << rcode;
+        packet->head.tc = 1;
+        EXPECT_EQ(_dns_server_process_answer(&request, "empty.example", packet, 0, &passthrough),
+            DNS_CLIENT_ACTION_MAY_RETRY);
+        ASSERT_TRUE(negative_packet(packet, sizeof(storage), "empty.example", qtype, "unrelated.example"));
+        packet->head.rcode = rcode;
+        EXPECT_EQ(_dns_server_process_answer(&request, "empty.example", packet, 0, &passthrough),
+            DNS_CLIENT_ACTION_MAY_RETRY);
+    }
 }
 
 #define NODATA_RUNTIME_CASE(Name, Action) \

@@ -9,7 +9,7 @@ const http = require('node:http');
 const crypto = require('node:crypto');
 const assert = require('node:assert/strict');
 const [outArg, apiArg, reportArg, mode] = process.argv.slice(2);
-assert(!mode || mode === "--server-check", "unknown validation mode");
+assert(!mode || mode === "--server-check" || mode === "--diagnostic-fixture", "unknown validation mode");
 if (!outArg || !apiArg || !reportArg) throw Error('usage: test-browser.cjs WEBUI_OUT CAPTURED_API_JSON REPORT_DIRECTORY');
 const out = fs.realpathSync(outArg);
 const apiBody = fs.readFileSync(apiArg);
@@ -137,6 +137,10 @@ async function capture(label) {
       const tr = cell.locator('xpath=ancestor::tr');
       assert((await tr.textContent()).includes(row.host));
       if (row.diagnostics) assert.equal(await tr.getByRole('button', { name: /诊断|Diagnostics/ }).count(), 1);
+      if (row.response_statistics) {
+        const rate=row.response_statistics.success_rate;
+        assert((await tr.textContent()).includes(typeof rate==='number'?rate.toFixed(2)+' %':'—'));
+      }
     }
     const normal = page.locator('tbody tr').filter({ hasText: '127.0.0.9' });
     assert.equal(await normal.count(), 1);
@@ -156,10 +160,27 @@ async function capture(label) {
     const section = dialog.getByRole('tabpanel');
     await section.waitFor({ state: 'visible' });
     assert.equal(await dialog.getByRole('tab').count(), 4);
+    const desktopFont=await dialog.evaluate(el=>Number.parseFloat(getComputedStyle(el).fontSize));
+    assert(desktopFont<=14,'desktop diagnostic body must stay compact');
     await dialog.getByRole('tab').nth(1).click();
     assert.match(await section.textContent(), /连接地址族|Transport family/);
     await capture('upstream-backends-and-latency');
     await dialog.getByRole('tab').nth(2).click();
+    if (mode==='--diagnostic-fixture') {
+      assert.equal(pools[0].response_statistics.success_rate,99.15);
+      assert.equal(await section.locator('summary').filter({hasText:/HTTP 429/}).count(),1);
+      const burst=section.locator('details').filter({has:page.locator('summary').filter({hasText:/HTTP 429/})}).first();
+      await burst.locator('summary').click();
+      assert.equal(await burst.getByText(/request-\d+\.example/).count(),14);
+      assert.match(await burst.textContent(),/2026/);
+      assert.equal(await burst.getByText('request-0.example · A · #0',{exact:true}).count(),1);
+      assert.match(await burst.textContent(),/固定冷却|Fixed cooldown/);
+      assert(!/0 \/ 1000 ms/.test(await burst.textContent()),'cooldown must not be formatted as measured response elapsed');
+      await section.getByRole('button',{name:/^DNS 响应$|^DNS responses$/}).click();
+      assert.equal(await section.locator('summary').filter({hasText:/HTTP 429/}).count(),0);
+      assert.match(await section.textContent(),/DNS 响应未被接受|DNS response not accepted/);
+      await section.getByRole('button',{name:/^全部$|^All$/}).click();
+    }
     await capture('upstream-recent-events');
     await dialog.getByRole('tab').nth(3).click();
     assert((await section.textContent()).includes(pools[0].diagnostics.cooldown_ms + ' ms'));
@@ -176,9 +197,14 @@ async function capture(label) {
     await dialog.waitFor({ state: 'visible' });
     const mobile = await dialog.boundingBox();
     assert(mobile && mobile.x >= 0 && mobile.x + mobile.width <= 390);
-    await dialog.getByRole('tab').nth(1).click();
-    const mobileContent = await section.evaluate(el => ({content: el.scrollWidth, viewport: el.clientWidth}));
-    assert(mobileContent.content <= mobileContent.viewport + 1, 'mobile diagnostic text must remain readable');
+    const mobileFont=await dialog.evaluate(el=>Number.parseFloat(getComputedStyle(el).fontSize));
+    assert(mobileFont<=desktopFont&&mobileFont>=12,'mobile font must adapt while remaining readable');
+    for (let tab=0;tab<4;tab++) {
+      await dialog.getByRole('tab').nth(tab).click();
+      const mobileContent = await section.evaluate(el => ({content: el.scrollWidth, viewport: el.clientWidth}));
+      assert(mobileContent.content <= mobileContent.viewport + 1, 'each mobile panel must remain readable without horizontal clipping');
+      if (tab===2) await capture('upstream-events-mobile');
+    }
     await capture('upstream-diagnostics-mobile');
     await dialog.getByRole('button', { name: /关闭|Close/ }).click();
     await dialog.waitFor({ state: 'hidden' });
