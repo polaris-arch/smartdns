@@ -5,6 +5,7 @@
 #include "client_http3_control.h"
 #include "client_http2.h"
 #include "client_tls.h"
+#include "client_quic.h"
 #include "smartdns/http2.h"
 #include "smartdns/util.h"
 #include <limits.h>
@@ -32,11 +33,11 @@ static void connection_maintain(struct dns_upstream_service *s, struct dns_serve
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
     if (ep->ssl && (ep->type == DNS_SERVER_HTTP3 || ep->type == DNS_SERVER_QUIC)) {
         struct timeval timeout = {0}; int infinite = 1;
-        if (SSL_get_event_timeout(ep->ssl, &timeout, &infinite) && !infinite) {
+        if (SSL_get_event_timeout(ep->ssl, &timeout, &infinite)) {
             unsigned long delay = timeout.tv_sec * 1000UL + (timeout.tv_usec + 999) / 1000;
-            if (delay <= 1) {
+            if ((!infinite && delay <= 1) || _dns_client_quic_buffered(ep)) {
                 _dns_client_process_guard_enter(ep);
-                _ssl_do_handevent(ep);
+                ep->http3_control_epoch++;
                 /* handle_events may consume UDP packets into OpenSSL's buffers.
                  * Drain decoded streams now; the kernel fd may no longer be readable. */
                 struct epoll_event event = {.events = EPOLLIN};
@@ -146,6 +147,10 @@ static void connection_maintain(struct dns_upstream_service *s, struct dns_serve
     }
     next_due(s, now, ep->service_keepalive_tick + interval);
 out:
+#if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
+    if ((ep->type==DNS_SERVER_HTTP3 || ep->type==DNS_SERVER_QUIC) && _dns_client_quic_buffered(ep))
+        next_due(s,now,now+1);
+#endif
     quic_deadline(s, ep, now); /* writes/control processing may create a new pacing deadline */
     pthread_mutex_unlock(&ep->lock);
 }

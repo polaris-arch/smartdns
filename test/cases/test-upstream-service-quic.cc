@@ -371,7 +371,13 @@ void quic_pool_case(bool h3, bool keepalive = false) {
     EXPECT_EQ(first.connections, 1U); EXPECT_EQ(second.connections, 1U);
     EXPECT_FALSE(first.failed); EXPECT_FALSE(second.failed);
     if(keepalive){
-        poll(nullptr,0,2400);dns_upstream_policy_snapshot_v1 policy{};
+        dns_client_loop_diagnostics_v1 idle_before{},idle_after{};
+        ASSERT_EQ(dns_client_get_loop_diagnostics_v1(&idle_before),0);
+        poll(nullptr,0,2400);
+        ASSERT_EQ(dns_client_get_loop_diagnostics_v1(&idle_after),0);
+        EXPECT_LT(idle_after.iterations-idle_before.iterations,1000U)
+            << "buffered continuation must stop after draining application data";
+        dns_upstream_policy_snapshot_v1 policy{};
         ASSERT_EQ(dns_client_get_service_policy_v1(snapshot.service_id,&policy),0);
         EXPECT_GE(policy.kind_counts[DNS_DETAIL_KEEPALIVE_SENT],2U);
         EXPECT_EQ(first.requests+second.requests,4U+first_warm+second_warm);

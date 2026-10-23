@@ -35,6 +35,8 @@ int _dns_client_send_quic(struct dns_query_struct *query, struct dns_server_info
 int _dns_client_send_quic_data(struct dns_query_struct *query, struct dns_server_info *server_info, void *packet,
 							   unsigned short len);
 
+int _dns_client_quic_buffered(struct dns_server_info *server_info);
+
 int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now);
 #ifdef __cplusplus
 }

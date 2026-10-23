@@ -519,12 +519,9 @@ static int _dns_client_process_quic_poll(struct dns_server_info *server_info)
 		}
 		pthread_mutex_unlock(&server_info->lock);
 
-		if (poll_item_count <= 0) {
-			_ssl_do_handevent(server_info);
-			break;
-		}
+        if (poll_item_count <= 0) break;
 
-		ret = SSL_poll(poll_items, poll_item_count, sizeof(SSL_POLL_ITEM), &nz_timeout, 0, &poll_retcount);
+		ret = SSL_poll(poll_items, poll_item_count, sizeof(SSL_POLL_ITEM), &nz_timeout, SSL_POLL_FLAG_NO_HANDLE_EVENTS, &poll_retcount);
 		if (ret <= 0) {
 			tlog(TLOG_DEBUG, "SSL_poll failed, %d", ret);
 			goto errout;
@@ -687,6 +684,30 @@ static void _dns_client_quic_discard_request(struct dns_server_info *s, struct d
         _dns_client_conn_stream_put(stream);
     }
     _dns_client_conn_stream_put(stream);
+}
+
+/* The caller holds the endpoint lock. Inspect SDK readiness without consuming
+ * any socket data: application buffers/FIN can remain ready after SSL IO has
+ * drained the kernel fd, even when QUIC itself has no immediate timer. */
+int _dns_client_quic_buffered(struct dns_server_info *s)
+{
+    if (!s->ssl) return 0;
+    if (s->status == DNS_SERVER_STATUS_CONNECTING) return SSL_is_init_finished(s->ssl);
+    SSL_POLL_ITEM items[128]; size_t count=0, ready=0;
+    const struct timeval zero={0};
+    items[count++]=(SSL_POLL_ITEM){.desc=SSL_as_poll_descriptor(s->ssl),
+        .events=SSL_POLL_EVENT_EC | (s->type==DNS_SERVER_HTTP3 ? SSL_POLL_EVENT_ISU|SSL_POLL_EVENT_ISB : 0)};
+    struct dns_conn_stream *stream;
+    list_for_each_entry(stream,&s->conn_stream_list,server_list) {
+        if (!stream->quic_stream) continue;
+        items[count++]=(SSL_POLL_ITEM){.desc=SSL_as_poll_descriptor(stream->quic_stream),
+            .events=SSL_POLL_EVENT_R|SSL_POLL_EVENT_ER|SSL_POLL_EVENT_EW};
+        if (count==128) {
+            if (SSL_poll(items,count,sizeof(items[0]),&zero,SSL_POLL_FLAG_NO_HANDLE_EVENTS,&ready)>0 && ready) return 1;
+            count=0;
+        }
+    }
+    return count && SSL_poll(items,count,sizeof(items[0]),&zero,SSL_POLL_FLAG_NO_HANDLE_EVENTS,&ready)>0 && ready;
 }
 
 int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now)
