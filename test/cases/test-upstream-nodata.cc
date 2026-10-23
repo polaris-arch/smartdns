@@ -102,6 +102,11 @@ void pool_case(unsigned rate, bool fallback, bool nxdomain = false)
         if (stats.success_count == queries && !stats.in_flight) break;
         poll(nullptr, 0, 5);
     } while (std::chrono::steady_clock::now() < deadline);
+    std::cout << "NODATA pool: qps=" << rate << " queries=" << stats.query_count
+        << " success=" << stats.success_count << " failure=" << stats.failure_count
+        << " skipped=" << stats.skip_count << " active=" << stats.in_flight
+        << " attempts=" << stats.attempt_count << " backends=" << sends[0].load() << ":" << sends[1].load()
+        << std::endl;
     EXPECT_EQ(stats.query_count, queries); EXPECT_EQ(stats.success_count, queries);
     EXPECT_EQ(stats.failure_count, 0U); EXPECT_EQ(stats.skip_count, 0U); EXPECT_EQ(stats.in_flight, 0U);
     EXPECT_EQ(stats.attempt_count, queries); EXPECT_EQ(sends[0] + sends[1], queries);

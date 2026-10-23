@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 
 # Explicit names: deleting/renaming a required fixture must update this reviewed gate.
 COMMON = set("""
+MockServer.InterruptedPollDoesNotDelayReply
 ClientH2FlowOwner.PeerCloseWithoutOrphanMustReachEOF
 ClientH2FlowOwner.LateCancelledResponseAndPeerCloseMustReachEOF
 ClientH2FlowOwner.LateCancelledResponseDoesNotRetainReadinessOrBreakSibling

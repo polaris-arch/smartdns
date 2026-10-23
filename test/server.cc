@@ -96,6 +96,9 @@ void MockServer::Run()
 		if (ret == 0) {
 			continue;
 		} else if (ret < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
 			sleep(1);
 			continue;
 		}
