@@ -16,6 +16,8 @@ MaterialReactTable row identity. Ordinary rows retain the upstream's default
 index identity and unchanged display. The fixed dashboard does not mount its
 legacy overview component; this patch does not modify or add that component.
 
+Upstream response times retain the deployed two-decimal display fix; invalid or negative values show N/A. The API keeps its original precision.
+
 Both build hooks verify the archive before extraction, verify exact full-file
 preimages, apply with no fuzz, and verify exact postimages. `prepare-source.sh`
 requires a new destination and never trusts an existing output. Generic builds

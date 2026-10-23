@@ -73,7 +73,7 @@ bool EnsureHTTP2TestCert()
 }
 
 bool BuildDnsAResponse(const std::vector<uint8_t> &request, const char *ip, std::vector<uint8_t> *response,
-					   std::string *error, bool answer_any = false)
+					   std::string *error, bool answer_any = false, bool address_negatives = false)
 {
 	unsigned char request_packet_buff[DNS_PACKSIZE];
 	unsigned char response_packet_buff[DNS_PACKSIZE];
@@ -120,6 +120,12 @@ bool BuildDnsAResponse(const std::vector<uint8_t> &request, const char *ip, std:
 		dns_add_A(response_packet, DNS_RRS_AN, domain, 60, addr);
 	}
 
+	if (address_negatives && qtype == DNS_T_AAAA) {
+		dns_soa soa{}; strcpy(soa.mname, "ns.example"); strcpy(soa.rname, "hostmaster.example");
+		soa.minimum = 60;
+		dns_add_SOA(response_packet, DNS_RRS_NS, "example", 60, &soa);
+	}
+
 	int encoded_len = dns_encode(encoded_buff, sizeof(encoded_buff), response_packet);
 	if (encoded_len <= 0) {
 		*error = "encode DNS response failed";
@@ -135,6 +141,7 @@ class PoolTlsPeer {
 public:
     std::atomic<unsigned> requests{0}, connections{0};
     std::function<bool()> on_request;
+    bool address_negatives = false;
     bool Start(const char *ip, unsigned port, bool h2) {
         h2_ = h2;
         if (!EnsureHTTP2TestCert()) return false;
@@ -222,7 +229,7 @@ private:
             std::vector<uint8_t> body(size), response;
             if (!Exact(ssl, body.data(), body.size(), false)) break;
             std::string error;
-            if (!BuildDnsAResponse(body, "192.0.2.88", &response, &error)) break;
+            if (!BuildDnsAResponse(body, "192.0.2.88", &response, &error, false, address_negatives)) break;
             requests++; if (on_request) on_request();
             prefix[0] = response.size() >> 8; prefix[1] = response.size();
             if (!Exact(ssl, prefix, 2, true) || !Exact(ssl, response.data(), response.size(), true)) break;
@@ -262,7 +269,7 @@ private:
                             http2_header_pair headers[] = {{"retry-after", "1"}, {"content-length", "0"}};
                             http2_stream_set_response(stream, 429, headers, 2);
                         } else {
-                            if (!BuildDnsAResponse(it->second, "192.0.2.89", &response, &error)) { run_ = false; break; }
+                            if (!BuildDnsAResponse(it->second, "192.0.2.89", &response, &error, false, address_negatives)) { run_ = false; break; }
                             std::string length = std::to_string(response.size());
                             http2_header_pair headers[] = {{"content-type", "application/dns-message"}, {"content-length", length.c_str()}};
                             http2_stream_set_response(stream, 200, headers, 2);
@@ -282,7 +289,7 @@ private:
     bool h2_ = false; int fd_ = -1; SSL_CTX *ctx_ = nullptr;
     std::atomic<bool> run_{false}; std::thread accept_; std::vector<std::thread> workers_;
 };
-bool query_udp(const std::string &name, unsigned port)
+bool query_udp(const std::string &name, unsigned port, int qtype = DNS_T_A)
 {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return false;
@@ -295,20 +302,22 @@ bool query_udp(const std::string &name, unsigned port)
     auto *packet = reinterpret_cast<dns_packet *>(storage);
     dns_head head{}; head.id = 4321; head.rd = 1;
     dns_packet_init(packet, sizeof(storage), &head);
-    dns_add_domain(packet, name.c_str(), DNS_T_A, DNS_C_IN);
+    dns_add_domain(packet, name.c_str(), qtype, DNS_C_IN);
     int length = dns_encode(wire, sizeof(wire), packet);
     bool good = length > 0 && sendto(fd, wire, length, 0, reinterpret_cast<sockaddr *>(&target), sizeof(target)) == length;
     if (good) {
         length = recv(fd, wire, sizeof(wire), 0);
         good = length > 0 && !dns_decode(packet, sizeof(storage), wire, length) &&
-            packet->head.id == 4321 && packet->head.rcode == DNS_RC_NOERROR && packet->head.ancount == 1;
+            packet->head.id == 4321 && packet->head.rcode == DNS_RC_NOERROR && packet->head.ancount == (qtype == DNS_T_A ? 1 : 0) &&
+            (qtype == DNS_T_A || packet->head.nscount == 1);
     }
     close(fd);
     return good;
 }
 
-void transport_case(bool h2, bool throttle) {
+void transport_case(bool h2, bool throttle, unsigned nodata_rate = 0) {
     PoolTlsPeer first, second;
+    first.address_negatives = second.address_negatives = nodata_rate != 0;
     std::mutex lock; std::vector<std::chrono::steady_clock::time_point> wire_times;
     std::vector<unsigned> wire_backend;
     auto observe = [&](unsigned backend) {
@@ -324,21 +333,25 @@ void transport_case(bool h2, bool throttle) {
     std::string config = "bind 127.0.0.1:" + std::to_string(listen) + "\nserver " + (h2 ? "https://" : "tls://") +
         "resolver.transport.example:" + std::to_string(port) + (h2 ? "/dns-query" : "") +
         " -upstream-ip-pool -host-ip 127.0.0.1,127.0.0.2 -no-check-certificate" + (h2 ? " -alpn h2" : "") +
+        (nodata_rate ? " -max-query-rate " + std::to_string(nodata_rate) + " -query-burst 1" : "") +
         "\ncache-size 0\ncache-persist no\nprefetch-domain no\nserve-expired no\n"
         "dualstack-ip-selection no\nspeed-check-mode none\nresponse-mode fastest-response\n";
     ASSERT_TRUE(resolver.Start(config));
-    for (unsigned i = 0; i < 4; i++) ASSERT_TRUE(query_udp("transport-" + std::to_string(i) + ".example", listen));
+    unsigned queries = nodata_rate ? 12 : 4;
+    for (unsigned i = 0; i < queries; i++)
+        ASSERT_TRUE(query_udp("transport-" + std::to_string(i) + ".example", listen,
+                              nodata_rate && (i / 2) % 2 ? DNS_T_AAAA : DNS_T_A));
     dns_upstream_service_snapshot_v1 snapshot{};
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     do {
         ASSERT_EQ(dns_client_get_service_snapshot_v1(&snapshot, 1), 1);
-        if (snapshot.success_count == 4 && !snapshot.in_flight) break;
+        if (snapshot.success_count == queries && !snapshot.in_flight) break;
         poll(nullptr, 0, 5);
     } while (std::chrono::steady_clock::now() < deadline);
-    EXPECT_EQ(snapshot.endpoint_count, 2U); EXPECT_EQ(snapshot.query_count, 4U);
-    EXPECT_EQ(snapshot.success_count, 4U); EXPECT_EQ(snapshot.failure_count, 0U); EXPECT_EQ(snapshot.skip_count, 0U);
-    EXPECT_EQ(snapshot.attempt_count, throttle ? 5U : 4U);
-    EXPECT_EQ(first.requests + second.requests, throttle ? 5U : 4U);
+    EXPECT_EQ(snapshot.endpoint_count, 2U); EXPECT_EQ(snapshot.query_count, queries);
+    EXPECT_EQ(snapshot.success_count, queries); EXPECT_EQ(snapshot.failure_count, 0U); EXPECT_EQ(snapshot.skip_count, 0U);
+    EXPECT_EQ(snapshot.attempt_count, queries + (throttle ? 1 : 0));
+    EXPECT_EQ(first.requests + second.requests, queries + (throttle ? 1 : 0));
     EXPECT_LE(std::abs(static_cast<int>(first.requests) - static_cast<int>(second.requests)), 1);
     EXPECT_EQ(first.connections, 1U); EXPECT_EQ(second.connections, 1U);
     std::lock_guard<std::mutex> guard(lock);
@@ -356,4 +369,17 @@ TEST(UpstreamServiceTransport, RealTlsDualBackendRoundRobinAndConnectionReuse) {
 TEST(UpstreamServiceTransport, RealH2DualBackendShared429CooldownAndRoundRobin) {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT({ transport_case(true, true); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
+}
+
+TEST(UpstreamServiceTransport, RealTlsNodataCompletesServiceWithoutDuplicateAttempt) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT({ transport_case(false, false, 20); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
+}
+TEST(UpstreamServiceTransport, RealH2Nodata20CompletesServiceWithoutDuplicateAttempt) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT({ transport_case(true, false, 20); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
+}
+TEST(UpstreamServiceTransport, RealH2Nodata40CompletesServiceWithoutDuplicateAttempt) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT({ transport_case(true, false, 40); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
 }

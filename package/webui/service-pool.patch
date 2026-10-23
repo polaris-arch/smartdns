@@ -30,3 +30,18 @@
      localization: tableLocales,
      enableColumnResizing: true,
      enableColumnOrdering: false,
+--- a/src/components/dashboard/upstream-servers/upstream-servers-table.tsx
++++ b/src/components/dashboard/upstream-servers/upstream-servers-table.tsx
+@@ -108,10 +108,10 @@
+         size: 140,
+         Cell: ({ cell }) => {
+           const avgTime = cell.getValue<number>();
+-          if (avgTime < 0) {
++          if (!Number.isFinite(avgTime) || avgTime < 0) {
+             return <span>N/A</span>;
+           }
+-          return <span>{avgTime} ms</span>;
++          return <span>{avgTime.toFixed(2)} ms</span>;
+         },
+       },
+       {

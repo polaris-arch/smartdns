@@ -16,10 +16,10 @@ extern "C" {
 
 namespace {
 bool negative_packet(dns_packet *packet, size_t capacity, const char *question, int qtype,
-                     const char *zone, bool authority = true)
+                     const char *zone, bool authority = true, int qclass = DNS_C_IN)
 {
     dns_head head{}; head.id = 14321; head.qr = DNS_QR_ANSWER; head.rd = head.ra = 1;
-    if (dns_packet_init(packet, capacity, &head) || dns_add_domain(packet, question, qtype, DNS_C_IN)) return false;
+    if (dns_packet_init(packet, capacity, &head) || dns_add_domain(packet, question, qtype, qclass)) return false;
     if (zone) {
         dns_soa soa{}; strcpy(soa.mname, "ns.example"); strcpy(soa.rname, "hostmaster.example");
         soa.serial = 1; soa.refresh = 3600; soa.retry = 600; soa.expire = 86400; soa.minimum = 60;
@@ -84,8 +84,10 @@ void pool_case(unsigned rate, bool fallback, bool nxdomain = false)
         " -host-ip 127.0.0.1,127.0.0.2 -max-query-rate " + std::to_string(rate) + " -query-burst 1\n";
     if (fallback) conf += "server udp://127.0.0.1:62892\n";
     conf += "cache-size 0\ncache-persist no\nprefetch-domain no\nserve-expired no\n"
-        "dualstack-ip-selection no\nspeed-check-mode none\n";
+        "dualstack-ip-selection no\n";
+    conf += fallback ? "speed-check-mode ping\n" : "speed-check-mode none\n";
     conf += fallback ? "response-mode first-ping\n" : "response-mode fastest-response\n";
+    if (fallback) resolver.MockPing(PING_TYPE_ICMP, "2001:db8::89", 64, 10);
     ASSERT_TRUE(resolver.Start(conf));
     unsigned queries = fallback || nxdomain ? 1 : 12;
     for (unsigned i = 0; i < queries; i++) {
@@ -96,7 +98,7 @@ void pool_case(unsigned rate, bool fallback, bool nxdomain = false)
     dns_upstream_service_snapshot_v1 stats{};
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     do {
-        ASSERT_EQ(dns_client_get_service_snapshot_v1(&stats, 1), 1);
+        ASSERT_EQ(dns_client_get_service_snapshot_v1(&stats, 1), fallback ? 2 : 1);
         if (stats.success_count == queries && !stats.in_flight) break;
         poll(nullptr, 0, 5);
     } while (std::chrono::steady_clock::now() < deadline);
@@ -113,9 +115,9 @@ TEST(UpstreamNodata, RequiresMatchingCompleteInClassAuthorityProof)
     alignas(dns_packet) unsigned char storage[DNS_PACKSIZE];
     auto *packet = reinterpret_cast<dns_packet *>(storage);
     for (int qtype : {DNS_T_A, DNS_T_AAAA}) {
-        for (const char *zone : {"example", "empty.example", "EXAMPLE", "."}) {
+        for (const char *zone : {"example", "empty.example", "EXAMPLE", ""}) {
             ASSERT_TRUE(negative_packet(packet, sizeof(storage), "empty.example", qtype, zone));
-            EXPECT_TRUE(_dns_server_is_nodata(packet, "empty.example", qtype));
+            EXPECT_TRUE(_dns_server_is_nodata(packet, "empty.example", qtype)) << "zone=" << zone;
             packet->head.tc = 1;
             EXPECT_FALSE(_dns_server_is_nodata(packet, "empty.example", qtype));
             packet->head.tc = 0; packet->head.ancount = 1;
@@ -137,6 +139,17 @@ TEST(UpstreamNodata, RequiresMatchingCompleteInClassAuthorityProof)
         packet->head.rcode = DNS_RC_NOERROR; packet->head.opcode = DNS_OP_IQUERY;
         EXPECT_FALSE(_dns_server_is_nodata(packet, "empty.example", qtype));
     }
+    ASSERT_TRUE(negative_packet(packet, sizeof(storage), "empty.example", DNS_T_AAAA, "example", true, 3));
+    EXPECT_FALSE(_dns_server_is_nodata(packet, "empty.example", DNS_T_AAAA));
+    ASSERT_TRUE(negative_packet(packet, sizeof(storage), "empty.example", DNS_T_AAAA, ""));
+    int count = 0;
+    auto *soa = dns_get_rrs_start(packet, DNS_RRS_NS, &count);
+    ASSERT_NE(soa, nullptr); ASSERT_EQ(count, 1);
+    // The decoded root owner is one zero octet, followed by type and class.
+    ASSERT_EQ(soa->data[0], 0); soa->data[4] = 3;
+    EXPECT_FALSE(_dns_server_is_nodata(packet, "empty.example", DNS_T_AAAA));
+    soa->data[4] = DNS_C_IN; soa->len = 5;
+    EXPECT_FALSE(_dns_server_is_nodata(packet, "empty.example", DNS_T_AAAA));
     ASSERT_TRUE(negative_packet(packet, sizeof(storage), "empty.example", DNS_T_HTTPS, "example"));
     EXPECT_FALSE(_dns_server_is_nodata(packet, "empty.example", DNS_T_HTTPS));
 }
