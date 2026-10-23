@@ -71,6 +71,8 @@ pub struct UpstreamServiceDetails {
     pub cooldown_remaining_ms: u64,
     pub freshness_remaining_ms: Option<u64>,
     pub freshness_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<crate::data_upstream_diagnostics::UpstreamDiagnostics>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +118,7 @@ impl UpstreamServerInfo {
             }
         } else { row.legacy_avg_time };
         let details = UpstreamServiceDetails {
-            service_id: service_id.clone(),
+            service_id: service_id.clone(), diagnostics: None,
             stats_semantics: if pool { "service-v1" } else { "legacy-endpoint-v1" }.into(),
             pool_enabled: pool,
             config_identity: ServiceConfigIdentity {
@@ -156,8 +158,13 @@ impl UpstreamServerInfo {
     }
 
     pub fn get_all() -> Result<Vec<UpstreamServerInfo>, Box<dyn std::error::Error>> {
-        smartdns::DnsUpstreamServices::snapshots()?.iter().map(|row| {
-            Self::from_snapshot(row).map_err(|error| error.into())
+        smartdns::DnsUpstreamServices::snapshots()?.iter().map(|row| -> Result<Self, Box<dyn std::error::Error>> {
+            if row.pool_enabled == 0 { return Self::from_snapshot(row).map_err(|error| error.into()); }
+            let id = smartdns::snapshot_string(&row.service_id)?;
+            let (base, diagnostics) = crate::data_upstream_diagnostics::UpstreamDiagnostics::fetch(&id)?;
+            let mut result = Self::from_snapshot(&base)?;
+            result.service.as_mut().ok_or("missing service details")?.diagnostics = Some(diagnostics);
+            Ok(result)
         }).collect()
     }
 }

@@ -13,6 +13,7 @@ int _dns_policy_service_init(struct dns_upstream_service *service);
 void _dns_policy_service_release(struct dns_upstream_service *service);
 unsigned long _dns_policy_service_cooldown(struct dns_upstream_service *service, unsigned long now);
 unsigned long _dns_policy_service_wait(struct dns_upstream_service *service, unsigned long now);
+unsigned long _dns_policy_service_wait_reason(struct dns_upstream_service *service, unsigned long now, unsigned *reason);
 int _dns_policy_attach(struct dns_server_info *server);
 int _dns_policy_connection_acquire(struct dns_server_info *server);
 void _dns_policy_connection_release(struct dns_server_info *server);

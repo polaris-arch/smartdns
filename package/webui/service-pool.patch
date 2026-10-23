@@ -1,9 +1,29 @@
 --- a/src/lib/backend/server.ts
 +++ b/src/lib/backend/server.ts
-@@ -265,6 +265,9 @@
+@@ -264,7 +264,29 @@
+     registrar: string;
  }
- 
+
++export interface UpstreamDiagnosticsData {
++    version: number;
++    qps: number;
++    cooldown_ms: number;
++    failure_end: Record<string, number>;
++    skip_end: Record<string, number>;
++    skip_wait: Record<string, number>;
++    failure_last_event: Record<string, number>;
++    events: Record<string, number>;
++    client_loop?: {cpu_percent?: number | null; sample_wall_ms?: number; sample_age_ms?: number;
++      zero_wait_no_events?: number; iterations?: number; wakeups?: number} | null;
++}
++
  export interface UpStreamServers {
++    diagnostics?: UpstreamDiagnosticsData;
++    query_count?: number;
++    success_count?: number;
++    failure_count?: number;
++    skip_count?: number;
++    in_flight?: number;
 +    service_id?: string;
 +    pool_enabled?: boolean;
 +    endpoint_ips?: string[];
@@ -12,7 +32,15 @@
      port: number;
 --- a/src/components/dashboard/upstream-servers/upstream-servers-table.tsx
 +++ b/src/components/dashboard/upstream-servers/upstream-servers-table.tsx
-@@ -64,7 +64,8 @@
+@@ -1,6 +1,7 @@
+ "use client"
+
+ import * as React from 'react';
++import { UpstreamDiagnostics } from './upstream-diagnostics';
+ import { useMemo, useState } from 'react';
+ import {
+   MaterialReactTable,
+@@ -64,7 +65,8 @@
          enableSorting: false,
        },
        {
@@ -22,17 +50,19 @@
          header: t('IP'),
          enableSorting: false,
          size: 330,
-@@ -191,6 +192,7 @@
-   const table = useMaterialReactTable({
-     columns,
-     data,
-+    getRowId: (row, index) => row.pool_enabled && row.service_id ? row.service_id : String(index),
-     localization: tableLocales,
-     enableColumnResizing: true,
-     enableColumnOrdering: false,
---- a/src/components/dashboard/upstream-servers/upstream-servers-table.tsx
-+++ b/src/components/dashboard/upstream-servers/upstream-servers-table.tsx
-@@ -108,10 +108,10 @@
+@@ -95,9 +97,9 @@
+         header: t('Success Rate'),
+         enableSorting: true,
+         size: 160,
+-        Cell: ({ cell }) => {
++        Cell: ({ cell, row }) => {
+           const rate = cell.getValue<number>();
+-          return <span>{rate} %</span>;
++          return <><span style={{whiteSpace: 'nowrap'}}>{rate} %</span><UpstreamDiagnostics server={row.original} /></>;
+         },
+       },
+       {
+@@ -107,10 +109,10 @@
          size: 140,
          Cell: ({ cell }) => {
            const avgTime = cell.getValue<number>();
@@ -45,3 +75,78 @@
          },
        },
        {
+@@ -191,6 +193,7 @@
+   const table = useMaterialReactTable({
+     columns,
+     data,
++    getRowId: (row, index) => row.pool_enabled && row.service_id ? row.service_id : String(index),
+     localization: tableLocales,
+     enableColumnResizing: true,
+     enableColumnOrdering: false,
+--- /dev/null
++++ b/src/components/dashboard/upstream-servers/upstream-diagnostics.tsx
+@@ -0,0 +1,64 @@
++import type * as React from 'react';
++import { useState } from 'react';
++import { Button, Dialog, DialogTitle, DialogContent, DialogActions } from '@mui/material';
++import { type UpStreamServers } from '@/lib/backend/server';
++import i18n from '@/components/core/i18n';
++
++const labels: Record<string, [string, string]> = {
++  other_result: ['其他上游已先取得结果', 'Another upstream completed first'],
++  deadline: ['查询期限已到', 'Query lifetime elapsed'],
++  budget_or_cancel: ['共享预算用尽或已取消', 'Shared budget exhausted or cancelled'],
++  shutdown: ['服务停止', 'Service stopped'], other: ['其他或未分类', 'Other or unclassified'],
++  unaccepted_result: ['当前服务结果未获接受', 'This service result was not accepted'],
++  unrecorded: ['未记录等待', 'No wait recorded'], rate_limit: ['等待 QPS 额度', 'Waiting for QPS allowance'],
++  cooldown: ['等待冷却', 'Waiting for cooldown'], recovery_probe: ['等待恢复探针', 'Waiting for recovery probe'],
++  no_backend: ['没有可用后端', 'No eligible backend'], send_turn: ['等待发送轮次', 'Waiting for send turn'],
++  inflight_limit: ['等待在途名额', 'Waiting for in-flight slot'], connect_or_write: ['连接或写入未完成', 'Connection or write pending'],
++  scheduler_delay: ['等待调度或重试', 'Waiting for scheduling or retry'], none: ['结算前未记录错误', 'No error recorded before settlement'],
++  http_429: ['HTTP 429', 'HTTP 429'], http_503: ['HTTP 503', 'HTTP 503'], http_other: ['其他 HTTP 错误', 'Other HTTP error'],
++  dns_rcode: ['DNS 错误响应码', 'DNS error RCODE'], dns_callback_rejected: ['DNS 响应未被接受', 'DNS response not accepted'],
++  attempt_timeout: ['发送尝试超时', 'Attempt timed out'], io_or_protocol_error: ['IO 或协议处理错误', 'IO or protocol processing error'],
++};
++
++export function UpstreamDiagnostics({server}: {server: UpStreamServers}): React.JSX.Element | null {
++  const [open, setOpen] = useState(false);
++  const d = server.diagnostics;
++  if (!server.pool_enabled || !d) return null;
++  const zh = i18n.language?.startsWith('zh');
++  const text = (cn: string, en: string): string => zh ? cn : en;
++  const counts = (values: Record<string, number>): React.JSX.Element => {
++    const entries = Object.entries(values).filter(([, value]) => value > 0);
++    return <dl>{entries.length > 0 ? entries.map(([key, value]) => <div key={key}>
++      <dt style={{display: 'inline'}}>{labels[key]?.[zh ? 0 : 1] ?? key}: </dt>
++      <dd style={{display: 'inline', margin: 0}}>{value}</dd>
++    </div>) : <div>0</div>}</dl>;
++  };
++  const success = server.success_count ?? 0, failure = server.failure_count ?? 0;
++  const settled = success + failure;
++  const sentRate = settled ? (success / settled * 100).toFixed(2) + '%' : 'N/A';
++  const loop = d.client_loop;
++  const cpu = typeof loop?.cpu_percent === 'number' && Number.isFinite(loop.cpu_percent) ? loop.cpu_percent.toFixed(2) + '%' : 'N/A';
++  return <>
++    <Button size="small" onClick={() => { setOpen(true); }}>{text('诊断', 'Diagnostics')}</Button>
++    <Dialog open={open} onClose={() => { setOpen(false); }} maxWidth="md" fullWidth>
++      <DialogTitle sx={{overflowWrap: 'anywhere'}}>{server.host} · {text('统计诊断', 'Diagnostics')}</DialogTitle>
++      <DialogContent dividers>
++      <section aria-label={text('服务池统计诊断', 'Service pool diagnostics')} style={{textAlign: 'left', whiteSpace: 'normal', overflowWrap: 'anywhere'}}>
++      <p>{text('表格成功率 = 成功 ÷ 全部查询（含跳过、在途）', 'Table rate = successes / all queries, including skipped and in-flight')}</p>
++      <p>{text('总查询 / 成功 / 已发送未成功 / 未发送 / 在途', 'Queries / successful / sent unsuccessful / unsent / in-flight')}: {server.query_count} / {success} / {failure} / {server.skip_count} / {server.in_flight}</p>
++      <p>{text('已发送且结算的成功占比', 'Success share of sent settled queries')}: {sentRate} ({text('仍含取消，不能等同网络成功率', 'includes cancellations; not a network reliability metric')})</p>
++      <p>QPS: {d.qps || text('不限', 'unlimited')}; {text('固定冷却', 'Fixed cooldown')}: {d.cooldown_ms} ms</p>
++      <strong>{text('已发送未成功：结束原因', 'Sent unsuccessful: terminal context')}</strong>{counts(d.failure_end)}
++      <strong>{text('未发送：结束原因', 'Unsent: terminal context')}</strong>{counts(d.skip_end)}
++      <strong>{text('未发送：最后等待状态', 'Unsent: last wait state')}</strong>{counts(d.skip_wait)}
++      <strong>{text('未成功：结算前最后记录事件', 'Unsuccessful: last recorded event')}</strong>{counts(d.failure_last_event)}
++      <strong>{text('错误事件累计（可重复，不与查询数相加）', 'Error events (may repeat; separate from query totals)')}</strong>{counts(d.events)}
++      <p>{text('最后记录事件不一定是最终根因；各维度分别统计', 'Last observed event is not necessarily the root cause; dimensions are separate')}</p>
++      <p>{text('全局客户端线程 CPU（单核）', 'Global client thread CPU (one core)')}: {cpu}; {text('采样窗口 / 距今', 'Sample window / age')}: {loop?.sample_wall_ms ?? 0} / {loop?.sample_age_ms ?? 0} ms</p>
++      <p>{text('零等待空返回 / 循环 / 唤醒累计', 'Empty zero-wait polls / iterations / wakeups')}: {loop?.zero_wait_no_events ?? 0} / {loop?.iterations ?? 0} / {loop?.wakeups ?? 0}</p>
++      </section>
++      </DialogContent>
++      <DialogActions><Button onClick={() => { setOpen(false); }}>{text('关闭', 'Close')}</Button></DialogActions>
++    </Dialog>
++  </>;
++}

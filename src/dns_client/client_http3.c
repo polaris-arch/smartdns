@@ -20,6 +20,7 @@
 
 #include "client_http3.h"
 #include "upstream_policy.h"
+#include "upstream_service.h"
 #include "client_http3_control.h"
 #include "client_socket.h"
 #include "client_quic.h"
@@ -145,6 +146,7 @@ parse_next_section:
 		tlog(TLOG_DEBUG, "http3 server query from %s:%d failed, server return http code : %d, %s", server_info->ip,
 			 server_info->port, http_head_get_httpcode(http_head), http_head_get_httpcode_msg(http_head));
 		int status = http_head_get_httpcode(http_head);
+        _dns_service_diagnostic_http(conn_stream->query, server_info, status);
 		if (status == 429 || status == 503) {
 			_dns_policy_http_error(server_info, status, http_head_get_fields_value(http_head, "retry-after"));
 		} else {

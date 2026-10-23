@@ -21,6 +21,7 @@ struct dns_service_observation {
     struct dns_upstream_service *service;
     unsigned long first_sent, accepted_tick;
     uint64_t sends;
+    unsigned last_wait, end_reason, last_event;
     unsigned terminal, success, waiting, writer_pending, settled, active_attempts, hint_queued, registered;
 };
 #ifdef TEST
@@ -47,6 +48,7 @@ struct dns_upstream_service {
     unsigned member_count, selected_count, connections, active_attempts;
     unsigned discovered_count, rejected_count, stale;
     unsigned long freshness_until, next_eligible;
+    unsigned next_wait;
     uint64_t member_sequence, cursor, turn_sequence;
     unsigned turn_state, cancel_requested, wake_pending, stopping;
     struct dns_server_info *turn_endpoint;
@@ -57,6 +59,7 @@ struct dns_upstream_service {
     struct list_head waiters; /* Ready observations only, not all in-flight work. */
     struct dns_service_observation *hints, *deferred_hints;
     struct dns_upstream_service_snapshot_v1 stats;
+    struct dns_upstream_service_diagnostics_v1 diagnostics;
     unsigned freshness_known; /* Observation only: published positive-membership TTL. */
 };
 void _dns_service_get(struct dns_upstream_service *s);
@@ -84,6 +87,12 @@ void _dns_service_endpoint_failure(struct dns_server_info *endpoint);
 void _dns_service_endpoint_ready(struct dns_server_info *endpoint);
 int _dns_service_endpoint_eligible(struct dns_server_info *endpoint, unsigned long now);
 int _dns_service_has_ecs(struct dns_upstream_service *s);
+void _dns_service_diagnostic_event(struct dns_query_struct *q, struct dns_server_info *ep, unsigned event);
+void _dns_service_diagnostic_http(struct dns_query_struct *q, struct dns_server_info *ep, int status);
+void _dns_client_loop_diagnostic_start(unsigned long now);
+void _dns_client_loop_diagnostic_poll(unsigned long now, int timeout, int events);
+void _dns_client_loop_diagnostic_wake(void);
+void _dns_client_loop_diagnostic_period(void);
 
 #ifdef TEST
 void _dns_service_snapshot_test(struct dns_upstream_service *s, struct dns_upstream_service_snapshot_v1 *out);

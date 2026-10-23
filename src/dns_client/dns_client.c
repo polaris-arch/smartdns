@@ -175,9 +175,12 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 		ret = query->callback(query->domain, DNS_QUERY_RESULT, server_info, packet, inpacket, inpacket_len,
 							  query->user_ptr);
 
-        _dns_service_query_result(query, server_info,
-            (ret == DNS_CLIENT_ACTION_OK || ret == DNS_CLIENT_ACTION_OK_WAIT) &&
-            (packet->head.rcode == DNS_RC_NOERROR || packet->head.rcode == DNS_RC_NXDOMAIN));
+        int accepted = (ret == DNS_CLIENT_ACTION_OK || ret == DNS_CLIENT_ACTION_OK_WAIT) &&
+            (packet->head.rcode == DNS_RC_NOERROR || packet->head.rcode == DNS_RC_NXDOMAIN);
+        if (!accepted) _dns_service_diagnostic_event(query, server_info,
+            packet->head.rcode != DNS_RC_NOERROR && packet->head.rcode != DNS_RC_NXDOMAIN ?
+            DNS_EVENT_DNS_RCODE : DNS_EVENT_DNS_REJECTED);
+        _dns_service_query_result(query, server_info, accepted);
 		if (ret == DNS_CLIENT_ACTION_RETRY || ret == DNS_CLIENT_ACTION_DROP) {
 			/* remove this result */
 			_dns_replied_check_remove(query, server_info);
@@ -188,7 +191,10 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 		} else {
             _dns_attempt_replied(query, server_info);
 			if (ret == DNS_CLIENT_ACTION_OK) {
+				pthread_mutex_lock(&query->lock);
+                query->result_service = server_info->service;
 				query->has_result = 1;
+                pthread_mutex_unlock(&query->lock);
 			} else if (ret != DNS_CLIENT_ACTION_OK_WAIT) {
 				tlog(TLOG_DEBUG, "query %s result is invalid, %d", query->domain, ret);
 			}
@@ -574,6 +580,7 @@ int dns_client_query(const char *domain, int qtype, dns_client_callback callback
 		dns_query_budget_get(query->budget);
 	}
 	query->has_result = 0;
+    query->result_service = NULL;
 	query->server_group = query->bootstrap_only ? _dns_client_get_group("bootstrap-dns") :
         _dns_client_get_dnsserver_group(group_name);
     if (query->bootstrap_only && (!query->server_group || list_empty(&query->server_group->head) ||
@@ -765,6 +772,7 @@ static void *_dns_client_work(void *arg)
 	now = get_tick_count();
 	start_time = now;
 	expect_time = now + sleep;
+    _dns_client_loop_diagnostic_start(now);
 
 	while (atomic_read(&client.run)) {
 		now = get_tick_count();
@@ -780,6 +788,7 @@ static void *_dns_client_work(void *arg)
 
 			expect_time = start_time + (msec + 1) * sleep;
 			_dns_client_period_run(msec);
+            _dns_client_loop_diagnostic_period();
 			msec++;
 
 			/* When client is idle, the sleep time is 1000ms, to reduce CPU usage */
@@ -802,6 +811,7 @@ static void *_dns_client_work(void *arg)
         if (service_due <= now) sleep_time = 0;
         else if (service_due - now < (unsigned long)sleep_time) sleep_time = service_due - now;
 		num = epoll_wait(client.epoll_fd, events, DNS_MAX_EVENTS, sleep_time);
+        _dns_client_loop_diagnostic_poll(get_tick_count(), sleep_time, num);
 		if (num < 0) {
 			usleep(100000);
 			continue;
@@ -816,6 +826,7 @@ static void *_dns_client_work(void *arg)
 			struct dns_server_info *server_info = (struct dns_server_info *)event->data.ptr;
 			if (event->data.fd == client.fd_wakeup) {
 				_dns_client_clear_wakeup_event();
+                _dns_client_loop_diagnostic_wake();
                 /* New work must leave the idle 1s cadence. Restore the existing
                  * 100ms scan grid without resetting any query/attempt deadline. */
                 unsigned long wake_now = get_tick_count();
@@ -838,8 +849,10 @@ static void *_dns_client_work(void *arg)
                     server_info->active_attempts);
             pthread_mutex_unlock(&server_info->lock);
             if (live_event && _dns_client_process(server_info, event, now) < 0 && server_info->service &&
-                !_dns_policy_service_cooldown(server_info->service, get_tick_count()))
+                !_dns_policy_service_cooldown(server_info->service, get_tick_count())) {
+                _dns_service_diagnostic_event(NULL, server_info, DNS_EVENT_IO_OR_PROTOCOL);
                 _dns_service_endpoint_failure(server_info);
+            }
             _dns_services_flush_pending();
 		}
         _dns_client_event_batch_unpin(events, num);

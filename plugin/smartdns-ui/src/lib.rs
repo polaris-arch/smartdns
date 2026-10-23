@@ -19,6 +19,7 @@
 pub mod data_server;
 pub mod data_stats;
 pub mod data_upstream_server;
+pub mod data_upstream_diagnostics;
 pub mod db;
 pub mod http_api_msg;
 pub mod http_error;

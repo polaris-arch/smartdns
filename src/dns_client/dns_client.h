@@ -325,6 +325,7 @@ struct dns_query_struct {
 
 	/* has result */
 	int has_result;
+    struct dns_upstream_service *result_service; /* NULL for an ordinary endpoint result. Observation owns service lifetime. */
 
 	/* ECS */
 	struct dns_client_ecs ecs;

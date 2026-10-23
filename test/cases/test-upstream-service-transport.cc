@@ -142,6 +142,7 @@ public:
     std::atomic<unsigned> requests{0}, connections{0};
     std::function<bool()> on_request;
     bool address_negatives = false;
+    const char *retry_after = "1";
     bool Start(const char *ip, unsigned port, bool h2) {
         h2_ = h2;
         if (!EnsureHTTP2TestCert()) return false;
@@ -266,7 +267,7 @@ private:
                         requests++; bool throttle = on_request && on_request();
                         std::vector<uint8_t> response; std::string error;
                         if (throttle) {
-                            http2_header_pair headers[] = {{"retry-after", "1"}, {"content-length", "0"}};
+                            http2_header_pair headers[] = {{"retry-after", retry_after}, {"content-length", "0"}};
                             http2_stream_set_response(stream, 429, headers, 2);
                         } else {
                             if (!BuildDnsAResponse(it->second, "192.0.2.89", &response, &error, false, address_negatives)) { run_ = false; break; }
@@ -315,9 +316,10 @@ bool query_udp(const std::string &name, unsigned port, int qtype = DNS_T_A)
     return good;
 }
 
-void transport_case(bool h2, bool throttle, unsigned nodata_rate = 0) {
+void transport_case(bool h2, bool throttle, unsigned nodata_rate = 0, unsigned cooldown_ms = 0) {
     PoolTlsPeer first, second;
     first.address_negatives = second.address_negatives = nodata_rate != 0;
+    if (cooldown_ms) first.retry_after = second.retry_after = "30";
     std::mutex lock; std::vector<std::chrono::steady_clock::time_point> wire_times;
     std::vector<unsigned> wire_backend;
     auto observe = [&](unsigned backend) {
@@ -334,6 +336,7 @@ void transport_case(bool h2, bool throttle, unsigned nodata_rate = 0) {
         "resolver.transport.example:" + std::to_string(port) + (h2 ? "/dns-query" : "") +
         " -upstream-ip-pool -host-ip 127.0.0.1,127.0.0.2 -no-check-certificate" + (h2 ? " -alpn h2" : "") +
         (nodata_rate ? " -max-query-rate " + std::to_string(nodata_rate) + " -query-burst 1" : "") +
+        (cooldown_ms ? " -upstream-cooldown-ms " + std::to_string(cooldown_ms) : "") +
         "\ncache-size 0\ncache-persist no\nprefetch-domain no\nserve-expired no\n"
         "dualstack-ip-selection no\nspeed-check-mode none\nresponse-mode fastest-response\n";
     ASSERT_TRUE(resolver.Start(config));
@@ -358,7 +361,8 @@ void transport_case(bool h2, bool throttle, unsigned nodata_rate = 0) {
     for (size_t i = 1; i < wire_backend.size(); i++) EXPECT_NE(wire_backend[i - 1], wire_backend[i]);
     if (throttle) {
         ASSERT_GE(wire_times.size(), 2U);
-        EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(wire_times[1] - wire_times[0]).count(), 900);
+        EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(wire_times[1] - wire_times[0]).count(),
+            cooldown_ms ? cooldown_ms - 10 : 900);
     }
 }
 } // namespace
@@ -369,6 +373,10 @@ TEST(UpstreamServiceTransport, RealTlsDualBackendRoundRobinAndConnectionReuse) {
 TEST(UpstreamServiceTransport, RealH2DualBackendShared429CooldownAndRoundRobin) {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT({ transport_case(true, true); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
+}
+TEST(UpstreamServiceTransport, RealH2ConfiguredCooldownOverridesLongRetryAfter) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT({ transport_case(true, true, 0, 250); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
 }
 
 TEST(UpstreamServiceTransport, RealTlsNodataCompletesServiceWithoutDuplicateAttempt) {

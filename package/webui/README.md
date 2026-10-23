@@ -9,7 +9,13 @@ fresh download from that exact URL both hashed to
 This replaces the moving `main.zip` generic build and OpenWrt's older
 `35cbf4a1940f5dd32670c69bd5cc02437ad073e7` webui pin.
 
-The three optional REST fields are `service_id`, `pool_enabled`, `endpoint_ips`.
+The optional REST fields include `service_id`, `pool_enabled`, `endpoint_ips` and
+`diagnostics`. The diagnostic disclosure keeps the existing success-rate formula
+and shows coherent query totals, separate terminal contexts, last wait states,
+last observed errors, event counts and the global client-thread CPU sample.
+Each outcome dimension closes to its own failure/skip total; events may repeat
+and must never be added to query counts. Fixed HTTP cooldown is 1000ms by default,
+configurable from 1 to 10000ms; Retry-After is recorded as evidence only.
 The mounted upstream table keeps one row per API service, shows its domain in
 Host and actual endpoint IP list in IP, and uses the stable service ID as the
 MaterialReactTable row identity. Ordinary rows retain the upstream's default

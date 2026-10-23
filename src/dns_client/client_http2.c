@@ -711,6 +711,7 @@ static int _dns_client_http2_process_stream_one(struct dns_server_info *server_i
 	int status = http2_stream_get_status(http2_stream);
     if (status >= 100 && status < 200 && status != 101) return 0;
 	if (status > 0 && status != 200) {
+        _dns_service_diagnostic_http(conn_stream->query, server_info, status);
 		tlog(TLOG_DEBUG, "http2 server query from %s:%d failed, server return http code: %d", server_info->ip,
 			 server_info->port, status);
 		if (status == 429 || status == 503) {

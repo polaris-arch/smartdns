@@ -426,6 +426,7 @@ struct dns_servers {
 	int tcp_keepalive;
 	unsigned int max_query_rate;
 	unsigned int query_burst;
+	unsigned int upstream_cooldown_ms;
 	unsigned int max_concurrent_queries;
 	unsigned int upstream_round_robin;
 	unsigned int max_upstream_connections;

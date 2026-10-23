@@ -189,6 +189,7 @@ static int _dns_client_http1_response(struct dns_server_info *server, struct htt
     int ret = 0;
     if (query) {
         if (code != 200) {
+            _dns_service_diagnostic_http(query, server, code);
             _dns_attempt_retire(query, server, generation);
             _dns_client_retry_dns_query(query);
         } else if (!query->terminal) {

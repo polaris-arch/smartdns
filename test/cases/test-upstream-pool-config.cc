@@ -167,3 +167,17 @@ TEST_F(UpstreamPoolConfig, LegacyIdenticalGroupSetsKeepPointersAndQuotaValues) {
     EXPECT_EQ(group.servers[0], &dns_conf.servers[0]); EXPECT_EQ(group.servers[1], &dns_conf.servers[1]);
     hlist_del_init(&group.node);
 }
+
+TEST_F(UpstreamPoolConfig, FixedCooldownMillisecondsDefaultBoundsAndStrictGrammar) {
+    ASSERT_EQ(parse({"server-https", "https://resolver.example/dns-query"}), 0);
+    EXPECT_EQ(dns_conf.servers[0].upstream_cooldown_ms, 1000U);
+    for (const char *value : {"1", "1000", "10000"}) {
+        reset(); ASSERT_EQ(parse({"server-https", "https://resolver.example/", "-upstream-cooldown-ms", value}), 0);
+        EXPECT_EQ(dns_conf.servers[0].upstream_cooldown_ms, std::stoul(value));
+    }
+    for (const char *value : {"0", "10001", "-1", "+1", "1.5", "1e3", "1000ms", "", " 1", "18446744073709551616"}) {
+        reset(); EXPECT_LT(parse({"server-https", "https://resolver.example/", "-upstream-cooldown-ms", value}), 0) << value;
+    }
+    reset(); ASSERT_EQ(parse({"server-https", "https://one.example/", "-quota-group", "shared", "-upstream-cooldown-ms", "1000"}), 0);
+    EXPECT_LT(parse({"server-https", "https://two.example/", "-quota-group", "shared", "-upstream-cooldown-ms", "2000"}), 0);
+}

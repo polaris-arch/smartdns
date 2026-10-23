@@ -29,13 +29,14 @@ struct ServiceState {
     static std::vector<dns_upstream_service *> &Live() {
         static std::vector<dns_upstream_service *> live; return live;
     }
-    ServiceState(unsigned n = 2, unsigned cap = 0, const char *quota = "", unsigned rate = 0, unsigned burst = 0)
+    ServiceState(unsigned n = 2, unsigned cap = 0, const char *quota = "", unsigned rate = 0, unsigned burst = 0, unsigned cooldown = 100)
       : endpoints(new dns_server_info[n]{}), count(n) {
         atomic_set(&s.refs, 1); pthread_mutex_init(&s.lock, nullptr); pthread_mutex_init(&s.turn_lock, nullptr);
         INIT_LIST_HEAD(&s.list); INIT_LIST_HEAD(&s.timer); INIT_LIST_HEAD(&s.waiters);
         s.started = 1; s.timer_due = ULONG_MAX; s.config.max_backends = n;
         s.type = DNS_SERVER_HTTPS; s.flags.type = s.type; s.flags.max_upstream_connections = cap;
         s.flags.max_query_rate = rate; s.flags.query_burst = burst;
+        s.flags.upstream_cooldown_ms = cooldown; // explicit fixture timing; zero exercises the production default
         strncpy(s.flags.quota_group, quota, sizeof(s.flags.quota_group) - 1);
         EXPECT_EQ(_dns_policy_service_init(&s), 0);
         for (unsigned i = 0; i < n; i++) {
@@ -215,7 +216,7 @@ TEST(UpstreamServiceState, NewEpochRejectsOldUnsentOwnerAndAllowsExactlyOneProbe
     EXPECT_EQ(_dns_attempt_wire_begin(&old.q, old_ep, old_gen), DNS_ADMIT_DONE);
     Retire(old, old_ep); s.Flush();
     EXPECT_EQ(Pick(s, probe), nullptr);
-    usleep(150000); // minimum existing recovery cooldown, no traffic/load loop
+    usleep(150000); // configured 100ms fixture cooldown, no traffic/load loop
     auto *probe_ep = Pick(s, probe); ASSERT_EQ(probe_ep, &s.endpoints[0]);
     EXPECT_EQ(Pick(s, waiting), nullptr); // probe held before handshake/first write
     Positive(s, probe, probe_ep); EXPECT_EQ(Pick(s, waiting), nullptr); // lease committed, recovery still exclusive
@@ -516,4 +517,64 @@ TEST(UpstreamServiceState, SnapshotFreshnessHasNoInfiniteIntegerSentinel) {
     _dns_service_snapshot_test(&state.s, &snapshot);
     EXPECT_EQ(snapshot.freshness_kind, DNS_FRESHNESS_FINITE);
     EXPECT_EQ(snapshot.freshness_remaining_ms, 0U);
+}
+
+TEST(UpstreamServiceState, FixedCooldownDefaultsAndDoesNotGrowOrFollowRetryAfter) {
+    for (unsigned configured : {0U, 1U, 1000U, 10000U}) {
+        ServiceState s(2, 0, "", 0, 0, configured);
+        unsigned expected = configured ? configured : 1000;
+        for (const char *header : {"0", "3600", "invalid", "18446744073709551615000"}) {
+            unsigned long before = get_tick_count();
+            _dns_policy_http_error(&s.endpoints[0], 429, header);
+            unsigned long after = get_tick_count();
+            auto remaining = _dns_policy_service_cooldown(&s.s, before);
+            EXPECT_GE(remaining, expected);
+            EXPECT_LE(remaining, expected + after - before);
+            unsigned reason = DNS_WAIT_NONE;
+            EXPECT_GT(_dns_policy_service_wait_reason(&s.s, before, &reason), 0U);
+            EXPECT_EQ(reason, DNS_WAIT_COOLDOWN);
+        }
+        EXPECT_EQ(s.s.diagnostics.events[DNS_EVENT_HTTP_429], 4U);
+    }
+}
+TEST(UpstreamServiceState, DiagnosticDimensionsDistinguishOtherWinnerCoolingAndRejectedReply) {
+    ServiceState s;
+    { ServiceQuery canceled(s); auto *ep = Pick(s, canceled); ASSERT_NE(ep, nullptr);
+      Positive(s, canceled, ep); canceled.q.has_result = 1; Retire(canceled, ep); }
+    EXPECT_EQ(s.s.stats.failure_count, 1U);
+    EXPECT_EQ(s.s.diagnostics.failure_end[DNS_END_OTHER_RESULT], 1U);
+    EXPECT_EQ(s.s.diagnostics.failure_last_event[0], 1U);
+    _dns_policy_http_error(&s.endpoints[0], 429, "3600");
+    { ServiceQuery skipped(s); EXPECT_EQ(Pick(s, skipped), nullptr); skipped.q.has_result = 1; }
+    EXPECT_EQ(s.s.stats.skip_count, 1U);
+    EXPECT_EQ(s.s.diagnostics.skip_end[DNS_END_OTHER_RESULT], 1U);
+    EXPECT_EQ(s.s.diagnostics.skip_wait[DNS_WAIT_COOLDOWN], 1U);
+    EXPECT_EQ(s.s.diagnostics.events[DNS_EVENT_HTTP_429], 1U);
+}
+TEST(UpstreamServiceState, DiagnosticsRecordLastObservedErrorSeparatelyFromTerminalContext) {
+    ServiceState s;
+    { ServiceQuery rejected(s); auto *ep = Pick(s, rejected); ASSERT_NE(ep, nullptr);
+      Positive(s, rejected, ep);
+      _dns_service_diagnostic_event(&rejected.q, ep, DNS_EVENT_DNS_REJECTED);
+      _dns_service_query_result(&rejected.q, ep, 0);
+      _dns_attempt_replied(&rejected.q, ep); Retire(rejected, ep);
+      rejected.q.created_tick = get_tick_count() - DNS_QUERY_RETRY * DNS_QUERY_TIMEOUT;
+    }
+    EXPECT_EQ(s.s.stats.failure_count, 1U);
+    EXPECT_EQ(s.s.diagnostics.failure_end[DNS_END_DEADLINE], 1U);
+    EXPECT_EQ(s.s.diagnostics.failure_last_event[DNS_EVENT_DNS_REJECTED + 1], 1U);
+    EXPECT_EQ(s.s.diagnostics.events[DNS_EVENT_DNS_REJECTED], 1U);
+}
+
+TEST(UpstreamServiceState, DiagnosticResultProvenanceDoesNotCallOwnRejectedResultAnotherWinner) {
+    ServiceState s;
+    { ServiceQuery rejected(s); auto *ep = Pick(s, rejected); ASSERT_NE(ep, nullptr);
+      Positive(s, rejected, ep); _dns_service_diagnostic_event(&rejected.q, ep, DNS_EVENT_DNS_RCODE);
+      _dns_service_query_result(&rejected.q, ep, 0);
+      rejected.q.has_result = 1; rejected.q.result_service = &s.s;
+      _dns_attempt_replied(&rejected.q, ep); Retire(rejected, ep);
+    }
+    EXPECT_EQ(s.s.stats.failure_count, 1U);
+    EXPECT_EQ(s.s.diagnostics.failure_end[DNS_END_UNACCEPTED_RESULT], 1U);
+    EXPECT_EQ(s.s.diagnostics.failure_end[DNS_END_OTHER_RESULT], 0U);
 }

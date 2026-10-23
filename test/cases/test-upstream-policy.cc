@@ -22,7 +22,7 @@ namespace {
 struct Endpoint {
     dns_server_info server{};
     dns_query_struct query{};
-    Endpoint(unsigned rate = 0, unsigned burst = 0, const char *group = "") {
+    Endpoint(unsigned rate = 0, unsigned burst = 0, const char *group = "", unsigned cooldown = 100) {
         pthread_mutexattr_t attr;
         pthread_mutexattr_init(&attr);
         pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
@@ -36,6 +36,7 @@ struct Endpoint {
         server.type = DNS_SERVER_HTTPS;
         server.flags.max_query_rate = rate;
         server.flags.query_burst = burst;
+        server.flags.upstream_cooldown_ms = cooldown; // explicit short fixture interval, not the production default
         strncpy(server.flags.quota_group, group, sizeof(server.flags.quota_group)-1);
         EXPECT_EQ(_dns_policy_attach(&server), 0);
     }
@@ -515,20 +516,16 @@ TEST(UpstreamPolicy, DatagramAndStreamShareRecoveryLease) {
     _dns_attempt_replied(&udp.query, &udp.server);
     EXPECT_EQ(https.Wire(), DNS_ADMIT_OK);
 }
-TEST(UpstreamPolicy, RecoveryPreservesExplicitRateAndRetryAfterMinimum) {
-    Endpoint a(1, 1, "recover-rate"), b(1, 1, "recover-rate");
-    _dns_policy_http_error(&a.server, 429, "1");
-    usleep(150000);
-    EXPECT_EQ(a.Begin(), DNS_ADMIT_WAIT); // server minimum is not local 100ms
-    // Separate policy lets the fast recovery fixture stay bounded.
-    Endpoint probe(1, 1, "recover-rate-fast"), next(1, 1, "recover-rate-fast");
-    _dns_policy_http_error(&probe.server, 429, "0");
-    usleep(150000);
+TEST(UpstreamPolicy, RecoveryPreservesExplicitRateAndFixedCooldown) {
+    Endpoint probe(1, 1, "recover-rate-fixed"), next(1, 1, "recover-rate-fixed");
+    _dns_policy_http_error(&probe.server, 429, "30");
+    EXPECT_EQ(probe.Begin(), DNS_ADMIT_WAIT);
+    usleep(150000); // explicitly configured 100ms; upstream header does not override it
     ASSERT_EQ(probe.Begin(), DNS_ADMIT_OK);
     ASSERT_EQ(probe.Wire(), DNS_ADMIT_OK); probe.Progress();
     ASSERT_EQ(probe.Retire(), 1);
     _dns_attempt_replied(&probe.query, &probe.server);
-    EXPECT_EQ(next.Begin(), DNS_ADMIT_WAIT); // successful probe does not refill rate tokens
+    EXPECT_EQ(next.Begin(), DNS_ADMIT_WAIT); // recovery never refills QPS tokens
 }
 TEST(UpstreamPolicy, RecoveryGatesProductionTcpWritesAcrossSharedEndpoints) {
     Endpoint a(0, 0, "recover-wire"), b(0, 0, "recover-wire");

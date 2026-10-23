@@ -195,6 +195,7 @@ struct client_dns_server_flags {
 	int tcp_keepalive;
 	unsigned int max_query_rate;
 	unsigned int query_burst;
+	unsigned int upstream_cooldown_ms; /* 0 means default 1000ms; explicit configuration is 1..10000ms. */
 	unsigned int max_concurrent_queries;
 	unsigned int upstream_round_robin;
     /* Load-local discriminator for separately declared pool services. Not identity material. */

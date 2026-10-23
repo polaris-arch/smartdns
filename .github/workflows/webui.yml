@@ -2,9 +2,9 @@ name: WebUI CI
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, polaris-main ]
   pull_request:
-    branches: [ master ]
+    branches: [ master, polaris-main ]
   workflow_dispatch:
     inputs:
       full_validation:

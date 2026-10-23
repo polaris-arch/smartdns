@@ -145,6 +145,7 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		{"max-upstream-connections", required_argument, NULL, 272},
 		{"upstream-ip-pool", no_argument, NULL, 273},
 		{"max-upstream-backends", required_argument, NULL, 274},
+		{"upstream-cooldown-ms", required_argument, NULL, 275},
 		{NULL, no_argument, NULL, 0}
 	};
 	/* clang-format on */
@@ -356,6 +357,16 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 			server->fallback = 1;
 			break;
 		}
+		case 275: {
+            if (!*optarg) return -1;
+            for (const char *digit = optarg; *digit; digit++) if (*digit < '0' || *digit > '9') return -1;
+            char *end = NULL;
+            errno = 0;
+            unsigned long value = strtoul(optarg, &end, 10);
+            if (errno || *end || value < 1 || value > 10000) return -1;
+            server->upstream_cooldown_ms = value;
+            break;
+        }
 		case 267:
 		case 268:
 		case 269: {
@@ -428,12 +439,14 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		} else if (server->max_upstream_connections) return -1;
 	}
 	if (server->query_burst && !server->max_query_rate) return -1;
+	if (!server->upstream_cooldown_ms) server->upstream_cooldown_ms = 1000;
 	if (server->max_query_rate && !server->query_burst) server->query_burst = 1;
 	if (server->quota_group[0]) {
 		for (int n = 0; n < index; n++) {
 			struct dns_servers *other = &dns_conf.servers[n];
 			if (strcmp(other->quota_group, server->quota_group) == 0 &&
 				(other->max_query_rate != server->max_query_rate || other->query_burst != server->query_burst ||
+                 other->upstream_cooldown_ms != server->upstream_cooldown_ms ||
 				 other->upstream_round_robin != server->upstream_round_robin ||
 				 (server->upstream_round_robin && other->max_upstream_connections != server->max_upstream_connections))) {
 				tlog(TLOG_ERROR, "conflicting rate/burst/round-robin/connection limit for quota group %s", server->quota_group);

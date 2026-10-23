@@ -1,2 +1,3 @@
-40490f00285705b745d33ab05450bc5889f55f2f6861beabc9a76afa6dbaf634  src/lib/backend/server.ts
-b94f3f8c5e7515fa03fd4ea61d34bdc6ea8509b9609750b7bcb187478c5d99be  src/components/dashboard/upstream-servers/upstream-servers-table.tsx
+e664020392dbd4ccdeb6bd6d0687ddf53bc8aba043fed955e4d90463516a0d85  src/lib/backend/server.ts
+10691d2145e33f3963e08c517ad7488fe754c11cf951a7ccdf5adf1e2031078e  src/components/dashboard/upstream-servers/upstream-servers-table.tsx
+8ba63e53cf4e5d7eb15a6050f2cd075699e7f83791673b38e6113cc872017bcb  src/components/dashboard/upstream-servers/upstream-diagnostics.tsx

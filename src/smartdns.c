@@ -125,7 +125,7 @@ static void _show_version(void)
 	char str_ver[256] = {0};
 	_smartdns_get_version(str_ver, sizeof(str_ver));
 	printf("smartdns %s\n", str_ver);
-    printf("features: smartdns-upstream-service-pool-v1\n");
+    printf("features: smartdns-upstream-service-pool-v1 smartdns-upstream-fixed-cooldown-v1\n");
 }
 
 static int _smartdns_load_from_resolv_file(const char *resolv_file)
@@ -246,6 +246,7 @@ static int _smartdns_prepare_server_flags(struct client_dns_server_flags *flags,
 	flags->tcp_keepalive = server->tcp_keepalive;
 	flags->max_query_rate = server->max_query_rate;
 	flags->query_burst = server->query_burst;
+	flags->upstream_cooldown_ms = server->upstream_cooldown_ms;
 	flags->max_concurrent_queries = server->max_concurrent_queries;
 	flags->upstream_round_robin = server->upstream_round_robin;
 	flags->max_upstream_connections = server->max_upstream_connections;

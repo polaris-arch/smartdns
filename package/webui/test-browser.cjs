@@ -136,6 +136,7 @@ async function capture(label) {
       assert.equal(await cell.count(), 1);
       const tr = cell.locator('xpath=ancestor::tr');
       assert((await tr.textContent()).includes(row.host));
+      if (row.diagnostics) assert.equal(await tr.getByRole('button', { name: /诊断|Diagnostics/ }).count(), 1);
     }
     const normal = page.locator('tbody tr').filter({ hasText: '127.0.0.9' });
     assert.equal(await normal.count(), 1);
@@ -146,6 +147,35 @@ async function capture(label) {
   stage = 'initial table assertions';
   await assertRows();
   await capture('upstream-initial');
+  if (pools[0].diagnostics) {
+    stage = 'actual service diagnostic disclosure';
+    const tr = page.getByText(pools[0].endpoint_ips.join(', '), { exact: true }).locator('xpath=ancestor::tr');
+    const button = tr.getByRole('button', { name: /诊断|Diagnostics/ });
+    await button.click();
+    const dialog = page.getByRole('dialog');
+    const section = dialog.locator('section[aria-label]');
+    await section.waitFor({ state: 'visible' });
+    assert((await section.textContent()).includes(pools[0].diagnostics.cooldown_ms + ' ms'));
+    assert.match(await section.textContent(), /客户端线程 CPU|client thread CPU/);
+    const bounds = await dialog.boundingBox();
+    assert(bounds && bounds.width >= 500 && bounds.x >= 0 && bounds.x + bounds.width <= 1600);
+    const contentBounds = await section.evaluate(el => ({content: el.scrollWidth, viewport: el.clientWidth}));
+    assert(contentBounds.content <= contentBounds.viewport + 1, 'diagnostic content must not be clipped by its cell');
+    await capture('upstream-diagnostics');
+    await dialog.getByRole('button', { name: /关闭|Close/ }).click();
+    await dialog.waitFor({ state: 'hidden' });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await button.click();
+    await dialog.waitFor({ state: 'visible' });
+    const mobile = await dialog.boundingBox();
+    assert(mobile && mobile.x >= 0 && mobile.x + mobile.width <= 390);
+    const mobileContent = await section.evaluate(el => ({content: el.scrollWidth, viewport: el.clientWidth}));
+    assert(mobileContent.content <= mobileContent.viewport + 1, 'mobile diagnostic text must remain readable');
+    await capture('upstream-diagnostics-mobile');
+    await dialog.getByRole('button', { name: /关闭|Close/ }).click();
+    await dialog.waitFor({ state: 'hidden' });
+    await page.setViewportSize({ width: 1600, height: 1100 });
+  }
   stage = 'locate real toolbar refresh';
   // Production MUI deliberately omits SvgIcon data-testid. Use the actual
   // Tooltip-provided accessible name, never a development-only icon marker.
