@@ -46,7 +46,8 @@ tokio-tungstenite = "0.23.1"
 tempfile = "3.27.0"
 
 [build-dependencies]
-bindgen = "0.69.5"
+# LLVM 22 forward declarations need rust-lang/rust-bindgen#3264's fix.
+bindgen = "=0.72.1"
 
 [profile.release-optmize-size]
 inherits = "release"
