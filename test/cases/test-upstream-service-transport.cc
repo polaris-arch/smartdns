@@ -22,6 +22,7 @@ extern "C" {
 #include <memory>
 #include <mutex>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <poll.h>
@@ -147,6 +148,7 @@ public:
     std::atomic<unsigned> requests{0}, connections{0};
     std::function<bool()> on_request;
     bool address_negatives = false;
+    bool tcp_nodelay = false;
     bool close_after_reply = false;
     const char *retry_after = "1";
     bool Start(const char *ip, unsigned port, bool h2) {
@@ -176,7 +178,10 @@ public:
                 pollfd p{fd_, POLLIN, 0};
                 if (poll(&p, 1, 20) <= 0 || !(p.revents & POLLIN)) continue;
                 int fd = accept4(fd_, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
-                if (fd >= 0) workers_.emplace_back(&PoolTlsPeer::Serve, this, fd);
+                if (fd >= 0) {
+                    if (tcp_nodelay) { int yes=1;setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&yes,sizeof(yes)); }
+                    workers_.emplace_back(&PoolTlsPeer::Serve, this, fd);
+                }
             }
         });
         return true;
@@ -529,6 +534,9 @@ TEST(UpstreamServiceTransport, DualFamily40BalancesPerIpAndSharesQps){
 namespace {
 void capped_reuse_case(unsigned rate){
     PoolTlsPeer a,b,c,d;
+    // Measure scheduler throughput, without server-side Nagle/delayed-ACK
+    // coupling across the separate H2 HEADERS and DATA writes.
+    a.tcp_nodelay=b.tcp_nodelay=c.tcp_nodelay=d.tcp_nodelay=true;
     ASSERT_TRUE(a.Start("127.0.0.1",62974,true));ASSERT_TRUE(b.Start("127.0.0.2",62974,true));
     ASSERT_TRUE(c.Start("127.0.0.3",62974,true));ASSERT_TRUE(d.Start("127.0.0.4",62974,true));
     smartdns::Server resolver(smartdns::Server::CREATE_MODE_THREAD);
@@ -544,7 +552,9 @@ void capped_reuse_case(unsigned rate){
         dns_upstream_service_snapshot_v1 info{};ASSERT_EQ(dns_client_get_service_snapshot_v1(&info,1),1);
         if(info.connection_count>max_connections)max_connections=info.connection_count;EXPECT_LE(info.connection_count,2U);
     }
-    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count(),80000/rate+1500);
+    auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count();
+    fprintf(stderr,"capped reuse rate=%u elapsed=%ldms connections=%u/%u/%u/%u requests=%u/%u/%u/%u\n",rate,(long)elapsed,a.connections.load(),b.connections.load(),c.connections.load(),d.connections.load(),a.requests.load(),b.requests.load(),c.requests.load(),d.requests.load());
+    EXPECT_LT(elapsed,80000/rate+1500);
     unsigned hits[]={a.requests,b.requests,c.requests,d.requests};
     unsigned least=hits[0],most=hits[0];for(unsigned hit:hits){if(hit<least)least=hit;if(hit>most)most=hit;}
     EXPECT_GT(least,0U);EXPECT_LE(most-least,rate);

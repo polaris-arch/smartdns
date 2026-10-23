@@ -1,5 +1,5 @@
 #include "gtest/gtest.h"
-#include <sched.h>
+#include <net/if.h>
 #include <cstdlib>
 #include <cstring>
 extern "C" {
@@ -20,17 +20,21 @@ struct Routes {
     void refresh(){service.path_refresh_due=0;_dns_paths_refresh(&service,get_tick_count());}
 };
 void route_changes() {
-    ASSERT_EQ(unshare(CLONE_NEWNET),0); ASSERT_EQ(std::system("ip link set lo up"),0);
-    Routes r;std::strcpy(r.desired.addresses[1].text,"2001:db8::53");r.refresh();
+    // The suite already runs in a loopback-only network namespace. Mutate only
+    // this unique ULA fixture, requiring NET_ADMIN rather than SYS_ADMIN/unshare.
+    struct if_nameindex *names=if_nameindex();ASSERT_NE(names,nullptr);
+    unsigned interfaces=0;for(auto *p=names;p->if_index;p++){interfaces++;EXPECT_STREQ(p->if_name,"lo");}
+    if_freenameindex(names);ASSERT_EQ(interfaces,1U);
+    Routes r;std::strcpy(r.desired.addresses[1].text,"fd42:7a5e::53");r.refresh();
     EXPECT_EQ(r.service.detail.paths[0].state,DNS_PATH_ELIGIBLE);
     EXPECT_EQ(r.service.detail.paths[1].state,DNS_PATH_NO_ROUTE);
     EXPECT_TRUE(_dns_path_allowed(&r.service,"127.0.0.2"));
-    EXPECT_FALSE(_dns_path_allowed(&r.service,"2001:db8::53"));
-    ASSERT_EQ(std::system("ip -6 addr add 2001:db8::1/64 dev lo"),0);
+    EXPECT_FALSE(_dns_path_allowed(&r.service,"fd42:7a5e::53"));
+    ASSERT_EQ(std::system("ip -6 addr add fd42:7a5e::1/64 dev lo"),0);
     _dns_paths_network_tick();_dns_paths_refresh(&r.service,get_tick_count());
     EXPECT_EQ(r.service.detail.paths[1].state,DNS_PATH_ELIGIBLE);
     EXPECT_STREQ(r.service.detail.paths[1].interface,"lo");
-    ASSERT_EQ(std::system("ip -6 addr del 2001:db8::1/64 dev lo"),0);
+    ASSERT_EQ(std::system("ip -6 addr del fd42:7a5e::1/64 dev lo"),0);
     _dns_paths_network_tick();_dns_paths_refresh(&r.service,get_tick_count());
     EXPECT_EQ(r.service.detail.paths[1].state,DNS_PATH_NO_ROUTE);
 }

@@ -24,6 +24,15 @@ for family, address in ((socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1'))
     with socket.socket(family, socket.SOCK_STREAM) as sock:
         sock.bind((address, 0))
 PY
+# Legacy discovery fixtures use documentation-only addresses. Give those
+# synthetic destinations loopback routes; no default route or external interface
+# is introduced. NET_ADMIN is confined to this --network none container.
+ip route add 192.0.2.0/24 dev lo
+ip route add 198.51.100.0/24 dev lo
+ip route add 203.0.113.0/24 dev lo
+ip -6 route add 2001:db8::/32 dev lo
+ip -j route show > ci-results/fixture-routes-v4.json
+ip -j -6 route show > ci-results/fixture-routes-v6.json
 command -v dig
 command -v dnsperf
 curl --version | grep -q HTTP2

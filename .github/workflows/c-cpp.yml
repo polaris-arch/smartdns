@@ -55,7 +55,7 @@ jobs:
         FROM ${BASE_IMAGE}
         RUN apt-get update && apt-get install -y --no-install-recommends \
             build-essential git libssl-dev libgtest-dev dnsperf dnsutils curl openssl \
-            pkg-config ca-certificates python3 zlib1g-dev && rm -rf /var/lib/apt/lists/*
+            pkg-config ca-certificates python3 zlib1g-dev iproute2 && rm -rf /var/lib/apt/lists/*
         WORKDIR /source
         DOCKERFILE
         docker image inspect smartdns-native-ci > ci-results/image.json
@@ -75,7 +75,7 @@ jobs:
         SANITIZERS: ${{ inputs.release_validation && '1' || '0' }}
       run: |
         set -o pipefail
-        docker run --rm --network none \
+        docker run --rm --network none --cap-add NET_ADMIN \
           -v "$GITHUB_WORKSPACE:/source" -w /source \
           -e CI_NATIVE_PROFILE="$PROFILE" -e CI_NATIVE_SANITIZERS="$SANITIZERS" smartdns-native-ci \
           bash .github/scripts/run-native-offline.sh 2>&1 | tee ci-results/native.log
