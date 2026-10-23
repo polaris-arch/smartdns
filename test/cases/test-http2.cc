@@ -381,7 +381,8 @@ class LimitedHTTP2DoHUpstream
 
 	bool WaitHttp2Handshake(struct http2_ctx *ctx, int fd)
 	{
-		for (int i = 0; i < 300 && run_; i++) {
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+		while (run_ && std::chrono::steady_clock::now() < deadline) {
 			int ret = http2_ctx_handshake(ctx);
 			if (ret == 1) {
 				return true;
@@ -391,7 +392,8 @@ class LimitedHTTP2DoHUpstream
 				return false;
 			}
 
-			struct pollfd pfd = {fd, POLLIN | POLLOUT, 0};
+			short events = POLLIN | (http2_ctx_want_write(ctx) ? POLLOUT : 0);
+			struct pollfd pfd = {fd, events, 0};
 			poll(&pfd, 1, 10);
 		}
 
@@ -486,7 +488,8 @@ class LimitedHTTP2DoHUpstream
 		std::set<struct http2_stream *> streams;
 		std::map<struct http2_stream *, std::vector<uint8_t>> bodies;
 		while (run_) {
-			struct pollfd pfd = {fd, POLLIN | POLLOUT, 0};
+			short events = POLLIN | (http2_ctx_want_write(ctx) ? POLLOUT : 0);
+			struct pollfd pfd = {fd, events, 0};
 			poll(&pfd, 1, 10);
 
 			if (zero_window_ && !http2_ctx_want_write(ctx) && !WriteWindowCommands(&conn, fd)) break;
@@ -608,7 +611,7 @@ class HTTP2DoHClient
 		}
 	}
 
-	bool Connect(const char *host, int port)
+	bool Connect(const char *host, int port, unsigned preface_delay_ms = 0)
 	{
 		fd_ = socket(AF_INET, SOCK_STREAM, 0);
 		if (fd_ < 0) {
@@ -678,6 +681,8 @@ class HTTP2DoHClient
 			last_error_ = "fcntl O_NONBLOCK failed";
 			return false;
 		}
+
+		if (preface_delay_ms) std::this_thread::sleep_for(std::chrono::milliseconds(preface_delay_ms));
 
 		ctx_ = http2_ctx_client_new(host, BioRead, BioWrite, this, NULL);
 		if (ctx_ == nullptr) {
@@ -2020,6 +2025,23 @@ log-level error
 	EXPECT_EQ(stats.total, query_count);
 	EXPECT_EQ(stats.success, query_count) << stats.first_failure;
 	EXPECT_EQ(stats.failure, 0) << stats.first_failure;
+}
+
+TEST(HTTP2, LimitedUpstreamWaitsForDelayedClientPreface)
+{
+	Defer { unlink(HTTP2_TEST_CERT_FILE); unlink(HTTP2_TEST_KEY_FILE); unlink("/tmp/root-ca.key"); };
+	LimitedHTTP2DoHUpstream upstream;
+	ASSERT_TRUE(upstream.Start(63054, 1, "1.2.3.4")) << upstream.LastError();
+	HTTP2DoHClient client;
+	bool connected = client.Connect("127.0.0.1", 63054, 50);
+	if (!connected) upstream.Stop();
+	ASSERT_TRUE(connected) << client.LastError() << "; peer=" << upstream.LastError();
+	std::vector<uint8_t> response;
+	bool replied = client.Query(BuildDnsQuery("delayed-preface.example.com", 0x8130), &response);
+	if (!replied) upstream.Stop();
+	ASSERT_TRUE(replied) << client.LastError() << "; peer=" << upstream.LastError();
+	std::string error;
+	EXPECT_TRUE(DnsResponseIsValidForQuery(response, 0x8130, "delayed-preface.example.com", "1.2.3.4", &error)) << error;
 }
 
 TEST(HTTP2, Http2UpstreamMaxConcurrentStreamsDoesNotBlockCompletedResponses)
