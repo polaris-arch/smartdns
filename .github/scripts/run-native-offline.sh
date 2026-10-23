@@ -14,6 +14,8 @@ mkdir -p ci-results
     curl --version
     cat /proc/net/route
     cat /proc/net/ipv6_route
+    cat /proc/sys/net/ipv4/ip_local_port_range
+    cat /proc/sys/net/ipv4/ip_local_reserved_ports
 } > ci-results/environment.txt
 # Refuse an accidentally network-enabled runtime. Loopback is the only interface.
 python3 - <<'PY'

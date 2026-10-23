@@ -76,6 +76,7 @@ jobs:
       run: |
         set -o pipefail
         docker run --rm --network none --cap-add NET_ADMIN \
+          --sysctl net.ipv4.ip_local_reserved_ports=60000-65535 \
           -v "$GITHUB_WORKSPACE:/source" -w /source \
           -e CI_NATIVE_PROFILE="$PROFILE" -e CI_NATIVE_SANITIZERS="$SANITIZERS" smartdns-native-ci \
           bash .github/scripts/run-native-offline.sh 2>&1 | tee ci-results/native.log

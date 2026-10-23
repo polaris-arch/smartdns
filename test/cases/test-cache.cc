@@ -337,6 +337,8 @@ TEST_F(Cache, save_file)
 bind [::]:60053@lo
 server 127.0.0.1:62053
 cache-persist yes
+speed-check-mode none
+rr-ttl-reply-max 3
 dualstack-ip-selection no
 )""";
 
@@ -387,6 +389,8 @@ TEST_F(Cache, corrupt_file)
 bind [::]:60053@lo
 server 127.0.0.1:62053
 dualstack-ip-selection no
+speed-check-mode none
+rr-ttl-reply-max 3
 cache-persist yes
 )""";
 
