@@ -18,6 +18,7 @@
 
 #define _GNU_SOURCE
 
+#include "upstream_observer.h"
 #include "smartdns/util.h"
 #include <limits.h>
 
@@ -204,6 +205,7 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 			if (ret == DNS_CLIENT_ACTION_OK) {
 				pthread_mutex_lock(&query->lock);
                 query->result_service = server_info->service;
+                query->result_endpoint = server_info;
 				query->has_result = 1;
                 pthread_mutex_unlock(&query->lock);
 			} else if (ret != DNS_CLIENT_ACTION_OK_WAIT) {
@@ -313,9 +315,9 @@ static int _dns_client_send_one_packet(struct dns_server_info *server_info, stru
             }
             ret = _dns_client_send_udp(server_info, packet_data, packet_data_len);
             send_err = errno;
+            if (!ret) _dns_attempt_mark_sent(query, server_info, generation);
             if (server_info->service) {
-                if (!ret) _dns_attempt_mark_sent(query, server_info, generation);
-                else {
+                if (ret) {
                     /* Datagram failure leaves no buffered owner. Revoke this
                      * lease, but do not self-feed a new turn on socket pressure. */
                     if (send_err == EAGAIN || send_err == EWOULDBLOCK)
@@ -363,6 +365,7 @@ static int _dns_client_send_one_packet(struct dns_server_info *server_info, stru
 		}
 
 		if (ret != 0) {
+            _dns_endpoint_io_error(query, server_info, DNS_PHASE_SOCKET, send_err);
 			switch (send_err) {
 			case EBADF:
 			case ECONNRESET:
@@ -446,13 +449,17 @@ static int _dns_client_send_packet_services(struct dns_query_struct *query, void
         if (targets[i].service) {
             server = _dns_service_select(targets[i].service, query, _dns_client_service_eligible, &ctx);
             if (!server) continue;
-        } else if (!_dns_client_service_eligible(server, &ctx) || _dns_attempt_begin(query, server) != DNS_ADMIT_OK) continue;
+        } else {
+            _dns_endpoint_observe(query, server);
+            if (!_dns_client_service_eligible(server, &ctx) || _dns_attempt_begin(query, server) != DNS_ADMIT_OK) continue;
+        }
         _dns_service_prepare_connection(server);
         pthread_mutex_lock(&server->lock);
         int socket_result = server->fd < 0 ? _dns_client_create_socket(server) : 0;
         int socket_errno = errno;
         pthread_mutex_unlock(&server->lock);
         if (socket_result) {
+            _dns_endpoint_io_error(query, server, DNS_PHASE_CONNECT, socket_errno);
             if (server->service && socket_errno != EAGAIN) _dns_service_endpoint_failure(server);
             _dns_attempt_retire(query, server, 0);
         } else {
@@ -503,6 +510,7 @@ int _dns_client_send_packet(struct dns_query_struct *query, void *packet, int le
              * retry so a silent head cannot starve another configured resolver. */
             if (bootstrap_count && bootstrap_index++ != bootstrap_selected) continue;
 			struct dns_server_info *server_info = member->server;
+            _dns_endpoint_observe(query, server_info);
 			void *data = NULL;
 			int data_len = 0;
 			if (pass == 0 && server_info->flags.fallback && now - query->created_tick < DNS_QUERY_TIMEOUT) continue;
@@ -510,6 +518,8 @@ int _dns_client_send_packet(struct dns_query_struct *query, void *packet, int le
 			/* Never create sockets or allocate a stream for admission-denied work. */
 			if (_dns_attempt_begin(query, server_info) != DNS_ADMIT_OK) continue;
 			if (server_info->fd <= 0 && _dns_client_create_socket(server_info) != 0) {
+                int socket_error = errno;
+                _dns_endpoint_io_error(query, server_info, DNS_PHASE_CONNECT, socket_error);
 				_dns_attempt_retire(query, server_info, 0);
 				server_info->prohibit = 1;
 				continue;
@@ -872,8 +882,8 @@ static void *_dns_client_work(void *arg)
                 server_info->service_error_code = server_info->service_system_error = 0;
                 server_info->service_tls_error = 0;
                 int processed = _dns_client_process(server_info, event, now);
-                if (processed < 0 && server_info->service &&
-                    !_dns_policy_service_cooldown(server_info->service, get_tick_count())) {
+                if (processed < 0 && (server_info->service || server_info->diagnostic) &&
+                    !_dns_policy_endpoint_cooldown(server_info, get_tick_count())) {
                     if (server_info->service_normal_close) {
                         _dns_service_detail(NULL, server_info, DNS_DETAIL_IDLE_CLOSE,
                             server_info->service_error_phase, 0, 0, 0);

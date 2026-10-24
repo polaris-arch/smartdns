@@ -160,6 +160,18 @@ async function capture(label) {
     const section = dialog.getByRole('tabpanel');
     await section.waitFor({ state: 'visible' });
     assert.equal(await dialog.getByRole('tab').count(), 4);
+    async function checkCardSeparation() {
+      const appearance=await section.locator('.MuiPaper-outlined').first().evaluate(el=>{
+        const card=getComputedStyle(el), backdrop=getComputedStyle(el.closest('.MuiDialogContent-root'));
+        return {border:card.borderTopColor,width:Number.parseFloat(card.borderTopWidth),surface:card.backgroundColor,backdrop:backdrop.backgroundColor};
+      });
+      assert(appearance.width>=1,'cards need a real visible border');
+      assert.notEqual(appearance.surface,appearance.backdrop,'card surface and backdrop must differ');
+      const alpha=appearance.border.match(/rgba\([^,]+,[^,]+,[^,]+,\s*([.\d]+)\)/);
+      if(alpha) assert(Number(alpha[1])>=.2,'card outline must be stronger than a faint default divider');
+      return appearance;
+    }
+    await checkCardSeparation();
     const desktopFont=await dialog.evaluate(el=>Number.parseFloat(getComputedStyle(el).fontSize));
     assert(desktopFont<=14,'desktop diagnostic body must stay compact');
     await dialog.getByRole('tab').nth(1).click();
@@ -190,6 +202,12 @@ async function capture(label) {
     const contentBounds = await section.evaluate(el => ({content: el.scrollWidth, viewport: el.clientWidth}));
     assert(contentBounds.content <= contentBounds.viewport + 1, 'diagnostic content must not be clipped by its cell');
     await capture('upstream-diagnostics');
+    await page.emulateMedia({colorScheme:'dark'});
+    await page.waitForFunction(()=>document.documentElement.classList.contains('dark'));
+    await checkCardSeparation();
+    await capture('upstream-diagnostics-dark');
+    await page.emulateMedia({colorScheme:'light'});
+    await page.waitForFunction(()=>document.documentElement.classList.contains('light'));
     await dialog.getByRole('button', { name: /关闭|Close/ }).click();
     await dialog.waitFor({ state: 'hidden' });
     await page.setViewportSize({ width: 390, height: 844 });
@@ -209,6 +227,22 @@ async function capture(label) {
     await dialog.getByRole('button', { name: /关闭|Close/ }).click();
     await dialog.waitFor({ state: 'hidden' });
     await page.setViewportSize({ width: 1600, height: 1100 });
+  }
+  if(ordinary[0].diagnostics) {
+    stage='ordinary upstream real diagnostics';
+    const tr=page.locator('tbody tr').filter({hasText:'127.0.0.9'});
+    await tr.getByRole('button',{name:/诊断|Diagnostics/}).click();
+    const dialog=page.getByRole('dialog'); await dialog.waitFor({state:'visible'});
+    assert.match(await dialog.textContent(),/单节点上游诊断|Endpoint diagnostics/);
+    for(let tab=0;tab<4;tab++) {
+      await dialog.getByRole('tab').nth(tab).click();
+      const panel=dialog.getByRole('tabpanel');
+      if(tab===1) assert.match(await panel.textContent(),/127\.0\.0\.9/);
+      if(tab===3) assert(!/两族建连间隔|Family connection delay/.test(await panel.textContent()),'ordinary endpoints must not pretend to use pool connection racing');
+    }
+    await capture('ordinary-upstream-diagnostics');
+    await dialog.getByRole('button',{name:/关闭|Close/}).click();
+    await dialog.waitFor({state:'hidden'});
   }
   stage = 'locate real toolbar refresh';
   // Production MUI deliberately omits SvgIcon data-testid. Use the actual

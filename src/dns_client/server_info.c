@@ -18,6 +18,7 @@
 
 #define _GNU_SOURCE
 
+#include "upstream_observer.h"
 #include "server_info.h"
 #include "upstream_policy.h"
 #include "client_socket.h"
@@ -156,6 +157,7 @@ static void _dns_client_server_free(struct dns_server_info *server_info)
 	list_del_init(&server_info->check_list);
 	_dns_client_server_close(server_info);
 	_dns_policy_detach(server_info);
+    _dns_endpoint_observer_destroy(server_info);
 	pthread_mutex_destroy(&server_info->lock);
     _dns_service_put(server_info->service);
 	free(server_info);
@@ -451,6 +453,7 @@ static int _dns_client_server_add_ext(const char *server_ip, const char *server_
 
 	memcpy(&server_info->flags, flags, sizeof(server_info->flags));
 	if (_dns_policy_attach(server_info) != 0) goto errout;
+    _dns_endpoint_observer_init(server_info);
 	INIT_LIST_HEAD(&server_info->list);
 	INIT_LIST_HEAD(&server_info->conn_stream_list);
 
@@ -535,6 +538,7 @@ errout:
 		}
 
 		_dns_policy_detach(server_info);
+    _dns_endpoint_observer_destroy(server_info);
 		pthread_mutex_destroy(&server_info->lock);
         _dns_service_put(server_info->service);
 		free(server_info);

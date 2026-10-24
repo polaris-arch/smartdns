@@ -26,19 +26,19 @@ function check(rows, expectedData) {
   assert.equal(new Set(rows.map(row => row.id)).size, rows.length);
   rows.forEach((row, index) => {
     assert.equal(row.original, expectedData[index]);
-    assert.equal(row.id, row.original.pool_enabled ? row.original.service_id : String(index));
+    assert.equal(row.id, row.original.service_id || String(index));
   });
 }
 check(table.getCoreRowModel().rows, data);
-const before = table.getCoreRowModel().rows.filter(row => row.original.pool_enabled).map(row => row.id).sort();
+const before = table.getCoreRowModel().rows.filter(row => row.original.service_id).map(row => row.id).sort();
 const reordered = data.slice().reverse();
 table.setOptions(old => ({ ...old, data: reordered }));
 check(table.getCoreRowModel().rows, reordered);
-assert.deepEqual(table.getCoreRowModel().rows.filter(row => row.original.pool_enabled).map(row => row.id).sort(), before);
-// Repeating the real ordinary record exercises the historical default-index
-// contract; no IP+transport identity is introduced that could collide.
+assert.deepEqual(table.getCoreRowModel().rows.filter(row => row.original.service_id).map(row => row.id).sort(), before);
+// Truly legacy rows without an ID retain the default-index fallback. Modern
+// ordinary endpoints use their canonical native ID, including across reorder.
 const ordinary = data.find(row => !row.pool_enabled);
-const ordinaryData = [ordinary, ordinary];
+const ordinaryData = [{...ordinary, service_id: undefined}, {...ordinary, service_id: undefined}];
 const baseline = createTable({ ...options, data: ordinaryData });
 const candidate = createTable({ ...options, data: ordinaryData, getRowId });
 assert.deepEqual(candidate.getCoreRowModel().rows.map(row => row.id), baseline.getCoreRowModel().rows.map(row => row.id));

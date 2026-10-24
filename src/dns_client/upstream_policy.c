@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "upstream_observer.h"
 #include "upstream_policy.h"
 #include "upstream_service.h"
 #include "group.h"
@@ -27,10 +28,7 @@ struct dns_upstream_policy {
 	char name[DNS_MAX_CNAME_LEN];
 	unsigned int refs, rate, burst, cooldown_ms;
 	uint64_t tokens; /* millitokens: refill is rate * elapsed milliseconds */
-	unsigned long updated, cooldown, last_warning;
-	uint64_t backpressure_count;
-	uint64_t recovery_epoch;
-	unsigned int recovering, recovery_active;
+	unsigned long updated;
 };
 static pthread_mutex_t policy_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct dns_upstream_policy *policies;
@@ -45,6 +43,7 @@ struct dns_query_attempt {
 	uint64_t recovery_epoch;
 	int recovery_held, retirement_pending;
     int response_received, outcome_recorded;
+    unsigned observed_sent_generation;
 };
 
 static unsigned long tick_add(unsigned long now, uint64_t delay)
@@ -223,24 +222,30 @@ void _dns_policy_http_error_query(struct dns_query_struct *q, struct dns_server_
     _dns_service_diagnostic_event(q, s, status == 429 ? DNS_EVENT_HTTP_429 : DNS_EVENT_HTTP_503);
     _dns_service_detail(q, s, status == 429 ? DNS_DETAIL_HTTP_429 : DNS_DETAIL_HTTP_503,
         s->type == DNS_SERVER_HTTP3 ? DNS_PHASE_HTTP3 : DNS_PHASE_HTTP2, status, 0,
-        s->service && s->service->flags.upstream_cooldown_ms ? s->service->flags.upstream_cooldown_ms : 1000);
+        s->flags.upstream_cooldown_ms ? s->flags.upstream_cooldown_ms : 1000);
 	unsigned long now = get_tick_count();
 	uint64_t delay = 0;
 	int valid = _dns_policy_retry_after_ms(value, time(NULL), &delay) == 0;
 	struct dns_upstream_policy *p = s->policy;
 	pthread_mutex_lock(&p->lock);
     /* Old in-flight replies cannot reopen a newer backpressure epoch. */
-    if (++p->recovery_epoch == 0) p->recovery_epoch++;
-    p->recovering = 1;
-    p->recovery_active = 0;
+    if (++s->policy_recovery_epoch == 0) s->policy_recovery_epoch++;
+    s->policy_recovering = 1;
+    s->policy_recovery_active = 0;
+    if (status == 429) s->policy_http_429++; else s->policy_http_503++;
+    struct timespec wall;
+    if (clock_gettime(CLOCK_REALTIME, &wall) == 0 && wall.tv_sec >= 0)
+        s->policy_last_backpressure_unix_ms = (uint64_t)wall.tv_sec * 1000 + wall.tv_nsec / 1000000;
     /* Fixed local duration; upstream Retry-After is diagnostic evidence only. */
 	unsigned long until = tick_add(now, p->cooldown_ms);
-	if (until > p->cooldown) p->cooldown = until;
-    if (p->backpressure_count != UINT64_MAX) p->backpressure_count++;
-    int warn = !p->last_warning || (now >= p->last_warning && now - p->last_warning >= 30000);
-    uint64_t count = p->backpressure_count;
-    if (warn) p->last_warning = now ? now : 1;
+	if (until > __atomic_load_n(&s->policy_cooldown, __ATOMIC_RELAXED))
+        __atomic_store_n(&s->policy_cooldown, until, __ATOMIC_RELEASE);
+    if (s->policy_backpressure_count != UINT64_MAX) s->policy_backpressure_count++;
+    int warn = !s->policy_last_warning || (now >= s->policy_last_warning && now - s->policy_last_warning >= 30000);
+    uint64_t count = s->policy_backpressure_count;
+    if (warn) s->policy_last_warning = now ? now : 1;
     pthread_mutex_unlock(&p->lock);
+    _dns_service_transport_changed(s);
     if (warn) tlog(TLOG_WARN, "upstream backpressure status=%d events=%llu cooldown_ms=%u retry_after_valid=%d retry_after_ms=%llu endpoint=%s:%d",
                   status, (unsigned long long)count, p->cooldown_ms, valid, (unsigned long long)delay, s->ip, s->port);
 }
@@ -262,24 +267,25 @@ static struct dns_query_attempt *find_attempt(struct dns_query_struct *q, struct
 /* A recovery lease serializes probes, not normal traffic or a provider QPS.
  * Caller holds the policy lock; attempts retain their epoch after retirement
  * so a validated reply can complete recovery without a dangling owner pointer. */
-static int recovery_available(struct dns_upstream_policy *p, struct dns_query_attempt *a)
+static int recovery_available(struct dns_server_info *s, struct dns_query_attempt *a)
 {
-    return !p->recovering || !p->recovery_active ||
-        (a && a->recovery_held && a->recovery_epoch == p->recovery_epoch);
+    return !s->policy_recovering || !s->policy_recovery_active ||
+        (a && a->recovery_held && a->recovery_epoch == s->policy_recovery_epoch);
 }
-static void recovery_claim(struct dns_upstream_policy *p, struct dns_query_attempt *a)
+static void recovery_claim(struct dns_query_attempt *a)
 {
-    if (!p->recovering || (a->recovery_held && a->recovery_epoch == p->recovery_epoch)) return;
-    a->recovery_epoch = p->recovery_epoch;
+    struct dns_server_info *s = a->server;
+    if (!s->policy_recovering || (a->recovery_held && a->recovery_epoch == s->policy_recovery_epoch)) return;
+    a->recovery_epoch = s->policy_recovery_epoch;
     a->recovery_held = 1;
-    p->recovery_active++;
+    s->policy_recovery_active++;
 }
 static void recovery_release(struct dns_query_attempt *a)
 {
     if (!a->recovery_held) return;
     struct dns_upstream_policy *p = a->server->policy;
     pthread_mutex_lock(&p->lock);
-    if (a->recovery_epoch == p->recovery_epoch && p->recovery_active) p->recovery_active--;
+    if (a->recovery_epoch == a->server->policy_recovery_epoch && a->server->policy_recovery_active) a->server->policy_recovery_active--;
     a->recovery_held = 0;
     pthread_mutex_unlock(&p->lock);
 }
@@ -320,29 +326,31 @@ int _dns_attempt_begin(struct dns_query_struct *q, struct dns_server_info *s)
     }
     if (p) {
         pthread_mutex_lock(&p->lock); policy_locked = 1;
-        if (now < p->cooldown || !recovery_available(p, a)) goto out;
+        if (now < s->policy_cooldown || !recovery_available(s, a)) {
+            _dns_endpoint_wait_locked(q, s, now < s->policy_cooldown ? DNS_WAIT_COOLDOWN : DNS_WAIT_RECOVERY); goto out;
+        }
         if (p->rate) {
             uint64_t cap = (uint64_t)p->burst * 1000;
             unsigned long elapsed = now >= p->updated ? now - p->updated : 0;
             uint64_t refill = elapsed > cap / p->rate ? cap : (uint64_t)elapsed * p->rate;
             p->tokens = refill >= cap - p->tokens ? cap : p->tokens + refill;
             p->updated = now;
-            if (p->tokens < 1000) goto out;
+            if (p->tokens < 1000) { _dns_endpoint_wait_locked(q, s, DNS_WAIT_RATE); goto out; }
         }
     }
     if (!stream_transport) {
         if (_dns_query_budget_take(q->budget)) { ret = DNS_ADMIT_DONE; goto out; }
         if (p) {
             if (p->rate) p->tokens -= 1000;
-            recovery_claim(p, a);
+            recovery_claim(a);
         }
         a->sends++;
     }
     if (p && s->service) {
         /* Reserve the single recovery probe in RR order, before handshake.
          * Old buffered owners cannot steal a newer recovery epoch. */
-        recovery_claim(p, a);
-        a->admitted_epoch = p->recovery_epoch;
+        recovery_claim(a);
+        a->admitted_epoch = s->policy_recovery_epoch;
     }
     if (s->service) {
         if (s->flags.max_concurrent_queries && __atomic_load_n(&s->service->active_attempts, __ATOMIC_ACQUIRE) >=
@@ -350,6 +358,7 @@ int _dns_attempt_begin(struct dns_query_struct *q, struct dns_server_info *s)
         __atomic_add_fetch(&s->service->active_attempts, 1, __ATOMIC_ACQ_REL);
         _dns_service_attempt_active(q, s->service, 1);
     }
+    if (stream_transport) _dns_endpoint_wait_locked(q, s, DNS_WAIT_WRITE);
     a->wire_started = !stream_transport; a->wire_reserved = !stream_transport;
     a->response_received = 0; a->outcome_recorded = 0;
     a->generation++; a->active = 1; a->sent_tick = stream_transport ? 0 : now;
@@ -379,17 +388,19 @@ int _dns_attempt_wire_begin(struct dns_query_struct *q, struct dns_server_info *
     if (a->wire_started) { ret = DNS_ADMIT_OK; goto out; }
     struct dns_upstream_policy *p = s->policy;
     pthread_mutex_lock(&p->lock);
-    if (s->service && a->admitted_epoch != p->recovery_epoch) {
+    if (s->service && a->admitted_epoch != s->policy_recovery_epoch) {
         ret = DNS_ADMIT_DONE; goto policy_out;
     }
-    if (now < p->cooldown || !recovery_available(p, a)) goto policy_out;
+    if (now < s->policy_cooldown || !recovery_available(s, a)) {
+        _dns_endpoint_wait_locked(q, s, now < s->policy_cooldown ? DNS_WAIT_COOLDOWN : DNS_WAIT_RECOVERY); goto policy_out;
+    }
     if (p->rate) {
         uint64_t cap = (uint64_t)p->burst * 1000;
         unsigned long elapsed = now >= p->updated ? now - p->updated : 0;
         uint64_t refill = elapsed > cap / p->rate ? cap : (uint64_t)elapsed * p->rate;
         p->tokens = refill >= cap - p->tokens ? cap : p->tokens + refill;
         p->updated = now;
-        if (p->tokens < 1000) goto policy_out;
+        if (p->tokens < 1000) { _dns_endpoint_wait_locked(q, s, DNS_WAIT_RATE); goto policy_out; }
     }
     if (!a->wire_reserved) {
         if (a->sends >= DNS_QUERY_RETRY || _dns_query_budget_take(q->budget)) { ret = DNS_ADMIT_DONE; goto policy_out; }
@@ -398,7 +409,7 @@ int _dns_attempt_wire_begin(struct dns_query_struct *q, struct dns_server_info *
     /* An unsuccessful write may have uncertain effects: never refund its token
      * or attempt. Until positive progress, every retry needs fresh pacing. */
     if (p->rate) p->tokens -= 1000;
-    recovery_claim(p, a);
+    recovery_claim(a);
     ret = s->service ? _dns_service_write_begin(q, s, generation) : DNS_ADMIT_OK;
 policy_out:
     pthread_mutex_unlock(&p->lock);
@@ -421,7 +432,7 @@ int _dns_attempt_live(struct dns_query_struct *q, struct dns_server_info *s, uns
 
 void _dns_attempt_response_sample(struct dns_query_struct *q, struct dns_server_info *s)
 {
-    if (!s->service) return;
+    if (!s->service && !s->diagnostic) return;
     pthread_mutex_lock(&q->lock);
     struct dns_query_attempt *a = find_attempt(q, s);
     if (a && a->wire_started && !a->response_received) {
@@ -431,22 +442,25 @@ void _dns_attempt_response_sample(struct dns_query_struct *q, struct dns_server_
         unsigned long now = get_tick_count();
         if (a->sends == 1 && now >= a->sent_tick) {
             _dns_service_response_time(s, now - a->sent_tick);
-            __atomic_add_fetch(&s->service->stats.attempt_rtt_sum_ms, now - a->sent_tick, __ATOMIC_RELAXED);
-            __atomic_add_fetch(&s->service->stats.attempt_rtt_samples, 1, __ATOMIC_RELAXED);
-        } else __atomic_add_fetch(&s->service->stats.attempt_rtt_ambiguous_count, 1, __ATOMIC_RELAXED);
+            if (s->service) {
+                __atomic_add_fetch(&s->service->stats.attempt_rtt_sum_ms, now - a->sent_tick, __ATOMIC_RELAXED);
+                __atomic_add_fetch(&s->service->stats.attempt_rtt_samples, 1, __ATOMIC_RELAXED);
+            } else _dns_endpoint_rtt_locked(s, now - a->sent_tick, 0);
+        } else if (s->service) __atomic_add_fetch(&s->service->stats.attempt_rtt_ambiguous_count, 1, __ATOMIC_RELAXED);
+        else _dns_endpoint_rtt_locked(s, 0, 1);
     }
     pthread_mutex_unlock(&q->lock);
 }
 static void attempt_outcome(struct dns_query_attempt *a, int success)
 {
-    if (!a->server->service || !a->wire_started || a->outcome_recorded) return;
+    if (!a->wire_started || a->outcome_recorded ||
+        (!a->server->service && a->observed_sent_generation != a->generation)) return;
     a->outcome_recorded = 1;
     if (success) __atomic_add_fetch(&a->server->service_success_count, 1, __ATOMIC_RELAXED);
     else __atomic_add_fetch(&a->server->service_failure_count, 1, __ATOMIC_RELAXED);
 }
 void _dns_attempt_reply_outcome(struct dns_query_struct *q, struct dns_server_info *s, int accepted)
 {
-    if (!s->service) return;
     pthread_mutex_lock(&q->lock);
     struct dns_query_attempt *a = find_attempt(q, s);
     if (a) attempt_outcome(a, accepted);
@@ -466,7 +480,7 @@ void _dns_attempt_replied(struct dns_query_struct *q, struct dns_server_info *s)
          * lease normally. A fresh query or stream probe can reopen the policy. */
         int unambiguous = (a->server->type != DNS_SERVER_UDP && a->server->type != DNS_SERVER_MDNS) ||
                           a->sends == 1;
-        if (a->wire_started && unambiguous && a->recovery_epoch == p->recovery_epoch) p->recovering = 0;
+        if (a->wire_started && unambiguous && a->recovery_epoch == a->server->policy_recovery_epoch) a->server->policy_recovering = 0;
         pthread_mutex_unlock(&p->lock);
     }
     pthread_mutex_unlock(&q->lock);
@@ -519,8 +533,16 @@ void _dns_attempt_mark_sent(struct dns_query_struct *q, struct dns_server_info *
 	if (!q) return;
 	pthread_mutex_lock(&q->lock);
 	struct dns_query_attempt *a = find_attempt(q, s);
-    if (a && a->generation == generation && !a->wire_started) {
-        a->wire_started = 1; a->sent_tick = get_tick_count();
+    if (a && a->generation == generation) {
+        if (!a->wire_started) { a->wire_started = 1; a->sent_tick = get_tick_count(); }
+        if (a->observed_sent_generation != generation) {
+            a->observed_sent_generation = generation;
+            _dns_policy_endpoint_sent(s);
+            if (!s->service) {
+                _dns_endpoint_sent_locked(q, s);
+                __atomic_add_fetch(&s->service_attempt_count, 1, __ATOMIC_RELAXED);
+            }
+        }
     }
 	pthread_mutex_unlock(&q->lock);
     _dns_service_write_result(q, s, generation, 1, 0);
@@ -573,6 +595,7 @@ void _dns_attempt_free_all(struct dns_query_struct *q)
 	struct dns_query_attempt *a = q->attempts;
 	while (a) {
 		struct dns_query_attempt *next = a->next;
+        if (!a->server->service) attempt_outcome(a, 0);
 		if (a->active || a->recovery_held) {
 			pthread_mutex_lock(&a->server->lock);
 			if (a->active && a->server->active_attempts) {
@@ -644,29 +667,85 @@ void _dns_policy_service_release(struct dns_upstream_service *service)
 }
 unsigned long _dns_policy_service_wait(struct dns_upstream_service *service, unsigned long now)
 { return _dns_policy_service_wait_reason(service, now, NULL); }
+unsigned long _dns_policy_endpoint_cooldown(struct dns_server_info *ep, unsigned long now)
+{
+    /* Also used under the leaf send-turn lock while policy->lock is held.
+     * A published deadline is sufficient; never recursively take the policy
+     * mutex or introduce turn -> policy lock ordering here. */
+    unsigned long until = __atomic_load_n(&ep->policy_cooldown, __ATOMIC_ACQUIRE);
+    return until > now ? until - now : 0;
+}
+/* Membership -> policy, never policy -> membership/endpoint. A service waits
+ * for node recovery only when every selected node is blocked. */
+static unsigned long service_node_wait_locked(struct dns_upstream_service *service,
+    unsigned long now, unsigned *reason, int include_recovery)
+{
+    unsigned long minimum = ULONG_MAX; unsigned why = DNS_WAIT_NONE;
+    for (unsigned i = 0; i < service->member_count; i++) {
+        struct dns_server_info *ep = service->members[i];
+        if (__atomic_load_n(&ep->service_revoked, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&ep->service_draining, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&ep->service_rotation, __ATOMIC_ACQUIRE)) continue;
+        unsigned long wait = ep->policy_cooldown > now ? ep->policy_cooldown - now :
+            include_recovery && ep->policy_recovering && ep->policy_recovery_active ? 100 : 0;
+        if (wait < minimum) { minimum = wait; why = wait && ep->policy_cooldown > now ? DNS_WAIT_COOLDOWN : DNS_WAIT_RECOVERY; }
+    }
+    if (reason) *reason = minimum && minimum != ULONG_MAX ? why : DNS_WAIT_NONE;
+    return minimum == ULONG_MAX ? 0 : minimum;
+}
 unsigned long _dns_policy_service_wait_reason(struct dns_upstream_service *service, unsigned long now, unsigned *reason)
 {
     struct dns_upstream_policy *p = service->policy;
-    unsigned long wait = 0;
+    pthread_mutex_lock(&service->lock); pthread_mutex_lock(&p->lock);
     unsigned why = DNS_WAIT_NONE;
-    pthread_mutex_lock(&p->lock);
-    if (p->cooldown > now) { wait = p->cooldown - now; why = DNS_WAIT_COOLDOWN; }
-    else if (p->recovering && p->recovery_active) { wait = 100; why = DNS_WAIT_RECOVERY; }
-    else if (p->rate) {
+    unsigned long wait = service_node_wait_locked(service, now, &why, 1);
+    if (p->rate) {
         uint64_t elapsed = now >= p->updated ? now - p->updated : 0;
         uint64_t available = p->tokens + (elapsed > 1000 ? 1000 : elapsed) * p->rate;
-        if (available < 1000) { wait = (1000 - available + p->rate - 1) / p->rate; why = DNS_WAIT_RATE; }
+        unsigned long rate_wait = available < 1000 ? (1000 - available + p->rate - 1) / p->rate : 0;
+        if (rate_wait && rate_wait >= wait) { wait = rate_wait; why = DNS_WAIT_RATE; }
     }
-    pthread_mutex_unlock(&p->lock);
+    pthread_mutex_unlock(&p->lock); pthread_mutex_unlock(&service->lock);
     if (reason) *reason = why;
     return wait;
 }
-
 unsigned long _dns_policy_service_cooldown(struct dns_upstream_service *service, unsigned long now)
 {
-    struct dns_upstream_policy *p = service->policy;
-    pthread_mutex_lock(&p->lock);
-    unsigned long wait = p->cooldown > now ? p->cooldown - now : 0;
-    pthread_mutex_unlock(&p->lock);
+    pthread_mutex_lock(&service->lock); pthread_mutex_lock(&service->policy->lock);
+    unsigned long wait = service_node_wait_locked(service, now, NULL, 0);
+    pthread_mutex_unlock(&service->policy->lock); pthread_mutex_unlock(&service->lock);
     return wait;
+}
+
+/* Passive counters: no sampling timer, additional connection or probe traffic. */
+void _dns_policy_endpoint_sent(struct dns_server_info *ep)
+{
+    if (!ep->policy) return;
+    unsigned long bucket = get_tick_count() / 100;
+    pthread_mutex_lock(&ep->policy->lock);
+    if (bucket != ep->policy_send_bucket_tick) {
+        ep->policy_send_bucket_tick = bucket; ep->policy_send_bucket_count = 0;
+    }
+    ep->policy_send_bucket_count++;
+    if (ep->policy_send_bucket_count > ep->policy_send_peak_100ms) {
+        ep->policy_send_peak_100ms = ep->policy_send_bucket_count;
+        struct timespec wall;
+        if (clock_gettime(CLOCK_REALTIME, &wall) == 0 && wall.tv_sec >= 0)
+            ep->policy_send_peak_unix_ms = (uint64_t)wall.tv_sec * 1000 + wall.tv_nsec / 1000000;
+    }
+    pthread_mutex_unlock(&ep->policy->lock);
+}
+void _dns_policy_endpoint_activity(struct dns_server_info *ep, struct dns_upstream_endpoint_activity_v1 *out)
+{
+    out->struct_size = sizeof(*out); out->version = 1;
+    if (!ep->policy) return;
+    unsigned long now = get_tick_count();
+    pthread_mutex_lock(&ep->policy->lock);
+    out->http_429 = ep->policy_http_429; out->http_503 = ep->policy_http_503;
+    out->cooldown_remaining_ms = ep->policy_cooldown > now ? ep->policy_cooldown - now : 0;
+    out->recovery_in_flight = ep->policy_recovery_active;
+    out->sends_current_100ms = ep->policy_send_bucket_tick == now / 100 ? ep->policy_send_bucket_count : 0;
+    out->sends_peak_100ms = ep->policy_send_peak_100ms; out->peak_unix_ms = ep->policy_send_peak_unix_ms;
+    out->last_backpressure_unix_ms = ep->policy_last_backpressure_unix_ms;
+    pthread_mutex_unlock(&ep->policy->lock);
 }

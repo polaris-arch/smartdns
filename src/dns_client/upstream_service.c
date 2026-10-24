@@ -1,4 +1,5 @@
 /* Bounded logical upstream services. GPL-3.0-or-later. */
+#include "upstream_observer.h"
 #include "upstream_service.h"
 #include "upstream_discovery.h"
 #include "upstream_policy.h"
@@ -466,7 +467,8 @@ int _dns_service_endpoint_eligible(struct dns_server_info *ep, unsigned long now
 {
     return !__atomic_load_n(&ep->service_draining, __ATOMIC_ACQUIRE) && !__atomic_load_n(&ep->service_revoked, __ATOMIC_ACQUIRE) &&
         now >= __atomic_load_n(&ep->service_retry_at, __ATOMIC_ACQUIRE) &&
-        (!ep->service || now < __atomic_load_n(&ep->service_valid_until, __ATOMIC_ACQUIRE));
+        (!ep->service || now < __atomic_load_n(&ep->service_valid_until, __ATOMIC_ACQUIRE)) &&
+        !_dns_policy_endpoint_cooldown(ep, now);
 }
 struct dns_server_info *_dns_service_select(struct dns_upstream_service *s, struct dns_query_struct *q,
     int (*eligible)(struct dns_server_info *, void *), void *context)
@@ -651,7 +653,8 @@ void _dns_service_unsent_retire(struct dns_query_struct *q, struct dns_server_in
 }
 static void diagnostic_last_event(struct dns_query_struct *q, struct dns_server_info *ep, unsigned event)
 {
-    if (!q || !ep->service) return;
+    if (!ep->service) { _dns_endpoint_event(q, ep, event, 0); return; }
+    if (!q) return;
     pthread_mutex_lock(&q->lock);
     for (struct dns_service_observation *o = q->service_observations; o; o = o->next)
         if (o->service == ep->service) { __atomic_store_n(&o->last_event, event + 1, __ATOMIC_RELAXED); break; }
@@ -659,7 +662,8 @@ static void diagnostic_last_event(struct dns_query_struct *q, struct dns_server_
 }
 void _dns_service_diagnostic_event(struct dns_query_struct *q, struct dns_server_info *ep, unsigned event)
 {
-    if (!ep || !ep->service || event >= DNS_EVENT_COUNT) return;
+    if (!ep || event >= DNS_EVENT_COUNT) return;
+    if (!ep->service) { _dns_endpoint_event(q, ep, event, 1); return; }
     stats_inc(&ep->service->diagnostics.events[event]);
     diagnostic_last_event(q, ep, event);
 }
@@ -676,8 +680,8 @@ void _dns_service_diagnostic_http(struct dns_query_struct *q, struct dns_server_
 }
 void _dns_service_query_result(struct dns_query_struct *q, struct dns_server_info *ep, int accepted)
 {
-    if (!ep->service) return;
     _dns_attempt_reply_outcome(q, ep, accepted);
+    if (!ep->service) { _dns_endpoint_result(q, ep, accepted); return; }
     pthread_mutex_lock(&q->lock);
     for (struct dns_service_observation *o = q->service_observations; o; o = o->next) {
         if (o->service != ep->service) continue;
@@ -709,10 +713,7 @@ void _dns_service_query_expired(struct dns_query_struct *q, struct dns_upstream_
 void _dns_service_query_terminal(struct dns_query_struct *q)
 {
     pthread_mutex_lock(&q->lock);
-    unsigned long now = get_tick_count();
-    unsigned reason = q->has_result ? DNS_END_OTHER_RESULT :
-        (dns_query_budget_timed_out(q->budget) || (now >= q->created_tick && now - q->created_tick >= (q->lifetime_ms ? q->lifetime_ms : DNS_QUERY_LIFETIME))) ? DNS_END_DEADLINE :
-        dns_query_budget_exhausted(q->budget) ? DNS_END_BUDGET_OR_CANCEL : DNS_END_OTHER;
+    unsigned reason = _dns_query_end_reason(q);
     for (struct dns_service_observation *o = q->service_observations; o; o = o->next) {
         if (__atomic_load_n(&o->terminal, __ATOMIC_ACQUIRE)) continue;
         __atomic_store_n(&o->end_reason, reason == DNS_END_OTHER_RESULT && q->result_service == o->service ?
@@ -808,9 +809,10 @@ void _dns_service_endpoint_failure(struct dns_server_info *ep)
     if (!ep->service) return;
     unsigned long now = get_tick_count();
     if (__atomic_load_n(&ep->service_retry_at, __ATOMIC_ACQUIRE) > now) return;
-    unsigned failures = __atomic_add_fetch(&ep->service_failures, 1, __ATOMIC_ACQ_REL);
-    unsigned delay = failures > 6 ? 60 : 1U << (failures - 1);
-    __atomic_store_n(&ep->service_retry_at, now + delay * 1000UL, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&ep->service_failures, 1, __ATOMIC_ACQ_REL);
+    unsigned delay = ep->service->flags.upstream_cooldown_ms ? ep->service->flags.upstream_cooldown_ms : 1000;
+    unsigned long until = delay > ULONG_MAX - now ? ULONG_MAX : now + delay;
+    __atomic_store_n(&ep->service_retry_at, until, __ATOMIC_RELEASE);
     service_queue(ep->service);
 }
 void _dns_service_endpoint_ready(struct dns_server_info *ep)
@@ -1089,6 +1091,10 @@ int dns_client_get_service_diagnostics_v1(const char *id, struct dns_upstream_se
         service_snapshot(s, base, out); result = 0; break;
     }
     pthread_mutex_unlock(&registry_lock);
+    if (result && (base && out)) {
+        struct dns_server_info *ep = _dns_endpoint_find(id);
+        if (ep) { _dns_endpoint_snapshot(ep, base, out); dns_client_server_info_release(ep); result = 0; }
+    }
     return result;
 }
 int dns_client_get_service_event_context_v1(const char *id, struct dns_upstream_event_context_snapshot_v1 *out)
@@ -1105,7 +1111,10 @@ int dns_client_get_service_event_context_v1(const char *id, struct dns_upstream_
         memcpy(out->events, s->event_context, out->event_count * sizeof(out->events[0]));
         pthread_mutex_unlock(&s->detail_lock); result = 0; break;
     }
-    pthread_mutex_unlock(&registry_lock); return result;
+    pthread_mutex_unlock(&registry_lock);
+    if (result) { struct dns_server_info *ep = _dns_endpoint_find(id);
+        if (ep) { _dns_endpoint_context_snapshot(ep, out); dns_client_server_info_release(ep); result = 0; } }
+    return result;
 }
 int dns_client_get_service_policy_v1(const char *id, struct dns_upstream_policy_snapshot_v1 *out)
 {
@@ -1137,7 +1146,10 @@ int dns_client_get_service_policy_v1(const char *id, struct dns_upstream_policy_
         }
         pthread_mutex_unlock(&s->lock); result = 0; break;
     }
-    pthread_mutex_unlock(&registry_lock); return result;
+    pthread_mutex_unlock(&registry_lock);
+    if (result) { struct dns_server_info *ep = _dns_endpoint_find(id);
+        if (ep) { _dns_endpoint_policy_snapshot(ep, out); dns_client_server_info_release(ep); result = 0; } }
+    return result;
 }
 void _dns_services_network_tick(void)
 {
@@ -1165,14 +1177,41 @@ int dns_client_get_service_snapshot_v1(struct dns_upstream_service_snapshot_v1 *
     pthread_mutex_unlock(&registry_lock);
     pthread_mutex_lock(&client.server_list_lock);
     struct dns_server_info *ep;
+    unsigned legacy_count = 0;
+    list_for_each_entry(ep, &client.dns_server_list, list)
+        if (!ep->service && ep->type != DNS_SERVER_MDNS) legacy_count++;
+    unsigned available = count < capacity ? capacity - count : 0;
+    unsigned fill = legacy_count < available ? legacy_count : available;
+    struct dns_server_info **pins = fill ? calloc(fill, sizeof(*pins)) : NULL;
+    if (fill && !pins) { pthread_mutex_unlock(&client.server_list_lock); return -1; }
+    unsigned pinned = 0;
     list_for_each_entry(ep, &client.dns_server_list, list) {
+        if (pinned == fill) break;
         if (ep->service || ep->type == DNS_SERVER_MDNS) continue;
-        if (count < capacity) {
-            struct dns_upstream_service_snapshot_v1 *v = &out[count];
+        dns_client_server_info_get(ep); pins[pinned++] = ep;
+    }
+    pthread_mutex_unlock(&client.server_list_lock);
+    for (unsigned i = 0; i < fill; i++) {
+        ep = pins[i];
+        struct dns_upstream_service_snapshot_v1 *v = &out[count + i];
+        if (ep->diagnostic) {
+            _dns_endpoint_snapshot(ep, v, NULL);
+            pthread_mutex_lock(&ep->lock);
+            v->query_count = stats_read(&ep->stats.total); v->success_count = stats_read(&ep->stats.success_count);
+            v->recv_count = stats_read(&ep->stats.recv_count);
+            v->legacy_avg_time = dns_stats_server_stats_avg_time_get(&ep->stats);
+            v->attempt_count = v->failure_count = v->skip_count = v->in_flight = 0;
+            v->response_latency_sum_ms = v->response_latency_samples = 0;
+            v->attempt_rtt_sum_ms = v->attempt_rtt_samples = v->attempt_rtt_ambiguous_count = 0;
+            pthread_mutex_unlock(&ep->lock);
+        } else {
+            /* Memory-pressure fallback retains honest legacy counters; callers
+             * cannot mistake these for the closed diagnostic accounting. */
+            pthread_mutex_lock(&ep->lock);
             memset(v, 0, sizeof(*v)); v->version = 1; v->struct_size = sizeof(*v);
             safe_strncpy(v->authority, ep->host, sizeof(v->authority));
             safe_strncpy(v->selected_ips[0], ep->ip, sizeof(v->selected_ips[0]));
-            snprintf(v->service_id, sizeof(v->service_id), "legacy-%u", count);
+            snprintf(v->service_id, sizeof(v->service_id), "legacy-%u", count + i);
             v->port = ep->port; v->transport = ep->type; v->endpoint_count = 1;
             v->query_count = stats_read(&ep->stats.total); v->success_count = stats_read(&ep->stats.success_count);
             v->recv_count = stats_read(&ep->stats.recv_count);
@@ -1180,46 +1219,61 @@ int dns_client_get_service_snapshot_v1(struct dns_upstream_service_snapshot_v1 *
             v->freshness_kind = DNS_FRESHNESS_NOT_APPLICABLE;
             v->security = ep->security_status;
             v->status = !v->query_count ? DNS_SERVICE_UNKNOWN : atomic_read(&ep->is_alive) ? DNS_SERVICE_READY : DNS_SERVICE_UNAVAILABLE;
+            pthread_mutex_unlock(&ep->lock);
         }
-        count++;
+        dns_client_server_info_release(ep);
     }
-    pthread_mutex_unlock(&client.server_list_lock);
+    free(pins); count += legacy_count;
     return count;
 }
-int dns_client_get_service_endpoints_v1(const char *id, struct dns_upstream_endpoint_snapshot_v1 *out, unsigned capacity)
+/* Pin under ownership locks; copied snapshots never hold membership/list
+ * locks while taking a transport lock. */
+static int service_endpoint_pins(const char *id, struct dns_server_info **pins, unsigned capacity)
 {
-    if (!id || (!out && capacity)) return -1;
     struct dns_upstream_service *found = NULL, *s;
     pthread_mutex_lock(&registry_lock);
     list_for_each_entry(s, &services, list) if (!strcmp(id, s->id)) { found = s; _dns_service_get(s); break; }
     pthread_mutex_unlock(&registry_lock);
-    if (!found) return -1;
-    s = found;
-    struct dns_server_info *pins[DNS_UPSTREAM_BACKENDS_MAX * 2];
-    pthread_mutex_lock(&s->lock);
-    unsigned count = s->member_count, fill = count < capacity ? count : capacity;
-    for (unsigned i = 0; i < fill; i++) { pins[i] = s->members[i]; dns_client_server_info_get(pins[i]); }
-    pthread_mutex_unlock(&s->lock);
-    for (unsigned i = 0; i < fill; i++) {
-        struct dns_server_info *ep = pins[i];
-        struct dns_upstream_endpoint_snapshot_v1 *v = &out[i];
-        memset(v, 0, sizeof(*v)); v->version = 1; v->struct_size = sizeof(*v);
-        safe_strncpy(v->service_id, s->id, sizeof(v->service_id)); safe_strncpy(v->ip, ep->ip, sizeof(v->ip));
-        pthread_mutex_lock(&ep->lock);
-        v->port = ep->port; v->security = ep->security_status; v->active_attempts = ep->active_attempts;
-        unsigned long now = get_tick_count(), retry = __atomic_load_n(&ep->service_retry_at, __ATOMIC_ACQUIRE);
-        v->state = __atomic_load_n(&ep->service_revoked, __ATOMIC_ACQUIRE) ? DNS_ENDPOINT_DRAINING :
-            retry > now ? DNS_ENDPOINT_BACKOFF :
-            (ep->status == DNS_SERVER_STATUS_CONNECTED || ep->status == DNS_SERVER_STATUS_CONNECTIONLESS) ? DNS_ENDPOINT_READY :
-            ep->status == DNS_SERVER_STATUS_CONNECTING ? DNS_ENDPOINT_CONNECTING : DNS_ENDPOINT_NEW;
-        v->attempt_count = __atomic_load_n(&ep->service_attempt_count, __ATOMIC_RELAXED);
-        v->success_count = __atomic_load_n(&ep->service_success_count, __ATOMIC_RELAXED);
-        v->failure_count = __atomic_load_n(&ep->service_failure_count, __ATOMIC_RELAXED);
-        v->retry_remaining_ms = retry > now ? retry - now : 0;
-        pthread_mutex_unlock(&ep->lock);
-        dns_client_server_info_release(ep);
+    if (!found) {
+        struct dns_server_info *ep = _dns_endpoint_find(id);
+        if (!ep) return -1;
+        if (capacity) pins[0] = ep; else dns_client_server_info_release(ep);
+        return 1;
     }
-    _dns_service_put(s); return count;
+    pthread_mutex_lock(&found->lock);
+    unsigned count = found->member_count, fill = count < capacity ? count : capacity;
+    for (unsigned i = 0; i < fill; i++) { pins[i] = found->members[i]; dns_client_server_info_get(pins[i]); }
+    pthread_mutex_unlock(&found->lock); _dns_service_put(found); return count;
+}
+int dns_client_get_service_endpoints_v1(const char *id, struct dns_upstream_endpoint_snapshot_v1 *out, unsigned capacity)
+{
+    if (!id || (!out && capacity)) return -1;
+    struct dns_server_info *pins[DNS_UPSTREAM_BACKENDS_MAX * 2];
+    unsigned cap = capacity < DNS_UPSTREAM_BACKENDS_MAX * 2 ? capacity : DNS_UPSTREAM_BACKENDS_MAX * 2;
+    int count = service_endpoint_pins(id, pins, cap);
+    if (count < 0) return -1;
+    unsigned fill = (unsigned)count < cap ? (unsigned)count : cap;
+    for (unsigned i = 0; i < fill; i++) {
+        _dns_endpoint_backend_snapshot(pins[i], &out[i]); dns_client_server_info_release(pins[i]);
+    }
+    return count;
+}
+int dns_client_get_service_endpoint_activity_v1(const char *id,
+    struct dns_upstream_endpoint_activity_v1 *out, unsigned capacity)
+{
+    if (!id || (!out && capacity)) return -1;
+    struct dns_server_info *pins[DNS_UPSTREAM_BACKENDS_MAX * 2];
+    unsigned cap = capacity < DNS_UPSTREAM_BACKENDS_MAX * 2 ? capacity : DNS_UPSTREAM_BACKENDS_MAX * 2;
+    int count = service_endpoint_pins(id, pins, cap);
+    if (count < 0) return -1;
+    unsigned fill = (unsigned)count < cap ? (unsigned)count : cap;
+    for (unsigned i = 0; i < fill; i++) {
+        memset(&out[i], 0, sizeof(out[i]));
+        _dns_endpoint_backend_snapshot(pins[i], &out[i].endpoint);
+        _dns_policy_endpoint_activity(pins[i], &out[i]);
+        dns_client_server_info_release(pins[i]);
+    }
+    return count;
 }
 
 /* Caller owns q->lock; no service mutex nesting in transport admission. */

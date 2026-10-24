@@ -21,6 +21,13 @@ last observed errors, event counts and the global client-thread CPU sample.
 Each outcome dimension closes to its own failure/skip total; events may repeat
 and must never be added to query counts. Fixed HTTP cooldown is 1000ms by default,
 configurable from 1 to 10000ms; Retry-After is recorded as evidence only.
+HTTP cooldown and recovery leases belong to the affected backend node, while
+QPS tokens remain shared by service/explicit quota group. Pool transport-failure
+retry waits use the same fixed interval rather than exponential growth. Existing
+ordinary transport scheduling is unchanged. A separate endpoint-activity-v1 ABI
+reports lifetime node HTTP429/503 counters, current HTTP cooldown/recovery,
+fixed-100ms send-bin peaks and capture timestamps; it never infers a provider quota
+or starts probe traffic. Those node counters are independent of the 32-event ring.
 Recent events include capture-time Unix milliseconds, query name/type and DNS
 response summaries when available. An optional bounded event-context companion
 ABI is joined by sequence without changing policy-v1. Missing context stays
@@ -30,8 +37,10 @@ the browser timezone and keeps monotonic snapshot-relative ages separate from
 response elapsed time and HTTP cooldown.
 The mounted upstream table keeps one row per API service, shows its domain in
 Host and actual endpoint IP list in IP, and uses the stable service ID as the
-MaterialReactTable row identity. Ordinary rows retain the upstream's default
-index identity and unchanged display. The fixed dashboard does not mount its
+MaterialReactTable row identity. Ordinary endpoints also expose passive outcome/event diagnostics and canonical
+IDs, independent of list order. Only rows lacking an ID use the index fallback.
+The ordinary snapshot-v1 counters retain legacy semantics for older callers;
+new diagnostic callers receive closed accounting tagged endpoint-outcome-v1. The fixed dashboard does not mount its
 legacy overview component; this patch does not modify or add that component.
 
 Upstream response times retain the deployed two-decimal display fix; invalid or negative values show N/A. The API keeps its original precision.

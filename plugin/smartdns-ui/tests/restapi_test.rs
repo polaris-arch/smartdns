@@ -742,7 +742,8 @@ fn test_rest_api_service_pool_configuration_and_backend_identity() {
         let pools: Vec<_> = rows.iter().filter(|row| row.service.as_ref().map(|v| v.pool_enabled).unwrap_or(false)).collect();
         let ready = pools.len()==3 && pools.iter().all(|row| {
             let service=row.service.as_ref().unwrap();
-            service.freshness_status=="non_expiring" && service.diagnostics.as_ref()
+            service.freshness_status=="non_expiring" && service.endpoint_count==2 &&
+                service.diagnostics.as_ref().map(|d| d.backends.len()==2).unwrap_or(false) && service.diagnostics.as_ref()
                 .and_then(|d|d.policy.as_ref()).and_then(|p|p.get("paths")).and_then(serde_json::Value::as_array)
                 .map(|paths|paths.len()==2).unwrap_or(false)
         });
@@ -774,8 +775,19 @@ fn test_rest_api_service_pool_configuration_and_backend_identity() {
     assert!(!ordinary.service.as_ref().unwrap().pool_enabled);
     assert_eq!(ordinary.service.as_ref().unwrap().freshness_status, "not_applicable");
     assert_eq!(ordinary.service.as_ref().unwrap().freshness_remaining_ms, None);
-    assert_eq!(ordinary.service.as_ref().unwrap().stats_semantics, "legacy-endpoint-v1");
+    assert_eq!(ordinary.service.as_ref().unwrap().stats_semantics, "endpoint-outcome-v1");
     assert_eq!(ordinary.port, 5309);
+    let endpoint = ordinary.service.as_ref().unwrap();
+    assert_eq!(endpoint.service_id.len(), 64);
+    let diagnostics = endpoint.diagnostics.as_ref().expect("ordinary endpoints need real diagnostic data");
+    assert_eq!(diagnostics.backends.len(), 1); assert_eq!(diagnostics.backends[0].ip, "127.0.0.9");
+    assert!(endpoint.response_statistics.is_some());
+    let (code, body) = client.get(&format!("/api/upstream-server/{}/backends", endpoint.service_id)).unwrap();
+    assert_eq!(code, 200);
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["backend_list"][0]["ip"], "127.0.0.9");
+    assert!(body["backend_list"][0]["http_429"].is_u64());
+    assert!(body["backend_list"][0]["sends_peak_100ms"].is_u64());
     let row = pools.iter().find(|row| row.host == "resolver.example"
         && row.service.as_ref().unwrap().config_identity.path == "/dns-query").unwrap();
     assert_eq!(row.host, "resolver.example");

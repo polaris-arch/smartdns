@@ -74,10 +74,21 @@ struct dns_upstream_policy;
 struct dns_upstream_service;
 struct dns_service_observation;
 struct dns_query_attempt;
+struct dns_endpoint_diagnostics;
+struct dns_endpoint_observation;
 
 /* dns server information */
 struct dns_http3_control;
 struct dns_server_info {
+    struct dns_endpoint_diagnostics *diagnostic;
+    /* Writes/recovery use policy->lock. Cooldown deadline is atomically
+     * published for leaf send-turn checks; the rate bucket stays shared. */
+    unsigned long policy_cooldown, policy_last_warning;
+    uint64_t policy_backpressure_count, policy_recovery_epoch;
+    unsigned policy_recovering, policy_recovery_active;
+    uint64_t policy_http_429, policy_http_503, policy_last_backpressure_unix_ms;
+    unsigned long policy_send_bucket_tick;
+    uint64_t policy_send_bucket_count, policy_send_peak_100ms, policy_send_peak_unix_ms;
     struct dns_upstream_service *service;
     unsigned service_revoked, service_connection_held, service_failures;
     unsigned long service_retry_at, service_drain_until, service_valid_until;
@@ -318,6 +329,7 @@ struct dns_query_struct {
 
 	struct dns_query_budget *budget;
 	struct dns_query_attempt *attempts;
+    struct dns_endpoint_observation *endpoint_observations;
 	unsigned long created_tick;
     unsigned lifetime_ms;
 	unsigned long next_send_tick;
@@ -333,6 +345,7 @@ struct dns_query_struct {
 	/* has result */
 	int has_result;
     struct dns_upstream_service *result_service; /* NULL for an ordinary endpoint result. Observation owns service lifetime. */
+    struct dns_server_info *result_endpoint; /* Compared only; endpoint observations retain ordinary endpoints. */
 
 	/* ECS */
 	struct dns_client_ecs ecs;

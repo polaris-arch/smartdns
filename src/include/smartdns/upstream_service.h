@@ -65,6 +65,17 @@ int dns_client_get_service_snapshot_v1(struct dns_upstream_service_snapshot_v1 *
 int dns_client_get_service_endpoints_v1(const char *service_id,
     struct dns_upstream_endpoint_snapshot_v1 *out, unsigned capacity);
 
+/* Optional endpoint activity companion. Original endpoint-v1 stays unchanged.
+ * Send peaks use fixed 100ms bins, not an inferred provider quota. */
+struct dns_upstream_endpoint_activity_v1 {
+    unsigned struct_size, version;
+    struct dns_upstream_endpoint_snapshot_v1 endpoint;
+    uint64_t http_429, http_503, cooldown_remaining_ms, recovery_in_flight;
+    uint64_t sends_current_100ms, sends_peak_100ms, peak_unix_ms, last_backpressure_unix_ms;
+};
+int dns_client_get_service_endpoint_activity_v1(const char *service_id,
+    struct dns_upstream_endpoint_activity_v1 *out, unsigned capacity);
+
 /* Independent bounded policy/detail ABI. Never extend callers' snapshot-v1. */
 #define DNS_UPSTREAM_DETAIL_EVENTS 32
 #define DNS_UPSTREAM_DETAIL_PATHS 128

@@ -24,6 +24,8 @@ pub struct UpstreamDiagnostics {
     pub client_loop: serde_json::Value,
     #[serde(default)]
     pub policy: Option<serde_json::Value>,
+    #[serde(default)]
+    pub backends: Vec<crate::data_upstream_server::UpstreamBackendInfo>,
 }
 
 fn named(names: &[&str], values: &[u64]) -> Result<BTreeMap<String, u64>, String> {
@@ -50,12 +52,13 @@ impl UpstreamDiagnostics {
             version: 1, qps: raw.qps, burst: raw.burst, cooldown_ms: raw.cooldown_ms,
             failure_end: named(ENDS, &raw.failure_end)?, skip_end: named(ENDS, &raw.skip_end)?,
             skip_wait: named(WAITS, &raw.skip_wait)?, failure_last_event: named(&last, &raw.failure_last_event)?,
-            events: named(EVENTS, &raw.events)?, client_loop: serde_json::Value::Null, policy: None,
+            events: named(EVENTS, &raw.events)?, client_loop: serde_json::Value::Null, policy: None, backends: Vec::new(),
         })
     }
 
     pub fn fetch(id: &str) -> Result<(smartdns_c::dns_upstream_service_snapshot_v1, Self), String> {
         if id.len() != 64 || !id.bytes().all(|c| c.is_ascii_hexdigit()) { return Err("invalid service identifier".into()); }
+        let backends = crate::data_upstream_server::UpstreamBackendInfo::get_all(id).map_err(|e| e.to_string())?;
         let id = CString::new(id).map_err(|_| "invalid service identifier")?;
         let mut base = unsafe { std::mem::zeroed() };
         let mut raw = unsafe { std::mem::zeroed() };
@@ -63,6 +66,7 @@ impl UpstreamDiagnostics {
             return Err("service diagnostic snapshot unavailable".into());
         }
         let mut value = Self::from_snapshot(&base, &raw)?;
+        value.backends = backends;
         let mut loop_raw: smartdns_c::dns_client_loop_diagnostics_v1 = unsafe { std::mem::zeroed() };
         if unsafe { smartdns_c::dns_client_get_loop_diagnostics_v1(&mut loop_raw) } == 0
             && loop_raw.version == 1 && loop_raw.struct_size as usize == std::mem::size_of_val(&loop_raw) {

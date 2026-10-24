@@ -1,6 +1,6 @@
 --- a/src/lib/backend/server.ts
 +++ b/src/lib/backend/server.ts
-@@ -264,7 +264,48 @@
+@@ -264,7 +264,57 @@
      registrar: string;
  }
  
@@ -18,6 +18,14 @@
 +        a: number; aaaa: number; cname: number; soa: number} | null}>;
 +}
 +
++export interface UpstreamBackendData {
++    service_id: string; ip: string; port: number; state: string; security: string;
++    active_attempts: number; attempt_count: number; success_count: number; failure_count: number;
++    retry_remaining_ms: number; http_429: number; http_503: number; cooldown_remaining_ms: number;
++    recovery_in_flight: number; sends_current_100ms: number; sends_peak_100ms: number;
++    peak_unix_ms: number; last_backpressure_unix_ms: number;
++}
++
 +export interface UpstreamDiagnosticsData {
 +    version: number;
 +    qps: number;
@@ -28,6 +36,7 @@
 +    failure_last_event: Record<string, number>;
 +    events: Record<string, number>;
 +    policy?: UpstreamPolicyData | null;
++    backends?: UpstreamBackendData[];
 +    client_loop?: {cpu_percent?: number | null; sample_wall_ms?: number; sample_age_ms?: number;
 +      zero_wait_no_events?: number; iterations?: number; wakeups?: number} | null;
 +}
@@ -78,7 +87,7 @@
            const rate = cell.getValue<number>();
 -          return <span>{rate} %</span>;
 +          const poolRate = row.original.response_statistics?.success_rate;
-+          return <><span style={{whiteSpace: 'nowrap'}} title={row.original.pool_enabled ? '已发请求结算：排除竞速取消、未发送及本地取消 / Sent outcomes excluding races, unsent and local cancellation' : undefined}>{row.original.pool_enabled ? (typeof poolRate === 'number' ? `${poolRate.toFixed(2)} %` : '—') : `${rate} %`}</span><UpstreamDiagnostics server={row.original} /></>;
++          return <><span style={{whiteSpace: 'nowrap'}} title={row.original.response_statistics ? '已发请求结算：排除竞速取消、未发送及本地取消 / Sent outcomes excluding races, unsent and local cancellation' : undefined}>{row.original.response_statistics ? (typeof poolRate === 'number' ? `${poolRate.toFixed(2)} %` : '—') : `${rate} %`}</span><UpstreamDiagnostics server={row.original} /></>;
          },
        },
        {
@@ -99,13 +108,13 @@
    const table = useMaterialReactTable({
      columns,
      data,
-+    getRowId: (row, index) => row.pool_enabled && row.service_id ? row.service_id : String(index),
++    getRowId: (row, index) => row.service_id || String(index),
      localization: tableLocales,
      enableColumnResizing: true,
      enableColumnOrdering: false,
 --- /dev/null
 +++ b/src/components/dashboard/upstream-servers/upstream-diagnostics.tsx
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,200 @@
 +import type * as React from 'react';
 +import { useState } from 'react';
 +import { Box, Button, Chip, Dialog, DialogTitle, DialogContent, DialogActions, Paper, Tabs, Tab, Typography } from '@mui/material';
@@ -145,11 +154,12 @@
 +export function UpstreamDiagnostics({server}: {server: UpStreamServers}): React.JSX.Element | null {
 +  const [open,setOpen]=useState(false), [tab,setTab]=useState(0), [filter,setFilter]=useState('all');
 +  const d=server.diagnostics;
-+  if (!server.pool_enabled || !d) return null;
++  if (!d) return <Button size="small" disabled title="诊断采集暂不可用 / Diagnostic collection unavailable">诊断 / Diagnostics</Button>;
 +  const lang=i18n.language?.startsWith('zh') ? 0 : 1;
 +  const text=(cn:string,en:string):string => lang===0 ? cn : en;
 +  const name=(values:string[],index:number):string => values[index]?.split('|')[lang] ?? String(index);
 +  const policy=d.policy, loop=d.client_loop, stats=server.response_statistics;
++  const family=server.pool_enabled ? (policy?.family===4?'IPv4':policy?.family===6?'IPv6':text('双栈，按出口匹配','Dual stack, matched to egress')) : (server.ip?.includes(':')?'IPv6':'IPv4');
 +  const state=({ready:text('就绪','Ready'),cooldown:text('冷却中','Cooling down'),degraded:text('部分后端可用','Partially available'),
 +    discovering:text('发现后端中','Discovering'),unavailable:text('暂无可用后端','No eligible backend'),stale:text('使用旧地址','Using stale addresses')} as Record<string,string>)[server.service_status??'']??text('状态未确认','State unconfirmed');
 +  const counts=(values:Record<string,number>):React.JSX.Element => <Box component="dl" sx={{m:0}}>
@@ -189,15 +199,15 @@
 +  const columns={display:'grid',gridTemplateColumns:{xs:'minmax(0,1fr)',sm:'repeat(2,minmax(0,1fr))'},gap:1.5};
 +  return <><Button size="small" onClick={()=>{setOpen(true);}}>{text('诊断','Diagnostics')}</Button>
 +    <Dialog open={open} onClose={()=>{setOpen(false);}} maxWidth="lg" fullWidth aria-labelledby="upstream-diagnostics-title"
-+      sx={{'& .MuiDialog-paper':{m:{xs:1,sm:3},width:{xs:'calc(100% - 16px)',sm:'calc(100% - 48px)'},maxWidth:1000,maxHeight:'92dvh',borderRadius:3,fontSize:'clamp(12px, .3vw + 10px, 14px)',lineHeight:1.65},'& .MuiTab-root':{fontSize:'inherit',minWidth:80,px:1.5},'& .MuiChip-root':{fontSize:'.86em'}}}>
++      sx={(theme)=>({'& .MuiPaper-outlined':{bgcolor:'background.paper',borderColor:'rgba(15,23,42,.24)',...theme.applyStyles('dark',{borderColor:'rgba(255,255,255,.26)'})},'& .MuiDialog-paper':{m:{xs:1,sm:3},width:{xs:'calc(100% - 16px)',sm:'calc(100% - 48px)'},maxWidth:1000,maxHeight:'92dvh',borderRadius:3,fontSize:'clamp(12px, .3vw + 10px, 14px)',lineHeight:1.65},'& .MuiTab-root':{fontSize:'inherit',minWidth:80,px:1.5},'& .MuiChip-root':{fontSize:'.86em'}})}>
 +      <DialogTitle component="div" sx={{px:{xs:2,sm:3},py:2,borderBottom:'1px solid',borderColor:'divider',fontSize:'inherit'}}>
 +        <Box sx={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:1}}>
 +          <Typography component="h2" id="upstream-diagnostics-title" sx={{fontSize:'clamp(16px, 1vw + 12px, 20px)',fontWeight:700,m:0,overflowWrap:'anywhere'}}>{server.host}</Typography>
 +          <Chip size="small" variant="outlined" color={server.service_status==='ready'?'success':server.service_status==='cooldown'?'warning':'default'} label={state}/>
 +        </Box>
-+        <Box sx={{fontSize:12,color:'text.secondary',mt:.25}}>{text('上游诊断','Upstream diagnostics')} · {text('请求结算、协议观测与连接状态','Query outcomes, protocol events and connections')}</Box>
++        <Box sx={{fontSize:12,color:'text.secondary',mt:.25}}>{server.pool_enabled?text('服务池诊断','Service pool diagnostics'):text('单节点上游诊断','Endpoint diagnostics')} · {text('请求结算、协议观测与连接状态','Query outcomes, protocol events and connections')}</Box>
 +      </DialogTitle>
-+      <DialogContent sx={{p:{xs:1.5,sm:2.5},bgcolor:'background.default','& details > summary':{cursor:'pointer',listStylePosition:'inside'},'& small':{fontSize:'.9em',color:'text.secondary'}}}>
++      <DialogContent sx={theme=>({p:{xs:1.5,sm:2.5},backgroundColor:'#edf1f6',...theme.applyStyles('dark',{backgroundColor:'#101722'}),'& details > summary':{cursor:'pointer',listStylePosition:'inside'},'& small':{fontSize:'.9em',color:'text.secondary'}})}>
 +        {tab===0?<><Box sx={{display:'grid',gridTemplateColumns:{xs:'repeat(2,minmax(0,1fr))',sm:'repeat(4,minmax(0,1fr))'},gap:1,mt:1}}>
 +          {[[text('已发请求成功率','Sent-query success rate'),typeof stats?.success_rate==='number'?stats.success_rate.toFixed(2)+'%':'—','primary.main'],
 +            [text('已接受响应','Accepted responses'),quantity(server.success_count),'text.primary'],
@@ -238,18 +248,27 @@
 +          </Box>}
 +          {tab===1&&<Box sx={{display:'grid',gap:1.5}}>
 +            <Panel title={text('响应延迟','Response latency')}>
-+              <Box sx={{mb:1,color:'text.secondary'}}>{text('连接地址族','Transport family')}: {policy?.family===4?'IPv4':policy?.family===6?'IPv6':text('双栈，按出口匹配','Dual stack, matched to egress')}</Box>
++              <Box sx={{mb:1,color:'text.secondary'}}>{text('连接地址族','Transport family')}: {family}</Box>
 +              <Box sx={{display:'flex',gap:3,flexWrap:'wrap',fontVariantNumeric:'tabular-nums'}}>P50 {quantile(.5)} <span>P95 {quantile(.95)}</span><span>P99 {quantile(.99)}</span></Box>
 +              <Box sx={{mt:1,color:'text.secondary'}}>{text('响应直方图的上界估计，超时单独记录；不包含等待发送时间。','Histogram upper-bound estimates. Timeouts are separate; admission waiting is excluded.')}</Box>
 +              <Box sx={{mt:.5,color:'text.secondary'}}>{text('后端尝试计数包含取消与重试，不等同失败请求数。','Backend attempt counters include cancellation and retries; they are not failed-query counts.')}</Box>
 +            </Panel>
-+            <Box sx={columns}>{(policy?.paths??[]).map(path=><Panel key={path.ip} title={path.ip}>
++            <Box sx={columns}>{(policy?.paths??[]).map(path=>{const backend=d.backends?.find(b=>b.ip===path.ip&&b.state!=='draining');return <Panel key={path.ip} title={path.ip}>
 +              <Box sx={{display:'flex',gap:.75,flexWrap:'wrap',mb:1}}><Chip size="small" label={'IPv'+String(path.family)}/><Chip size="small" variant="outlined" color={path.connected?'success':'default'} label={path.connected?text('已连接','Connected'):text('未连接','Disconnected')}/><Chip size="small" variant="outlined" label={name(routes,path.state)}/></Box>
 +              <Box sx={{color:'text.secondary'}}>{text('出口','Egress')} {path.interface||'—'}<br/>{text('源地址','Source')} {path.source||'—'}</Box>
 +              <Box sx={{display:'grid',gridTemplateColumns:'repeat(2,minmax(0,1fr))',gap:1,mt:1.5,fontVariantNumeric:'tabular-nums'}}>
 +                {[[text('发送尝试','Attempts'),path.attempts],[text('接受','Accepted'),path.successes],[text('未成功尝试','Unsuccessful attempts'),path.failures],[text('在途','Active'),path.active_attempts]].map(([label,value])=><Box key={String(label)}><Box sx={{fontSize:'.9em',color:'text.secondary'}}>{label}</Box><strong>{quantity(Number(value))}</strong></Box>)}
 +              </Box><Box sx={{mt:1.5,color:'text.secondary'}}>{text('实际协议保活间隔','Effective protocol keepalive interval')}: {path.keepalive_ms?String(path.keepalive_ms)+' ms':text('关闭或尚未协商','Off or not negotiated')}</Box>
-+            </Panel>)}</Box>
++              {backend&&<Box sx={{mt:1.5,pt:1.5,borderTop:'1px solid',borderColor:'divider'}}>
++                <Box sx={{display:'flex',gap:.75,flexWrap:'wrap'}}><Chip size="small" variant="outlined" color={backend.http_429?'warning':'default'} label={`HTTP 429 · ${quantity(backend.http_429)}`}/><Chip size="small" variant="outlined" label={`HTTP 503 · ${quantity(backend.http_503)}`}/></Box>
++                <Box sx={{mt:1}}>{text('节点冷却剩余','Node cooldown remaining')}: <strong>{backend.cooldown_remaining_ms} ms</strong>{backend.recovery_in_flight>0?' · '+text('恢复探测中','Recovery probe in flight'):''}</Box>
++                {backend.retry_remaining_ms>backend.cooldown_remaining_ms&&<Box sx={{mt:.5}}>{text('故障重试等待','Failure retry wait')}: {backend.retry_remaining_ms} ms</Box>}
++                <Box sx={{mt:.5}}>{text('100 ms 发送峰值','Peak sends in 100 ms')}: <strong>{quantity(backend.sends_peak_100ms)}</strong></Box>
++                {backend.peak_unix_ms>0&&<Box sx={{fontSize:'.9em',color:'text.secondary'}}>{eventTime(backend.peak_unix_ms,i18n.language)}</Box>}
++                {backend.last_backpressure_unix_ms>0&&<Box sx={{mt:.5,fontSize:'.9em',color:'text.secondary'}}>{text('最近限流 / 不可用','Last backpressure')}: {eventTime(backend.last_backpressure_unix_ms,i18n.language)}</Box>}
++                <Box sx={{mt:1,fontSize:'.9em',color:'text.secondary'}}>{text('计数自该节点创建起累计，不受最近32条明细窗口限制。发送峰值用于观察短时突发，不代表上游QPS额度。','Counters accumulate for this node lifetime, independently of the 32-detail window. Send peaks show short bursts, not the provider QPS allowance.')}</Box>
++              </Box>}
++            </Panel>;})}</Box>
 +          </Box>}
 +          {tab===2&&<Box sx={{display:'grid',gap:1.5}}>
 +            <Panel title={text('累计观测事件','Cumulative observed events')}>
@@ -273,11 +292,12 @@
 +          {tab===3&&<Box sx={columns}>
 +            <Panel title={text('调度与期限','Scheduling and deadlines')}>
 +              <Box>QPS: {d.qps||text('不限','Unlimited')}</Box>
-+              <Box>{text('HTTP 固定冷却','Fixed HTTP cooldown')}: {d.cooldown_ms} ms</Box>
-+              <Box>{text('采样时冷却剩余','Cooldown remaining at snapshot')}: {server.cooldown_remaining_ms??'—'} ms</Box>
-+              <Box>{text('两族建连间隔','Family connection delay')}: {policy?.connect_delay_ms??'—'} ms</Box>
-+              <Box>{text('响应 / 建连 / 总期限','Response / connect / total')}: {policy?.response_timeout_ms??'—'} / {policy?.connect_timeout_ms??'—'} / {policy?.query_timeout_ms??'—'} ms</Box>
-+              <Box sx={{mt:1.5,color:'text.secondary'}}>{text('传输地址族','Transport family')}: {policy?.family===4?'IPv4':policy?.family===6?'IPv6':text('双栈，按出口匹配','Dual stack, matched to egress')}</Box>
++              <Box>{text('节点固定冷却 / 故障等待','Fixed node cooldown / failure wait')}: {d.cooldown_ms} ms</Box>
++              <Box>{server.pool_enabled?text('全部节点 HTTP 冷却时的最早解冻','Earliest thaw when all nodes are HTTP cooling'):text('节点冷却剩余','Node cooldown remaining')}: {server.cooldown_remaining_ms??'—'} ms</Box>
++              {server.pool_enabled&&<Box>{text('两族建连间隔','Family connection delay')}: {policy?.connect_delay_ms??'—'} ms</Box>}
++              <Box>{server.pool_enabled?text('响应 / 建连 / 总期限','Response / connect / total'):text('默认响应 / 总期限','Default response / total')}: {policy?.response_timeout_ms??'—'} / {server.pool_enabled?String(policy?.connect_timeout_ms??'—')+' / ':''}{policy?.query_timeout_ms??'—'} ms</Box>
++              <Box sx={{mt:1,color:'text.secondary'}}>{text('冷却按后端节点隔离；QPS仍按服务或既有共享配额组累计。','Cooldown is isolated per backend node; QPS remains shared by service or configured quota group.')}</Box>
++              <Box sx={{mt:1.5,color:'text.secondary'}}>{text('传输地址族','Transport family')}: {family}</Box>
 +            </Panel>
 +            <Panel title={text('连接保活','Protocol keepalive')}>
 +              <Box>{text('配置间隔','Configured interval')}: {policy?.keepalive_ms?String(policy.keepalive_ms)+' ms':text('关闭','Off')}</Box>

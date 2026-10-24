@@ -190,9 +190,14 @@ impl UpstreamServerInfo {
 
     pub fn get_all() -> Result<Vec<UpstreamServerInfo>, Box<dyn std::error::Error>> {
         smartdns::DnsUpstreamServices::snapshots()?.iter().map(|row| -> Result<Self, Box<dyn std::error::Error>> {
-            if row.pool_enabled == 0 { return Self::from_snapshot(row).map_err(|error| error.into()); }
             let id = smartdns::snapshot_string(&row.service_id)?;
-            let (base, diagnostics) = crate::data_upstream_diagnostics::UpstreamDiagnostics::fetch(&id)?;
+            let (base, diagnostics) = match crate::data_upstream_diagnostics::UpstreamDiagnostics::fetch(&id) {
+                Ok(value) => value,
+                // A failed passive allocation retains the honest legacy row;
+                // it must not blank every upstream or fabricate diagnostics.
+                Err(_) if row.pool_enabled == 0 => return Self::from_snapshot(row).map_err(|error| error.into()),
+                Err(error) => return Err(error.into()),
+            };
             let mut result = Self::from_snapshot(&base)?;
             result.attach_diagnostics(diagnostics)?;
             Ok(result)
@@ -203,13 +208,14 @@ impl UpstreamServerInfo {
         let service = self.service.as_mut().ok_or("missing service details")?;
         let statistics = ResponseStatistics::from_diagnostics(service.success_count, service.failure_count, &diagnostics)?;
         self.query_success_rate = statistics.success_rate.unwrap_or(0.0);
+        if !service.pool_enabled { service.stats_semantics = "endpoint-outcome-v1".into(); }
         service.response_statistics = Some(statistics);
         service.diagnostics = Some(diagnostics);
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UpstreamBackendInfo {
     pub service_id: String,
     pub ip: String,
@@ -221,20 +227,35 @@ pub struct UpstreamBackendInfo {
     pub success_count: u64,
     pub failure_count: u64,
     pub retry_remaining_ms: u64,
+    pub http_429: u64,
+    pub http_503: u64,
+    pub cooldown_remaining_ms: u64,
+    pub recovery_in_flight: u64,
+    pub sends_current_100ms: u64,
+    pub sends_peak_100ms: u64,
+    pub peak_unix_ms: u64,
+    pub last_backpressure_unix_ms: u64,
 }
 impl UpstreamBackendInfo {
+    pub fn from_activity(activity: &smartdns::smartdns_c::dns_upstream_endpoint_activity_v1) -> Result<Self, String> {
+        let row = &activity.endpoint;
+        Ok(Self {
+            service_id: smartdns::snapshot_string(&row.service_id)?,
+            ip: smartdns::snapshot_string(&row.ip)?, port: row.port as u16,
+            state: match row.state { 0 => "new", 1 => "connecting", 2 => "ready", 3 => "backoff", 4 => "draining", _ => "unknown" }.into(),
+            security: smartdns::DnsServerTrustStatus::from(row.security).to_string(),
+            active_attempts: row.active_attempts, attempt_count: row.attempt_count,
+            success_count: row.success_count, failure_count: row.failure_count,
+            retry_remaining_ms: row.retry_remaining_ms,
+            http_429: activity.http_429, http_503: activity.http_503,
+            cooldown_remaining_ms: activity.cooldown_remaining_ms, recovery_in_flight: activity.recovery_in_flight,
+            sends_current_100ms: activity.sends_current_100ms, sends_peak_100ms: activity.sends_peak_100ms,
+            peak_unix_ms: activity.peak_unix_ms, last_backpressure_unix_ms: activity.last_backpressure_unix_ms,
+        })
+    }
     pub fn get_all(id: &str) -> Result<Vec<Self>, Box<dyn std::error::Error>> {
-        smartdns::DnsUpstreamServices::endpoints(id)?.iter().map(|row| {
-            Ok(Self {
-                service_id: smartdns::snapshot_string(&row.service_id)?,
-                ip: smartdns::snapshot_string(&row.ip)?, port: row.port as u16,
-                state: match row.state { 0 => "new", 1 => "connecting", 2 => "ready", 3 => "backoff", 4 => "draining", _ => "unknown" }.into(),
-                security: smartdns::DnsServerTrustStatus::from(row.security).to_string(),
-                active_attempts: row.active_attempts, attempt_count: row.attempt_count,
-                success_count: row.success_count, failure_count: row.failure_count,
-                retry_remaining_ms: row.retry_remaining_ms,
-            })
-        }).collect()
+        smartdns::DnsUpstreamServices::endpoint_activity(id)?.iter()
+            .map(|row| Self::from_activity(row).map_err(|error| error.into())).collect()
     }
 }
 
@@ -390,4 +411,32 @@ mod tests {
         raw.endpoint_count = 0; raw.authority.fill(b'a' as c_char);
         assert!(UpstreamServerInfo::from_snapshot(&raw).is_err());
     }
+    #[test]
+    fn ordinary_endpoint_outcomes_use_the_same_race_exclusion_and_keep_distinct_semantics() {
+        let mut base = snapshot(); base.pool_enabled = 0;
+        base.success_count = 9; base.failure_count = 4; base.skip_count = 3; base.query_count = 16;
+        let mut raw: smartdns::smartdns_c::dns_upstream_service_diagnostics_v1 = unsafe { std::mem::zeroed() };
+        raw.version = 1; raw.struct_size = std::mem::size_of_val(&raw) as u32; raw.cooldown_ms = 1000;
+        raw.failure_end[0] = 3; raw.failure_end[1] = 1; raw.failure_last_event[0] = 4;
+        raw.skip_end[0] = 3; raw.skip_wait[0] = 3;
+        let diagnostics = crate::data_upstream_diagnostics::UpstreamDiagnostics::from_snapshot(&base, &raw).unwrap();
+        let mut row = UpstreamServerInfo::from_snapshot(&base).unwrap(); row.attach_diagnostics(diagnostics).unwrap();
+        assert_eq!(row.query_success_rate, 90.0);
+        let details = row.service.unwrap(); assert!(!details.pool_enabled);
+        assert_eq!(details.stats_semantics, "endpoint-outcome-v1");
+        assert_eq!(details.response_statistics.unwrap().race_cancelled, 3);
+    }
+    #[test]
+    fn backend_activity_preserves_actual_node_counts_fixed_bucket_units_and_timestamps() {
+        let mut raw: smartdns::smartdns_c::dns_upstream_endpoint_activity_v1 = unsafe { std::mem::zeroed() };
+        text(&mut raw.endpoint.service_id, &"a".repeat(64)); text(&mut raw.endpoint.ip, "120.53.53.53");
+        raw.endpoint.port = 443; raw.endpoint.state = 3; raw.endpoint.attempt_count = 120;
+        raw.http_429 = 7; raw.http_503 = 1; raw.cooldown_remaining_ms = 900;
+        raw.sends_peak_100ms = 4; raw.peak_unix_ms = 1792809826000;
+        let row = UpstreamBackendInfo::from_activity(&raw).unwrap();
+        assert_eq!(row.http_429, 7); assert_eq!(row.attempt_count, 120);
+        assert_eq!(row.sends_peak_100ms, 4); assert_eq!(row.peak_unix_ms, 1792809826000);
+        assert_eq!(row.state, "backoff"); assert_eq!(row.cooldown_remaining_ms, 900);
+    }
+
 }

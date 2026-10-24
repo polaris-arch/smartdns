@@ -16,6 +16,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "upstream_observer.h"
 #include "smartdns/util.h"
 
 #include "conn_stream.h"
@@ -47,6 +48,7 @@ void _dns_client_query_release(struct dns_query_struct *query)
 		return;
 	}
 
+    _dns_endpoint_query_finish(query);
 	dns_query_budget_put(query->budget);
 	query->budget = NULL;
 
@@ -68,6 +70,7 @@ void _dns_client_query_release(struct dns_query_struct *query)
 
 	_dns_attempt_free_all(query);
     _dns_service_query_free(query);
+    _dns_endpoint_query_free(query);
 	pthread_mutex_destroy(&query->lock);
 
 	/* free resource */

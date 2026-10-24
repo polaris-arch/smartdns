@@ -1,5 +1,6 @@
 /* Transport-family policy, cached kernel routes and bounded diagnostic evidence. */
 #define _GNU_SOURCE
+#include "upstream_observer.h"
 #include "upstream_service.h"
 #include "upstream_discovery.h"
 #include "smartdns/util.h"
@@ -145,8 +146,10 @@ int _dns_path_allowed(struct dns_upstream_service *service, const char *ip)
 static void service_detail(struct dns_query_struct *query, struct dns_server_info *endpoint,
     unsigned kind, unsigned phase, int code, unsigned elapsed, unsigned limit, struct dns_packet *packet)
 {
-    if (!endpoint || !endpoint->service || kind >= DNS_DETAIL_COUNT) return;
-    struct dns_upstream_service *service = endpoint->service;
+    if (!endpoint || (!endpoint->service && !endpoint->diagnostic) || kind >= DNS_DETAIL_COUNT) return;
+    pthread_mutex_t *lock = endpoint->service ? &endpoint->service->detail_lock : &endpoint->diagnostic->lock;
+    struct dns_upstream_policy_snapshot_v1 *detail = endpoint->service ? &endpoint->service->detail : &endpoint->diagnostic->detail;
+    struct dns_upstream_event_context_v1 *contexts = endpoint->service ? endpoint->service->event_context : endpoint->diagnostic->context;
     struct dns_upstream_event_v1 event = {0};
     event.tick_ms = get_tick_count(); event.kind = kind; event.phase = phase; event.code = code;
     event.query_id = query ? query->sid : 0;
@@ -179,23 +182,22 @@ static void service_detail(struct dns_query_struct *query, struct dns_server_inf
             }
         }
     }
-    pthread_mutex_lock(&service->detail_lock);
-    struct dns_upstream_policy_snapshot_v1 *detail = &service->detail;
+    pthread_mutex_lock(lock);
     event.sequence = ++detail->sequence; detail->kind_counts[kind]++;
     context.sequence = event.sequence;
     if (kind == DNS_DETAIL_DNS_REJECT) detail->reject_counts[code >= 0 && code < DNS_REJECT_COUNT ? code : 0]++;
     /* Healthy idle probes stay in counters, preserving the bounded ring for failures and lifecycle events. */
     if (kind == DNS_DETAIL_KEEPALIVE_SENT || kind == DNS_DETAIL_KEEPALIVE_ACK) {
-        pthread_mutex_unlock(&service->detail_lock); return;
+        pthread_mutex_unlock(lock); return;
     }
     if (detail->event_count == DNS_UPSTREAM_DETAIL_EVENTS) detail->dropped_events++;
     else detail->event_count++;
     memmove(&detail->events[1], &detail->events[0], (detail->event_count - 1) * sizeof(event));
-    memmove(&service->event_context[1], &service->event_context[0],
+    memmove(&contexts[1], &contexts[0],
         (detail->event_count - 1) * sizeof(context));
     detail->events[0] = event;
-    service->event_context[0] = context;
-    pthread_mutex_unlock(&service->detail_lock);
+    contexts[0] = context;
+    pthread_mutex_unlock(lock);
 }
 void _dns_service_detail(struct dns_query_struct *query, struct dns_server_info *endpoint,
     unsigned kind, unsigned phase, int code, unsigned elapsed, unsigned limit)
@@ -205,10 +207,10 @@ void _dns_service_detail_dns(struct dns_query_struct *query, struct dns_server_i
 { service_detail(query, endpoint, kind, phase, code, 0, 0, packet); }
 void _dns_service_response_time(struct dns_server_info *endpoint, unsigned elapsed)
 {
-    if (!endpoint->service) return;
+    if (!endpoint->service && !endpoint->diagnostic) return;
     static const unsigned upper[] = {10, 25, 50, 100, 250, 500, 1000, 2000};
     unsigned bin = 0; while (bin < 8 && elapsed > upper[bin]) bin++;
-    pthread_mutex_lock(&endpoint->service->detail_lock);
-    endpoint->service->detail.response_histogram[bin]++;
-    pthread_mutex_unlock(&endpoint->service->detail_lock);
+    pthread_mutex_t *lock = endpoint->service ? &endpoint->service->detail_lock : &endpoint->diagnostic->lock;
+    struct dns_upstream_policy_snapshot_v1 *detail = endpoint->service ? &endpoint->service->detail : &endpoint->diagnostic->detail;
+    pthread_mutex_lock(lock); detail->response_histogram[bin]++; pthread_mutex_unlock(lock);
 }

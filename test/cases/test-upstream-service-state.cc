@@ -211,9 +211,9 @@ TEST(UpstreamRoundRobin, MixedGroupLegacyFirstConnectionIsNotFalselyProhibited) 
     pthread_mutex_destroy(&client.server_list_lock);
 }
 TEST(UpstreamServiceState, NewEpochRejectsOldUnsentOwnerAndAllowsExactlyOneProbe) {
-    ServiceState s; ServiceQuery old(s), probe(s), waiting(s);
+    ServiceState s(1); ServiceQuery old(s), probe(s), waiting(s);
     auto *old_ep = Pick(s, old); ASSERT_NE(old_ep, nullptr); unsigned old_gen = Generation(old, old_ep);
-    _dns_policy_http_error(&s.endpoints[1], 429, "0");
+    _dns_policy_http_error(&s.endpoints[0], 429, "0");
     EXPECT_EQ(_dns_attempt_wire_begin(&old.q, old_ep, old_gen), DNS_ADMIT_DONE);
     Retire(old, old_ep); s.Flush();
     EXPECT_EQ(Pick(s, probe), nullptr);
@@ -223,16 +223,16 @@ TEST(UpstreamServiceState, NewEpochRejectsOldUnsentOwnerAndAllowsExactlyOneProbe
     Positive(s, probe, probe_ep); EXPECT_EQ(Pick(s, waiting), nullptr); // lease committed, recovery still exclusive
     _dns_attempt_replied(&probe.q, probe_ep); Retire(probe, probe_ep);
     s.s.next_eligible = 0; // deterministic advisory-timer wake after policy recovery
-    auto *next = Pick(s, waiting); ASSERT_EQ(next, &s.endpoints[1]); Retire(waiting, next); s.Flush();
+    auto *next = Pick(s, waiting); ASSERT_EQ(next, &s.endpoints[0]); Retire(waiting, next); s.Flush();
 }
 TEST(UpstreamServiceState, OldInflightReplyCannotClearNewEpochAndCanceledProbeReleasesOnlyItsLease) {
-    ServiceState s; ServiceQuery old(s), probe(s), replacement(s);
+    ServiceState s(1); ServiceQuery old(s), probe(s), replacement(s);
     auto *old_ep = Pick(s, old); ASSERT_NE(old_ep, nullptr); Positive(s, old, old_ep);
-    _dns_policy_http_error(&s.endpoints[1], 503, "0");
+    _dns_policy_http_error(&s.endpoints[0], 503, "0");
     _dns_attempt_replied(&old.q, old_ep); Retire(old, old_ep);
     EXPECT_GT(_dns_policy_service_wait(&s.s, get_tick_count()), 0UL);
     usleep(150000); s.s.next_eligible = 0;
-    auto *probe_ep = Pick(s, probe); ASSERT_EQ(probe_ep, &s.endpoints[1]);
+    auto *probe_ep = Pick(s, probe); ASSERT_EQ(probe_ep, &s.endpoints[0]);
     EXPECT_EQ(Pick(s, replacement), nullptr);
     Retire(probe, probe_ep); s.Flush(); s.s.next_eligible = 0;
     auto *next = Pick(s, replacement); ASSERT_EQ(next, probe_ep); // unsent probe did not consume RR turn
@@ -522,7 +522,7 @@ TEST(UpstreamServiceState, SnapshotFreshnessHasNoInfiniteIntegerSentinel) {
 
 TEST(UpstreamServiceState, FixedCooldownDefaultsAndDoesNotGrowOrFollowRetryAfter) {
     for (unsigned configured : {0U, 1U, 1000U, 10000U}) {
-        ServiceState s(2, 0, "", 0, 0, configured);
+        ServiceState s(1, 0, "", 0, 0, configured);
         unsigned expected = configured ? configured : 1000;
         for (const char *header : {"0", "3600", "invalid", "18446744073709551615000"}) {
             unsigned long before = get_tick_count();
@@ -539,7 +539,7 @@ TEST(UpstreamServiceState, FixedCooldownDefaultsAndDoesNotGrowOrFollowRetryAfter
     }
 }
 TEST(UpstreamServiceState, DiagnosticDimensionsDistinguishOtherWinnerCoolingAndRejectedReply) {
-    ServiceState s;
+    ServiceState s(1);
     { ServiceQuery canceled(s); auto *ep = Pick(s, canceled); ASSERT_NE(ep, nullptr);
       Positive(s, canceled, ep); canceled.q.has_result = 1; Retire(canceled, ep); }
     EXPECT_EQ(s.s.stats.failure_count, 1U);
@@ -589,4 +589,54 @@ TEST(UpstreamServiceState, ServiceDeadlineRecordsWholeAgeWithoutPenalizingEndpoi
     EXPECT_EQ(s.s.detail.kind_counts[DNS_DETAIL_RESPONSE_TIMEOUT],0U);
     EXPECT_GE(s.s.detail.events[0].elapsed_ms,800U);EXPECT_EQ(s.s.detail.events[0].limit_ms,700U);
     EXPECT_EQ(ep->service_retry_at,0U);
+}
+
+TEST(UpstreamServiceState, OneLimitedNodeDoesNotCoolHealthyPeerAndAllBlockedUseEarliestThaw) {
+    ServiceState state(2, 0, "", 0, 0, 1000);
+    auto *limited = &state.endpoints[0], *healthy = &state.endpoints[1];
+    _dns_policy_http_error(limited, 429, "3600");
+    EXPECT_GT(_dns_policy_endpoint_cooldown(limited, get_tick_count()), 0U);
+    EXPECT_EQ(_dns_policy_endpoint_cooldown(healthy, get_tick_count()), 0U);
+    EXPECT_EQ(_dns_policy_service_cooldown(&state.s, get_tick_count()), 0U);
+    EXPECT_EQ(_dns_policy_service_wait(&state.s, get_tick_count()), 0U);
+    { ServiceQuery query(state); auto *ep = Pick(state, query); ASSERT_EQ(ep, healthy);
+      Positive(state, query, ep); _dns_attempt_replied(&query.q, ep);
+      EXPECT_TRUE(limited->policy_recovering); // healthy peer cannot reopen this node
+      Retire(query, ep); }
+    _dns_policy_http_error(healthy, 503, "0");
+    auto wait = _dns_policy_service_cooldown(&state.s, get_tick_count());
+    EXPECT_GT(wait, 0U); EXPECT_LE(wait, 1000U);
+    { ServiceQuery query(state); EXPECT_EQ(Pick(state, query), nullptr); }
+    dns_upstream_endpoint_activity_v1 a{}, b{};
+    _dns_policy_endpoint_activity(limited, &a); _dns_policy_endpoint_activity(healthy, &b);
+    EXPECT_EQ(a.http_429, 1U); EXPECT_EQ(a.http_503, 0U);
+    EXPECT_EQ(b.http_429, 0U); EXPECT_EQ(b.http_503, 1U);
+    EXPECT_GT(b.sends_peak_100ms, 0U);
+}
+TEST(UpstreamServiceState, NodeIsolationCannotRefillOrBypassSharedServiceRate) {
+    ServiceState state(2, 0, "", 1, 1, 100);
+    { ServiceQuery first(state); auto *ep = Pick(state, first); ASSERT_NE(ep, nullptr);
+      Positive(state, first, ep); Retire(first, ep); }
+    _dns_policy_http_error(&state.endpoints[0], 429, "0");
+    unsigned reason = DNS_WAIT_NONE;
+    EXPECT_GT(_dns_policy_service_wait_reason(&state.s, get_tick_count(), &reason), 0U);
+    EXPECT_EQ(reason, DNS_WAIT_RATE);
+    ServiceQuery next(state); EXPECT_EQ(Pick(state, next), nullptr);
+}
+
+TEST(UpstreamServiceState, TransportFailureWaitUsesFixedConfiguredNodeCooldownWithoutGrowth) {
+    for (unsigned configured : {0U, 1U, 1000U, 10000U}) {
+        ServiceState state(2, 0, "", 0, 0, configured);
+        auto *failed = &state.endpoints[0], *healthy = &state.endpoints[1];
+        unsigned expected = configured ? configured : 1000;
+        for (unsigned turn = 0; turn < 9; turn++) {
+            failed->service_retry_at = 0; // deterministic passage of the prior wait
+            unsigned long before = get_tick_count(); _dns_service_endpoint_failure(failed);
+            unsigned long after = get_tick_count();
+            EXPECT_GE(failed->service_retry_at - before, expected);
+            EXPECT_LE(failed->service_retry_at - before, expected + after - before);
+            EXPECT_EQ(healthy->service_retry_at, 0U);
+        }
+        EXPECT_EQ(failed->service_failures, 9U);
+    }
 }

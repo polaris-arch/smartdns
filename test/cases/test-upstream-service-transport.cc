@@ -389,7 +389,7 @@ void transport_case(bool h2, bool throttle, unsigned nodata_rate = 0, unsigned c
     EXPECT_EQ(snapshot.success_count, queries); EXPECT_EQ(snapshot.failure_count, 0U); EXPECT_EQ(snapshot.skip_count, 0U);
     EXPECT_EQ(snapshot.attempt_count, queries + (throttle ? 1 : 0));
     EXPECT_EQ(first.requests + second.requests, queries + (throttle ? 1 : 0));
-    EXPECT_LE(std::abs(static_cast<int>(first.requests) - static_cast<int>(second.requests)), 1);
+    if (!throttle) EXPECT_LE(std::abs(static_cast<int>(first.requests) - static_cast<int>(second.requests)), 1);
     EXPECT_EQ(first.connections, 1U); EXPECT_EQ(second.connections, 1U);
     if (h2 && throttle) {
         dns_upstream_policy_snapshot_v1 detail{};
@@ -437,11 +437,19 @@ void transport_case(bool h2, bool throttle, unsigned nodata_rate = 0, unsigned c
         EXPECT_TRUE(received); // H2 data must refresh legacy idle accounting too.
     }
     std::lock_guard<std::mutex> guard(lock);
-    for (size_t i = 1; i < wire_backend.size(); i++) EXPECT_NE(wire_backend[i - 1], wire_backend[i]);
-    if (throttle) {
+    if (!throttle) {
+        for (size_t i = 1; i < wire_backend.size(); i++) EXPECT_NE(wire_backend[i - 1], wire_backend[i]);
+    } else {
         ASSERT_GE(wire_times.size(), 2U);
-        EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(wire_times[1] - wire_times[0]).count(),
-            cooldown_ms ? cooldown_ms - 10 : 900);
+        unsigned limited = wire_backend.front();
+        EXPECT_NE(wire_backend[1], limited); // healthy peer remains usable immediately
+        for (size_t i = 1; i < wire_times.size(); i++) if (wire_backend[i] == limited)
+            EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(wire_times[i] - wire_times[0]).count(),
+                cooldown_ms ? cooldown_ms - 10 : 900);
+        dns_upstream_endpoint_activity_v1 nodes[2]{};
+        ASSERT_EQ(dns_client_get_service_endpoint_activity_v1(snapshot.service_id, nodes, 2), 2);
+        EXPECT_EQ(nodes[0].http_429 + nodes[1].http_429, 1U);
+        EXPECT_EQ(nodes[0].http_503 + nodes[1].http_503, 0U);
     }
 }
 } // namespace
@@ -449,7 +457,7 @@ TEST(UpstreamServiceTransport, RealTlsDualBackendRoundRobinAndConnectionReuse) {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT({ transport_case(false, false); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
 }
-TEST(UpstreamServiceTransport, RealH2DualBackendShared429CooldownAndRoundRobin) {
+TEST(UpstreamServiceTransport, RealH2DualBackendNode429IsolationAndConnectionReuse) {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT({ transport_case(true, true); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
 }

@@ -47,10 +47,10 @@ struct Endpoint {
         pthread_mutex_destroy(&server.lock);
         pthread_mutex_destroy(&query.lock);
     }
-    int Begin() { return _dns_attempt_begin(&query, &server); }
-    int Wire() { return _dns_attempt_wire_begin(&query, &server, _dns_attempt_generation(&query, &server)); }
-    void Progress() { _dns_attempt_mark_sent(&query, &server, _dns_attempt_generation(&query, &server)); }
-    int Retire() { return _dns_attempt_retire(&query, &server, _dns_attempt_generation(&query, &server)); }
+    int Begin(dns_server_info *target = nullptr) { return _dns_attempt_begin(&query, target ? target : &server); }
+    int Wire(dns_server_info *target = nullptr) { auto *ep = target ? target : &server; return _dns_attempt_wire_begin(&query, ep, _dns_attempt_generation(&query, ep)); }
+    void Progress(dns_server_info *target = nullptr) { auto *ep = target ? target : &server; _dns_attempt_mark_sent(&query, ep, _dns_attempt_generation(&query, ep)); }
+    int Retire(dns_server_info *target = nullptr) { auto *ep = target ? target : &server; return _dns_attempt_retire(&query, ep, _dns_attempt_generation(&query, ep)); }
 };
 int SaveHeader(void *p, const char *, const char *value) {
     *static_cast<std::string *>(p) = value; return 0;
@@ -411,111 +411,110 @@ TEST(UpstreamPolicy, Http1ProductionWriteOwnerBecomesCancellationTombstone) {
 }
 
 // Recovery uses no provider-specific QPS and never opens all queued owners
-// merely because their shared cooldown has expired.
-TEST(UpstreamPolicy, RecoverySerializesPrebufferedSharedEndpointsUntilAcceptedReply) {
+// merely because that node cooldown has expired.
+TEST(UpstreamPolicy, RecoverySerializesPrebufferedQueriesOnTheSameNodeUntilAcceptedReply) {
     Endpoint a(0, 0, "recover-buffered"), b(0, 0, "recover-buffered"), healthy;
     ASSERT_EQ(a.Begin(), DNS_ADMIT_OK);
-    ASSERT_EQ(b.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(b.Begin(&a.server), DNS_ADMIT_OK);
     _dns_policy_http_error(&a.server, 429, "0");
     EXPECT_EQ(a.Wire(), DNS_ADMIT_WAIT);
-    EXPECT_EQ(b.Wire(), DNS_ADMIT_WAIT);
+    EXPECT_EQ(b.Wire(&a.server), DNS_ADMIT_WAIT);
     ASSERT_EQ(healthy.Begin(), DNS_ADMIT_OK);
     EXPECT_EQ(healthy.Wire(), DNS_ADMIT_OK);
     usleep(150000);
     ASSERT_EQ(a.Wire(), DNS_ADMIT_OK);
     // WANT_WRITE may continue its own lease before positive progress.
     EXPECT_EQ(a.Wire(), DNS_ADMIT_OK);
-    EXPECT_EQ(b.Wire(), DNS_ADMIT_WAIT);
+    EXPECT_EQ(b.Wire(&a.server), DNS_ADMIT_WAIT);
     a.Progress();
     ASSERT_EQ(a.Retire(), 1);
     _dns_attempt_replied(&a.query, &a.server);
-    EXPECT_EQ(b.Wire(), DNS_ADMIT_OK);
+    EXPECT_EQ(b.Wire(&a.server), DNS_ADMIT_OK);
 }
 TEST(UpstreamPolicy, RecoveryRetirementPermitsOneNextProbeWithoutOpeningPolicy) {
     Endpoint a(0, 0, "recover-retire"), b(0, 0, "recover-retire"), c(0, 0, "recover-retire");
     ASSERT_EQ(a.Begin(), DNS_ADMIT_OK);
-    ASSERT_EQ(b.Begin(), DNS_ADMIT_OK);
-    ASSERT_EQ(c.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(b.Begin(&a.server), DNS_ADMIT_OK);
+    ASSERT_EQ(c.Begin(&a.server), DNS_ADMIT_OK);
     _dns_policy_http_error(&a.server, 503, "0");
     usleep(150000);
     ASSERT_EQ(a.Wire(), DNS_ADMIT_OK); a.Progress();
     EXPECT_EQ(_dns_attempt_retire(&a.query, &a.server,
         _dns_attempt_generation(&a.query, &a.server) + 1), 0);
-    EXPECT_EQ(b.Wire(), DNS_ADMIT_WAIT);
+    EXPECT_EQ(b.Wire(&a.server), DNS_ADMIT_WAIT);
     ASSERT_EQ(a.Retire(), 1);
     EXPECT_EQ(a.Retire(), 0);
-    ASSERT_EQ(b.Wire(), DNS_ADMIT_OK);
-    EXPECT_EQ(c.Wire(), DNS_ADMIT_WAIT);
-    b.Progress(); ASSERT_EQ(b.Retire(), 1);
-    _dns_attempt_replied(&b.query, &b.server);
-    EXPECT_EQ(c.Wire(), DNS_ADMIT_OK);
+    ASSERT_EQ(b.Wire(&a.server), DNS_ADMIT_OK);
+    EXPECT_EQ(c.Wire(&a.server), DNS_ADMIT_WAIT);
+    b.Progress(&a.server); ASSERT_EQ(b.Retire(&a.server), 1);
+    _dns_attempt_replied(&b.query, &a.server);
+    EXPECT_EQ(c.Wire(&a.server), DNS_ADMIT_OK);
 }
 TEST(UpstreamPolicy, NewBackpressureEpochRejectsOldProbeCompletion) {
     Endpoint a(0, 0, "recover-epoch"), b(0, 0, "recover-epoch"), c(0, 0, "recover-epoch");
     ASSERT_EQ(a.Begin(), DNS_ADMIT_OK);
-    ASSERT_EQ(b.Begin(), DNS_ADMIT_OK);
-    ASSERT_EQ(c.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(b.Begin(&a.server), DNS_ADMIT_OK);
+    ASSERT_EQ(c.Begin(&a.server), DNS_ADMIT_OK);
     _dns_policy_http_error(&a.server, 429, "0");
     usleep(150000);
     ASSERT_EQ(a.Wire(), DNS_ADMIT_OK); a.Progress();
     _dns_policy_http_error(&a.server, 429, "0");
     ASSERT_EQ(a.Retire(), 1);
     _dns_attempt_replied(&a.query, &a.server); // prior epoch is stale
-    EXPECT_EQ(b.Wire(), DNS_ADMIT_WAIT);
+    EXPECT_EQ(b.Wire(&a.server), DNS_ADMIT_WAIT);
     usleep(150000);
-    ASSERT_EQ(b.Wire(), DNS_ADMIT_OK); b.Progress();
+    ASSERT_EQ(b.Wire(&a.server), DNS_ADMIT_OK); b.Progress(&a.server);
     _dns_attempt_replied(&a.query, &a.server); // cannot release b's lease
-    EXPECT_EQ(c.Wire(), DNS_ADMIT_WAIT);
-    ASSERT_EQ(b.Retire(), 1);
-    _dns_attempt_replied(&b.query, &b.server);
-    EXPECT_EQ(c.Wire(), DNS_ADMIT_OK);
+    EXPECT_EQ(c.Wire(&a.server), DNS_ADMIT_WAIT);
+    ASSERT_EQ(b.Retire(&a.server), 1);
+    _dns_attempt_replied(&b.query, &a.server);
+    EXPECT_EQ(c.Wire(&a.server), DNS_ADMIT_OK);
 }
 TEST(UpstreamPolicy, RecoveryCancellationAndDestructionReleaseLease) {
     Endpoint next(0, 0, "recover-free"), sibling(0, 0, "recover-free");
     ASSERT_EQ(next.Begin(), DNS_ADMIT_OK);
-    ASSERT_EQ(sibling.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(sibling.Begin(&next.server), DNS_ADMIT_OK);
     {
         Endpoint canceled(0, 0, "recover-free");
         canceled.query.budget = dns_query_budget_new(4, 10000);
-        ASSERT_EQ(canceled.Begin(), DNS_ADMIT_OK);
-        _dns_policy_http_error(&canceled.server, 429, "0");
+        ASSERT_EQ(canceled.Begin(&next.server), DNS_ADMIT_OK);
+        _dns_policy_http_error(&next.server, 429, "0");
         usleep(150000);
-        ASSERT_EQ(canceled.Wire(), DNS_ADMIT_OK);
+        ASSERT_EQ(canceled.Wire(&next.server), DNS_ADMIT_OK);
         dns_query_budget_cancel(canceled.query.budget);
-        EXPECT_EQ(canceled.Wire(), DNS_ADMIT_DONE);
+        EXPECT_EQ(canceled.Wire(&next.server), DNS_ADMIT_DONE);
         EXPECT_EQ(next.Wire(), DNS_ADMIT_WAIT);
     }
     ASSERT_EQ(next.Wire(), DNS_ADMIT_OK);
-    EXPECT_EQ(sibling.Wire(), DNS_ADMIT_WAIT);
+    EXPECT_EQ(sibling.Wire(&next.server), DNS_ADMIT_WAIT);
     next.Progress(); ASSERT_EQ(next.Retire(), 1);
     _dns_attempt_replied(&next.query, &next.server);
-    EXPECT_EQ(sibling.Wire(), DNS_ADMIT_OK);
+    EXPECT_EQ(sibling.Wire(&next.server), DNS_ADMIT_OK);
 }
 TEST(UpstreamPolicy, RecoveryProbeTimeoutReleasesOnlyItsLease) {
     Endpoint a(0, 0, "recover-timeout"), b(0, 0, "recover-timeout"), c(0, 0, "recover-timeout");
     ASSERT_EQ(a.Begin(), DNS_ADMIT_OK);
-    ASSERT_EQ(b.Begin(), DNS_ADMIT_OK);
-    ASSERT_EQ(c.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(b.Begin(&a.server), DNS_ADMIT_OK);
+    ASSERT_EQ(c.Begin(&a.server), DNS_ADMIT_OK);
     _dns_policy_http_error(&a.server, 429, "0");
     usleep(150000);
     ASSERT_EQ(a.Wire(), DNS_ADMIT_OK); a.Progress();
     _dns_attempt_expire(&a.query, ULONG_MAX);
     EXPECT_EQ(atomic_read(&a.query.dns_request_sent), 0);
-    ASSERT_EQ(b.Wire(), DNS_ADMIT_OK);
-    EXPECT_EQ(c.Wire(), DNS_ADMIT_WAIT);
+    ASSERT_EQ(b.Wire(&a.server), DNS_ADMIT_OK);
+    EXPECT_EQ(c.Wire(&a.server), DNS_ADMIT_WAIT);
 }
-TEST(UpstreamPolicy, DatagramAndStreamShareRecoveryLease) {
+TEST(UpstreamPolicy, SharedQuotaDoesNotShareRecoveryAcrossTransportNodes) {
     Endpoint udp(0, 0, "recover-mixed"), https(0, 0, "recover-mixed");
     udp.server.type = DNS_SERVER_UDP;
-    ASSERT_EQ(https.Begin(), DNS_ADMIT_OK);
     _dns_policy_http_error(&https.server, 429, "0");
-    usleep(150000);
+    EXPECT_EQ(https.Begin(), DNS_ADMIT_WAIT);
     ASSERT_EQ(udp.Begin(), DNS_ADMIT_OK);
-    EXPECT_EQ(https.Wire(), DNS_ADMIT_WAIT);
-    ASSERT_EQ(udp.Retire(), 1);
-    _dns_attempt_replied(&udp.query, &udp.server);
-    EXPECT_EQ(https.Wire(), DNS_ADMIT_OK);
+    EXPECT_EQ(_dns_policy_endpoint_cooldown(&udp.server, get_tick_count()), 0U);
+    EXPECT_GT(_dns_policy_endpoint_cooldown(&https.server, get_tick_count()), 0U);
+    EXPECT_EQ(udp.Retire(), 1);
 }
+
 TEST(UpstreamPolicy, RecoveryPreservesExplicitRateAndFixedCooldown) {
     Endpoint probe(1, 1, "recover-rate-fixed"), next(1, 1, "recover-rate-fixed");
     _dns_policy_http_error(&probe.server, 429, "30");
@@ -527,7 +526,7 @@ TEST(UpstreamPolicy, RecoveryPreservesExplicitRateAndFixedCooldown) {
     _dns_attempt_replied(&probe.query, &probe.server);
     EXPECT_EQ(next.Begin(), DNS_ADMIT_WAIT); // recovery never refills QPS tokens
 }
-TEST(UpstreamPolicy, RecoveryGatesProductionTcpWritesAcrossSharedEndpoints) {
+TEST(UpstreamPolicy, NodeCooldownDoesNotBlockProductionWritesToAnotherTcpSocket) {
     Endpoint a(0, 0, "recover-wire"), b(0, 0, "recover-wire");
     int x[2], y[2];
     ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, x), 0);
@@ -544,7 +543,7 @@ TEST(UpstreamPolicy, RecoveryGatesProductionTcpWritesAcrossSharedEndpoints) {
     EXPECT_EQ(_dns_client_process_stream_writes(&a.server), 0);
     EXPECT_EQ(_dns_client_process_stream_writes(&b.server), 0);
     EXPECT_EQ(recv(x[1], received, sizeof(received), 0), -1); EXPECT_EQ(errno, EAGAIN);
-    EXPECT_EQ(recv(y[1], received, sizeof(received), 0), -1); EXPECT_EQ(errno, EAGAIN);
+    EXPECT_EQ(recv(y[1], received, sizeof(received), 0), 14);
     usleep(150000);
     ASSERT_EQ(_dns_client_process_stream_writes(&a.server), 0);
     EXPECT_EQ(recv(x[1], received, sizeof(received), 0), 14);
@@ -552,7 +551,7 @@ TEST(UpstreamPolicy, RecoveryGatesProductionTcpWritesAcrossSharedEndpoints) {
     EXPECT_EQ(recv(y[1], received, sizeof(received), 0), -1); EXPECT_EQ(errno, EAGAIN);
     ASSERT_EQ(a.Retire(), 1); _dns_attempt_replied(&a.query, &a.server);
     ASSERT_EQ(_dns_client_process_stream_writes(&b.server), 0);
-    EXPECT_EQ(recv(y[1], received, sizeof(received), 0), 14);
+    EXPECT_EQ(recv(y[1], received, sizeof(received), 0), -1); EXPECT_EQ(errno, EAGAIN);
     EXPECT_EQ(b.Retire(), 1);
     close(x[0]); close(x[1]); close(y[0]); close(y[1]);
     a.server.fd = b.server.fd = -1;
@@ -668,7 +667,7 @@ TEST(UpstreamPolicy, Pre429UdpReplyCannotProveRetriedProbeEpochThroughReceive) {
     auto first = wire.Capture(); ASSERT_FALSE(first.empty());
     auto old_reply = registered.Reply();
     unsigned first_generation = _dns_attempt_generation(&udp.query, &udp.server);
-    ASSERT_EQ(https.Begin(), DNS_ADMIT_OK); ASSERT_EQ(sibling.Begin(), DNS_ADMIT_OK);
+    ASSERT_EQ(https.Begin(), DNS_ADMIT_OK); ASSERT_EQ(sibling.Begin(&https.server), DNS_ADMIT_OK);
     _dns_policy_http_error(&https.server, 429, "0");
     // Remain within the original two-second budget while genuinely expiring gen1.
     usleep((DNS_QUERY_TIMEOUT + 40) * 1000);
@@ -684,7 +683,7 @@ TEST(UpstreamPolicy, Pre429UdpReplyCannotProveRetriedProbeEpochThroughReceive) {
     EXPECT_TRUE(udp.query.terminal); EXPECT_TRUE(udp.query.has_result);
     // Ordinary delivery succeeds, but only one sibling may now probe recovery.
     ASSERT_EQ(https.Wire(), DNS_ADMIT_OK);
-    EXPECT_EQ(sibling.Wire(), DNS_ADMIT_WAIT);
+    EXPECT_EQ(sibling.Wire(&https.server), DNS_ADMIT_WAIT);
 }
 
 TEST(UpstreamPolicy, FirstSendUdpQueryAfterCooldownCanStillProveRecoveryThroughReceive) {
@@ -707,7 +706,7 @@ TEST(UpstreamPolicy, RecoveryExchangeCallbackContractIsSeparateFromDnsBusinessSu
             Endpoint probe(0, 0, "callback-proof"), a(0, 0, "callback-proof"), b(0, 0, "callback-proof");
             ReceiveQuery registered(probe, action);
             ASSERT_EQ(probe.Begin(), DNS_ADMIT_OK);
-            ASSERT_EQ(a.Begin(), DNS_ADMIT_OK); ASSERT_EQ(b.Begin(), DNS_ADMIT_OK);
+            ASSERT_EQ(a.Begin(&probe.server), DNS_ADMIT_OK); ASSERT_EQ(b.Begin(&probe.server), DNS_ADMIT_OK);
             _dns_policy_http_error(&probe.server, 429, "0"); usleep(150000);
             ASSERT_EQ(probe.Wire(), DNS_ADMIT_OK); probe.Progress();
             ASSERT_EQ(registered.Deliver(registered.Reply(rcode)), 0);
@@ -716,8 +715,8 @@ TEST(UpstreamPolicy, RecoveryExchangeCallbackContractIsSeparateFromDnsBusinessSu
             bool accepted = action != DNS_CLIENT_ACTION_RETRY && action != DNS_CLIENT_ACTION_DROP;
             EXPECT_EQ(probe.query.terminal, accepted && action != DNS_CLIENT_ACTION_MAY_RETRY &&
                 action != DNS_CLIENT_ACTION_OK_WAIT);
-            ASSERT_EQ(a.Wire(), DNS_ADMIT_OK);
-            EXPECT_EQ(b.Wire(), accepted ? DNS_ADMIT_OK : DNS_ADMIT_WAIT);
+            ASSERT_EQ(a.Wire(&probe.server), DNS_ADMIT_OK);
+            EXPECT_EQ(b.Wire(&probe.server), accepted ? DNS_ADMIT_OK : DNS_ADMIT_WAIT);
         }
     }
 }

@@ -5,12 +5,16 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+struct dns_upstream_endpoint_activity_v1;
 /* Admission is not a transport error. */
 #define DNS_ADMIT_OK 0
 #define DNS_ADMIT_WAIT 1
 #define DNS_ADMIT_DONE 2
 int _dns_policy_service_init(struct dns_upstream_service *service);
 void _dns_policy_service_release(struct dns_upstream_service *service);
+void _dns_policy_endpoint_sent(struct dns_server_info *server);
+void _dns_policy_endpoint_activity(struct dns_server_info *server, struct dns_upstream_endpoint_activity_v1 *out);
+unsigned long _dns_policy_endpoint_cooldown(struct dns_server_info *server, unsigned long now);
 unsigned long _dns_policy_service_cooldown(struct dns_upstream_service *service, unsigned long now);
 unsigned long _dns_policy_service_wait(struct dns_upstream_service *service, unsigned long now);
 unsigned long _dns_policy_service_wait_reason(struct dns_upstream_service *service, unsigned long now, unsigned *reason);
