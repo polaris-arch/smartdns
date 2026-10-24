@@ -6,6 +6,10 @@ import xml.etree.ElementTree as ET
 
 # Explicit names: deleting/renaming a required fixture must update this reviewed gate.
 COMMON = set("""
+UpstreamCompleted.LateSrvPoolKeepsCompletionWithoutRetryOrEndpointPenalty
+UpstreamCompleted.LateSrvOrdinaryKeepsCompletionWithoutRetry
+UpstreamCompleted.LateUsableAddressStillUsesNativeProcessing
+UpstreamCompleted.LateActualServfailRemainsVisible
 UpstreamServiceState.OneLimitedNodeDoesNotCoolHealthyPeerAndAllBlockedUseEarliestThaw
 UpstreamServiceState.NodeIsolationCannotRefillOrBypassSharedServiceRate
 UpstreamServiceState.TransportFailureWaitUsesFixedConfiguredNodeCooldownWithoutGrowth

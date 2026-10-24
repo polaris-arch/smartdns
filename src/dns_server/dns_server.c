@@ -190,8 +190,13 @@ static int dns_server_resolve_callback(const char *domain, dns_result_type rtype
 			}
 		}
 
-        if (atomic_read(&request->notified)) dns_client_response_reject_reason(DNS_REJECT_COMPLETED);
+		/* Fastest-response still collects later addresses for the cache. Do not
+		 * let that processing turn an already completed race into a DNS fault. */
+		int already_notified = atomic_read(&request->notified);
 		ret = _dns_server_process_answer(request, domain, packet, result_flag, &need_passthrouh);
+		if (already_notified && ret != DNS_CLIENT_ACTION_OK && ret != DNS_CLIENT_ACTION_OK_WAIT) {
+			dns_client_response_reject_reason(DNS_REJECT_COMPLETED);
+		}
 		if (ret == 0 && need_passthrouh == 1 && atomic_read(&request->notified) == 0) {
 			/* not supported record, passthrouth */
 			request->passthrough = 1;

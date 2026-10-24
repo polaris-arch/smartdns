@@ -184,7 +184,9 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
         response_reject_reason = saved_reason;
         int accepted = (ret == DNS_CLIENT_ACTION_OK || ret == DNS_CLIENT_ACTION_OK_WAIT) &&
             (packet->head.rcode == DNS_RC_NOERROR || packet->head.rcode == DNS_RC_NXDOMAIN);
-        if (!accepted) _dns_service_diagnostic_event(query, server_info,
+        int completed = !accepted && reject_reason == DNS_REJECT_COMPLETED &&
+            (packet->head.rcode == DNS_RC_NOERROR || packet->head.rcode == DNS_RC_NXDOMAIN);
+        if (!accepted && !completed) _dns_service_diagnostic_event(query, server_info,
             packet->head.rcode != DNS_RC_NOERROR && packet->head.rcode != DNS_RC_NXDOMAIN ?
             DNS_EVENT_DNS_RCODE : DNS_EVENT_DNS_REJECTED);
         if (!accepted) {
@@ -192,7 +194,14 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
             _dns_service_detail_dns(query, server_info, bad_rcode ? DNS_DETAIL_DNS_RCODE : DNS_DETAIL_DNS_REJECT,
                 DNS_PHASE_RESPONSE, bad_rcode ? packet->head.rcode : reject_reason, packet);
         }
-        _dns_service_query_result(query, server_info, accepted);
+        /* A late valid response can no longer be consumed by the native
+         * request. Preserve its completion evidence without penalizing the
+         * endpoint or scheduling another backend attempt. Real wire RCODE
+         * errors above remain observable even after another provider won. */
+        if (completed) {
+            if (server_info->service) stats_inc(&server_info->service->stats.recv_count);
+            ret = DNS_CLIENT_ACTION_UNDEFINE;
+        } else _dns_service_query_result(query, server_info, accepted);
 		if (ret == DNS_CLIENT_ACTION_RETRY || ret == DNS_CLIENT_ACTION_DROP) {
 			/* remove this result */
 			_dns_replied_check_remove(query, server_info);
