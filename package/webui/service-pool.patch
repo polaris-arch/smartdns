@@ -292,7 +292,7 @@
 +          {tab===3&&<Box sx={columns}>
 +            <Panel title={text('调度与期限','Scheduling and deadlines')}>
 +              <Box>QPS: {d.qps||text('不限','Unlimited')}</Box>
-+              <Box>{text('节点固定冷却 / 故障等待','Fixed node cooldown / failure wait')}: {d.cooldown_ms} ms</Box>
++              <Box>{server.pool_enabled?text('节点固定冷却 / 故障等待','Fixed node cooldown / failure wait'):text('HTTP 固定冷却','Fixed HTTP cooldown')}: {d.cooldown_ms} ms</Box>
 +              <Box>{server.pool_enabled?text('全部节点 HTTP 冷却时的最早解冻','Earliest thaw when all nodes are HTTP cooling'):text('节点冷却剩余','Node cooldown remaining')}: {server.cooldown_remaining_ms??'—'} ms</Box>
 +              {server.pool_enabled&&<Box>{text('两族建连间隔','Family connection delay')}: {policy?.connect_delay_ms??'—'} ms</Box>}
 +              <Box>{server.pool_enabled?text('响应 / 建连 / 总期限','Response / connect / total'):text('默认响应 / 总期限','Default response / total')}: {policy?.response_timeout_ms??'—'} / {server.pool_enabled?String(policy?.connect_timeout_ms??'—')+' / ':''}{policy?.query_timeout_ms??'—'} ms</Box>

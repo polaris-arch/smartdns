@@ -238,7 +238,11 @@ async function capture(label) {
       await dialog.getByRole('tab').nth(tab).click();
       const panel=dialog.getByRole('tabpanel');
       if(tab===1) assert.match(await panel.textContent(),/127\.0\.0\.9/);
-      if(tab===3) assert(!/两族建连间隔|Family connection delay/.test(await panel.textContent()),'ordinary endpoints must not pretend to use pool connection racing');
+      if(tab===3) {
+        assert(!/两族建连间隔|Family connection delay/.test(await panel.textContent()),'ordinary endpoints must not pretend to use pool connection racing');
+        assert.match(await panel.textContent(),/HTTP 固定冷却|Fixed HTTP cooldown/);
+        assert(!/故障等待|failure wait/.test(await panel.textContent()),'ordinary native retries do not use the pool failure interval');
+      }
     }
     await capture('ordinary-upstream-diagnostics');
     await dialog.getByRole('button',{name:/关闭|Close/}).click();
