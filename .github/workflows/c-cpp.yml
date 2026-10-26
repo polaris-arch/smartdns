@@ -1,26 +1,46 @@
-name: C/C++ CI
-
+name: Upstream resource review
 on:
   push:
-    branches: [ master ]
-  pull_request:
-    branches: [ master ]
-
+    branches: [audit/upstream-resource-baseline, audit/upstream-domain-flags]
+permissions:
+  contents: read
 jobs:
-  build:
-
-    runs-on: ubuntu-latest
-
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizers: ['0', '1']
     steps:
-    - uses: actions/checkout@v2
-    - name: prepare
-      run: |
-        sudo apt update
-        sudo apt install libgtest-dev dnsperf
-    - name: make
-      run: |
-        make all -j4
-        make clean
-    - name: test
-      run: |
-        make -C test test -j8
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libgtest-dev dnsperf dnsutils libssl-dev zlib1g-dev
+          cc --version
+          openssl version
+          git rev-parse HEAD
+          git ls-tree -r HEAD src
+      - name: Build and verify
+        env:
+          SANITIZERS: ${{ matrix.sanitizers }}
+        run: |
+          set -euo pipefail
+          if [[ "$SANITIZERS" == 1 ]]; then
+            export EXTRA_CFLAGS='-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'
+            export CXXFLAGS='-O1 -fsanitize=address,undefined -fno-sanitize-recover=all'
+            export EXTRA_LDFLAGS='-fsanitize=address,undefined'
+            export ASAN_OPTIONS='detect_leaks=1:halt_on_error=1:abort_on_error=1'
+            export UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'
+          fi
+          make -C test -j4
+          # The clean baseline intentionally fails new ownership regressions.
+          # Print measurements first so they survive a baseline ASan abort.
+          timeout --kill-after=10s 180s ./test/test.bin --gtest_filter='DomainRuleResourceReview.*' --gtest_output=xml:resource-results.xml
+          timeout --kill-after=10s 600s ./test/test.bin --gtest_filter='-DomainRuleResourceReview.*' --gtest_output=xml:suite-results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: upstream-resource-${{ matrix.sanitizers }}-${{ github.sha }}
+          path: '*results.xml'
