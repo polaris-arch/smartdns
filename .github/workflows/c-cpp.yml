@@ -46,8 +46,13 @@ jobs:
           fi
           # The clean baseline intentionally fails new ownership regressions.
           # Print measurements first so they survive a baseline ASan abort.
+          set +e
           timeout --kill-after=10s 180s ./test/test.bin --gtest_filter='DomainRuleResourceReview.*' --gtest_output=xml:resource-results.xml
+          resource_result=$?
           timeout --kill-after=10s 600s ./test/test.bin --gtest_filter='-DomainRuleResourceReview.*' --gtest_output=xml:suite-results.xml
+          suite_result=$?
+          if [[ "$resource_result" != 0 ]]; then exit "$resource_result"; fi
+          exit "$suite_result"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
