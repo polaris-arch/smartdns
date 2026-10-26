@@ -1280,6 +1280,7 @@ TEST(AnyAddress, CacheZeroCoalescesAdmittedTcpWaitersThenFetchesAgain)
 	ASSERT_NE(marker, responses.end());
 	EXPECT_TRUE(response_is(marker->second, DNS_RC_NOERROR, {address_rr(DNS_T_A, kMarker)},
 		0, kQueryId + callers, DNS_T_A, kMarker));
+	ASSERT_TRUE(upstream.wait_for_release()); // sendto can wake clients before the fixture publishes its counter
 	EXPECT_EQ(upstream.releases.load(), 1);
 	expect_workload(upstream, 1, 1, 1);
 	/* A post-completion caller cannot reuse a completed result or native
