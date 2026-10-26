@@ -268,6 +268,16 @@ private:
                     if (!own_control) Process(stream);
                     Flush(stream, !own_control);
                 }
+                // Bound live streams, not the connection's lifetime request
+                // count. Free only normally finished bidirectional streams;
+                // QUIC keeps any remaining protocol state in the connection.
+                for (auto it = peer.streams.begin(); it != peer.streams.end();) {
+                    if (!(SSL_get_stream_id(it->ssl) & 2u) &&
+                        SSL_get_stream_read_state(it->ssl) == SSL_STREAM_STATE_FINISHED &&
+                        SSL_get_stream_write_state(it->ssl) == SSL_STREAM_STATE_FINISHED) {
+                        SSL_free(it->ssl); it = peer.streams.erase(it);
+                    } else ++it;
+                }
             }
             pollfd p{fd_, POLLIN, 0}; poll(&p, 1, 1);
         }
@@ -322,7 +332,7 @@ void quic_error_ready_case(bool h3) {
         << "error-only ready events=" << after.ready_events - before.ready_events
         << ", pending socket error=" << pending_error;
 }
-void quic_pool_case(bool h3, bool keepalive = false) {
+void quic_pool_case(bool h3, bool keepalive = false, unsigned queries = 4) {
     PoolQuicPeer first, second;
     std::mutex lock; std::vector<unsigned> order;
     first.on_request = [&] { std::lock_guard<std::mutex> guard(lock); order.push_back(0); };
@@ -336,39 +346,41 @@ void quic_pool_case(bool h3, bool keepalive = false) {
         (keepalive ? std::string(" -upstream-keepalive-ms 1000") : std::string()) + "\ncache-size 0\ncache-persist no\nprefetch-domain no\nserve-expired no\n"
         "dualstack-ip-selection no\nspeed-check-mode none\nresponse-mode fastest-response\n";
     ASSERT_TRUE(resolver.Start(config));
-    unsigned warm_queries=0, first_warm=0, second_warm=0;
+    unsigned first_warm=0, second_warm=0;
     if(h3){
+        ASSERT_TRUE(query_udp("quic-warm-0.example",listen));
         auto warm_deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
         for(;;){
-            ASSERT_TRUE(query_udp("quic-warm-"+std::to_string(warm_queries++)+".example",listen));
             dns_upstream_service_snapshot_v1 warm{};ASSERT_EQ(dns_client_get_service_snapshot_v1(&warm,1),1);
             dns_upstream_endpoint_snapshot_v1 paths[2]{};
             int n=dns_client_get_service_endpoints_v1(warm.service_id,paths,2);
-            if(n==2&&first.requests&&second.requests&&paths[0].state==DNS_ENDPOINT_READY&&paths[1].state==DNS_ENDPOINT_READY&&!warm.in_flight)break;
+            bool ready=false;for(int i=0;i<n&&i<2;i++)ready|=paths[i].state==DNS_ENDPOINT_READY;
+            if(ready&&warm.connection_count==1&&first.requests&&!warm.in_flight)break;
             ASSERT_LT(std::chrono::steady_clock::now(),warm_deadline);poll(nullptr,0,25);
         }
         first_warm=first.requests;second_warm=second.requests;
         std::lock_guard<std::mutex> guard(lock);order.clear();
     }
     dns_upstream_service_snapshot_v1 baseline{};ASSERT_EQ(dns_client_get_service_snapshot_v1(&baseline,1),1);
-    for (unsigned i = 0; i < 4; i++) ASSERT_TRUE(query_udp("quic-pool-" + std::to_string(i) + ".example", listen));
+    for (unsigned i = 0; i < queries; i++) ASSERT_TRUE(query_udp("quic-pool-" + std::to_string(i) + ".example", listen));
     dns_upstream_service_snapshot_v1 snapshot{};
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     do {
         ASSERT_EQ(dns_client_get_service_snapshot_v1(&snapshot, 1), 1);
-        if (snapshot.success_count == baseline.success_count+4 && !snapshot.in_flight) break;
+        if (snapshot.success_count == baseline.success_count+queries && !snapshot.in_flight) break;
         poll(nullptr, 0, 5);
     } while (std::chrono::steady_clock::now() < deadline);
     fprintf(stderr,"Pool QUIC snapshot: h3=%d queries=%llu attempts=%llu successes=%llu failures=%llu skips=%llu active=%llu requests=%u/%u connections=%u/%u peer_failed=%d/%d\n",h3,
         (unsigned long long)snapshot.query_count,(unsigned long long)snapshot.attempt_count,(unsigned long long)snapshot.success_count,
         (unsigned long long)snapshot.failure_count,(unsigned long long)snapshot.skip_count,(unsigned long long)snapshot.in_flight,
         first.requests.load(),second.requests.load(),first.connections.load(),second.connections.load(),first.failed.load(),second.failed.load());
-    EXPECT_TRUE(snapshot.pool_enabled); EXPECT_EQ(snapshot.endpoint_count, 2U);
+    EXPECT_TRUE(snapshot.pool_enabled); EXPECT_GE(snapshot.endpoint_count, 1U); EXPECT_LE(snapshot.endpoint_count, 2U);
+    EXPECT_EQ(snapshot.connection_count, 1U);
     EXPECT_EQ(snapshot.transport, h3 ? DNS_SERVER_HTTP3 : DNS_SERVER_QUIC);
-    EXPECT_EQ(snapshot.query_count, baseline.query_count+4); EXPECT_EQ(snapshot.attempt_count, baseline.attempt_count+4); EXPECT_EQ(snapshot.success_count, baseline.success_count+4);
+    EXPECT_EQ(snapshot.query_count, baseline.query_count+queries); EXPECT_EQ(snapshot.attempt_count, baseline.attempt_count+queries); EXPECT_EQ(snapshot.success_count, baseline.success_count+queries);
     EXPECT_EQ(snapshot.failure_count, 0U); EXPECT_EQ(snapshot.skip_count, 0U); EXPECT_EQ(snapshot.in_flight, 0U);
-    EXPECT_EQ(first.requests-first_warm, 2U); EXPECT_EQ(second.requests-second_warm, 2U);
-    EXPECT_EQ(first.connections, 1U); EXPECT_EQ(second.connections, 1U);
+    EXPECT_EQ(first.requests-first_warm, queries); EXPECT_EQ(second.requests-second_warm, 0U);
+    EXPECT_EQ(first.connections, 1U); EXPECT_EQ(second.connections, 0U);
     EXPECT_FALSE(first.failed); EXPECT_FALSE(second.failed);
     if(keepalive){
         dns_client_loop_diagnostics_v1 idle_before{},idle_after{};
@@ -380,18 +392,18 @@ void quic_pool_case(bool h3, bool keepalive = false) {
         dns_upstream_policy_snapshot_v1 policy{};
         ASSERT_EQ(dns_client_get_service_policy_v1(snapshot.service_id,&policy),0);
         EXPECT_GE(policy.kind_counts[DNS_DETAIL_KEEPALIVE_SENT],2U);
-        EXPECT_EQ(first.requests+second.requests,4U+first_warm+second_warm);
+        EXPECT_EQ(first.requests+second.requests,queries+first_warm+second_warm);
         ASSERT_TRUE(query_udp("quic-pool-after-idle.example",listen));
-        EXPECT_EQ(first.connections,1U);EXPECT_EQ(second.connections,1U);
+        EXPECT_EQ(first.connections,1U);EXPECT_EQ(second.connections,0U);
         EXPECT_FALSE(first.failed);EXPECT_FALSE(second.failed);return;
     }
     std::lock_guard<std::mutex> guard(lock);
-    ASSERT_EQ(order.size(), 4U);
-    for (size_t i = 1; i < order.size(); i++) EXPECT_NE(order[i-1], order[i]);
+    ASSERT_EQ(order.size(), queries);
+    for (size_t i = 1; i < order.size(); i++) EXPECT_EQ(order[i-1], order[i]);
 }
 } // namespace
 #endif
-TEST(UpstreamServiceQuic, RealDoqDualBackendRoundRobinAndConnectionReuse) {
+TEST(UpstreamServiceQuic, RealDoqSingleWanReusesOneHealthyAddress) {
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC) && OPENSSL_VERSION_NUMBER >= 0x30500000L
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT({ quic_pool_case(false); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
@@ -399,7 +411,7 @@ TEST(UpstreamServiceQuic, RealDoqDualBackendRoundRobinAndConnectionReuse) {
     GTEST_SKIP() << "Real pool DoQ listener requires OpenSSL >= 3.5 QUIC; mandatory in quic CI profile";
 #endif
 }
-TEST(UpstreamServiceQuic, RealH3DualBackendRoundRobinAndConnectionReuse) {
+TEST(UpstreamServiceQuic, RealH3SingleWanReusesOneHealthyAddress) {
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC) && OPENSSL_VERSION_NUMBER >= 0x30500000L
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT({ quic_pool_case(true); fflush(stdout); fflush(stderr); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
@@ -427,8 +439,33 @@ TEST(UpstreamServiceQuic, ErrorOnlyH3ReadinessDoesNotSpin) {
 TEST(UpstreamServiceQuic, H3IdleControlKeepaliveUsesNoDnsStreamAndPreservesConnections) {
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC) && OPENSSL_VERSION_NUMBER >= 0x30500000L
     ::testing::FLAGS_gtest_death_test_style="threadsafe";
-    ASSERT_EXIT({quic_pool_case(true,true);fflush(stdout);fflush(stderr);_exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+    ASSERT_EXIT({
+        quic_pool_case(true,true);
+        const auto *result = ::testing::UnitTest::GetInstance()->current_test_info()->result();
+        for (int i = 0; i < result->total_part_count(); i++) {
+            const auto &part = result->GetTestPartResult(i);
+            if (part.failed()) fprintf(stderr, "%s:%d: %s\n", part.file_name(), part.line_number(), part.summary());
+        }
+        fflush(stdout); fflush(stderr); _exit(::testing::Test::HasFailure()?1:0);
+    },::testing::ExitedWithCode(0),"");
 #else
     GTEST_SKIP()<<"Requires the mandatory QUIC CI profile";
+#endif
+}
+
+TEST(UpstreamServiceQuic, H3CompletedStreamsDoNotConsumeTheLiveStreamLimit) {
+#if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC) && OPENSSL_VERSION_NUMBER >= 0x30500000L
+    ::testing::FLAGS_gtest_death_test_style="threadsafe";
+    ASSERT_EXIT({
+        quic_pool_case(true,false,48);
+        const auto *result=::testing::UnitTest::GetInstance()->current_test_info()->result();
+        for(int i=0;i<result->total_part_count();i++) {
+            const auto &part=result->GetTestPartResult(i);
+            if(part.failed())fprintf(stderr,"%s:%d: %s\n",part.file_name(),part.line_number(),part.summary());
+        }
+        fflush(stdout);fflush(stderr);_exit(::testing::Test::HasFailure()?1:0);
+    },::testing::ExitedWithCode(0),"");
+#else
+    GTEST_SKIP() << "Real H3 listener requires OpenSSL >= 3.5 QUIC";
 #endif
 }

@@ -61,6 +61,7 @@ extern "C" {
 #define PREFETCH_FLAGS_NO_DUALSTACK (1 << 0)
 #define PREFETCH_FLAGS_EXPIRED (1 << 1)
 #define PREFETCH_FLAGS_NOPREFETCH (1 << 2)
+#define PREFETCH_FLAGS_CACHE_HIT (1 << 3)
 
 #define RECV_ERROR_AGAIN 1
 #define RECV_ERROR_OK 0
@@ -383,6 +384,8 @@ struct dns_request {
 	int request_wait;
 	int prefetch;
 	int prefetch_flags;
+    void *prefetch_ticket;
+    unsigned prefetch_origin_flags, prefetch_queue_wait_ms;
 
 	int dualstack_selection;
 	int dualstack_selection_force_soa;

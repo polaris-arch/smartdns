@@ -1,6 +1,7 @@
 #include "gtest/gtest.h"
 extern "C" {
 #include "dns_client/upstream_policy.h"
+#include "dns_client/upstream_service.h"
 #include "dns_client/query.h"
 #include "smartdns/util.h"
 #include "dns_client/client_tcp.h"
@@ -17,6 +18,41 @@ extern "C" {
 #include <unistd.h>
 #include <string>
 #include <vector>
+#include <memory>
+
+TEST(UpstreamPolicy, ServicePolicyLifecycleFitsA128KiBClientThread) {
+    auto service = std::make_unique<dns_upstream_service>();
+    auto endpoint = std::make_unique<dns_server_info>();
+    service->wan_count = 1;
+    strcpy(service->id, "bounded-stack-policy");
+    strcpy(service->wans[0].interface, "wan-test");
+    service->flags.adaptive_query_rate = 1;
+    service->flags.max_query_rate = 20; service->flags.query_burst = 1;
+    endpoint->service = service.get(); endpoint->flags = service->flags;
+    strcpy(endpoint->flags.ifname, "wan-test");
+    struct Work { dns_upstream_service *service; dns_server_info *endpoint; int result; } work{service.get(), endpoint.get(), -1};
+    pthread_attr_t attr; ASSERT_EQ(pthread_attr_init(&attr), 0);
+    ASSERT_EQ(pthread_attr_setstacksize(&attr, 128 * 1024), 0);
+    pthread_t thread;
+    int created = pthread_create(&thread, &attr, [](void *opaque) -> void * {
+        auto &w = *static_cast<Work *>(opaque);
+        w.result = _dns_policy_service_init(w.service);
+        if (!w.result) {
+            for (unsigned i = 0; i < 100; i++) {
+                w.result = _dns_policy_attach(w.endpoint);
+                if (w.result) break;
+                _dns_policy_detach(w.endpoint);
+            }
+            _dns_policy_service_release(w.service);
+        }
+        return nullptr;
+    }, &work);
+    pthread_attr_destroy(&attr); ASSERT_EQ(created, 0);
+    ASSERT_EQ(pthread_join(thread, nullptr), 0);
+    EXPECT_EQ(work.result, 0);
+    EXPECT_EQ(service->policy, nullptr); EXPECT_EQ(service->wans[0].policy, nullptr);
+    EXPECT_EQ(endpoint->policy, nullptr);
+}
 
 namespace {
 struct Endpoint {

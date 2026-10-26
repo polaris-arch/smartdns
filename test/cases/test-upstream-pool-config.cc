@@ -5,6 +5,7 @@ extern "C" {
 #include "dns_conf/dns_conf_group.h"
 extern struct dns_conf_group_info *dns_conf_current_group_info;
 int dns_conf_pool_normalize_for_test(void);
+int _config_upstream_wan_resolve(void);
 }
 #include <cstring>
 #include <memory>
@@ -46,6 +47,64 @@ TEST_F(UpstreamPoolConfig, ExplicitOptInRetainsAuthorityAndActualList) {
     EXPECT_STREQ(s.hostname, "resolver.example"); EXPECT_STREQ(s.tls_host_verify, "resolver.example");
     EXPECT_STREQ(s.path, "/dns-query"); EXPECT_STREQ(s.quota_group, "");
 }
+TEST_F(UpstreamPoolConfig, WanSelectionIsExplicitAndGlobalsCanFollowTheServer) {
+    ASSERT_EQ(parse({"server-https", "https://resolver.example/"}), 0);
+    ASSERT_EQ(_config_upstream_wan_resolve(), 0);
+    EXPECT_EQ(dns_conf.servers[0].upstream_wan_count, 0U);
+    EXPECT_EQ(dns_conf.servers[0].upstream_ip_pool, 0U);
+    dns_conf.upstream_multi_wan = 1;
+    EXPECT_EQ(_config_upstream_wan_resolve(), -1);
+    dns_conf.upstream_wan_count = 2;
+    strcpy(dns_conf.upstream_wan_interfaces[0], "ppp0"); strcpy(dns_conf.upstream_wan_interfaces[1], "wan1");
+    ASSERT_EQ(_config_upstream_wan_resolve(), 0);
+    auto &s = dns_conf.servers[0]; EXPECT_EQ(s.upstream_wan_count, 2U);
+    EXPECT_STREQ(s.upstream_wan_interfaces[1], "wan1");
+    EXPECT_EQ(s.max_upstream_backends, 4U);
+    EXPECT_EQ(s.upstream_response_timeout_ms, 5000U); EXPECT_EQ(s.upstream_query_timeout_ms, 8000U);
+}
+TEST_F(UpstreamPoolConfig, OffRetainsSavedChoicesAndAdaptiveCapRequiresOptIn) {
+    ASSERT_EQ(parse({"server-https", "https://192.0.2.1/", "-upstream-service", "-upstream-wan", "off",
+        "-upstream-wan-interfaces", "offline-wan", "-adaptive-query-rate", "off", "-max-query-rate", "40"}), 0);
+    ASSERT_EQ(_config_upstream_wan_resolve(), 0);
+    auto &s = dns_conf.servers[0]; EXPECT_EQ(s.upstream_wan_count, 0U);
+    EXPECT_STREQ(s.upstream_wan_interfaces[0], "offline-wan");
+    EXPECT_EQ(s.adaptive_query_rate, 0U); EXPECT_EQ(s.max_query_rate, 0U);
+    reset();
+    ASSERT_EQ(parse({"server-https", "https://resolver.example/", "-adaptive-query-rate", "on"}), 0);
+    EXPECT_EQ(dns_conf.servers[0].max_query_rate, 20U);
+    ASSERT_EQ(_config_upstream_wan_resolve(), 0);
+    EXPECT_EQ(dns_conf.servers[0].upstream_wan_count, 0U);
+}
+TEST_F(UpstreamPoolConfig, AdaptiveRateOnlyAppliesToEncryptedNonBootstrapServices) {
+    struct Protocol { const char *name; int (*parse)(void *, int, char **); bool allowed; };
+    const Protocol protocols[] = {
+        {"server", _config_server_udp, false}, {"server-tcp", _config_server_tcp, false},
+        {"server-tls", _config_server_tls, true}, {"server-https", _config_server_https, true},
+        {"server-quic", _config_server_quic, true}, {"server-h3", _config_server_http3, true},
+    };
+    for (const auto &p : protocols) {
+        for (bool bootstrap : {false, true}) {
+            reset();
+            std::vector<std::string> args{p.name, "192.0.2.1", "-adaptive-query-rate", "on"};
+            if (bootstrap) args.emplace_back("-bootstrap-dns");
+            std::vector<char *> argv; for (auto &s : args) argv.push_back(&s[0]); argv.push_back(nullptr);
+            EXPECT_EQ(p.parse(nullptr, args.size(), argv.data()), p.allowed && !bootstrap ? 0 : -1) << p.name << " bootstrap=" << bootstrap;
+        }
+    }
+}
+TEST_F(UpstreamPoolConfig, ExplicitWanCannotOverrideProxyAndZeroRaceDelayIsPreserved) {
+    ASSERT_EQ(parse({"server-https", "https://resolver.example/", "-upstream-service", "-proxy", "managed",
+        "-upstream-wan", "ppp0"}), 0);
+    EXPECT_EQ(_config_upstream_wan_resolve(), -1);
+    reset();
+    ASSERT_EQ(parse({"server-https", "https://resolver.example/", "-upstream-service", "-upstream-connect-delay-ms", "0"}), 0);
+    ASSERT_EQ(_config_upstream_wan_resolve(), 0);
+    EXPECT_EQ(dns_conf.servers[0].upstream_connect_delay_ms, 0U);
+    reset();
+    EXPECT_EQ(parse({"server-https", "https://resolver.example/", "-upstream-wan", "ppp0,ppp0"}), -1);
+    reset();
+    EXPECT_EQ(parse({"server-https", "https://resolver.example/", "-adaptive-query-rate", "on", "-max-query-rate", "0"}), -1);
+}
 TEST_F(UpstreamPoolConfig, CanonicalDedupPreservesFirstOccurrenceOrder) {
     ASSERT_EQ(parse({"server-https", "https://resolver.example/", "-upstream-ip-pool", "-host-ip",
         "192.0.2.1,::ffff:192.0.2.1,2001:0db8:0:0::1,2001:db8::1,127.0.0.1,::1"}), 0);
@@ -78,7 +137,8 @@ TEST_F(UpstreamPoolConfig, RejectsInvalidCapsAndConflictingModes) {
         reset(); EXPECT_EQ(parse({"server-https", "https://resolver.example/", "-upstream-ip-pool", "-max-upstream-backends", value}), -1) << value;
     }
     reset(); EXPECT_EQ(parse({"server-https", "https://resolver.example/", "-upstream-ip-pool", "-max-upstream-connections", "5"}), -1);
-    reset(); EXPECT_EQ(parse({"server-https", "https://192.0.2.1/", "-upstream-ip-pool"}), -1);
+    reset(); EXPECT_EQ(parse({"server-https", "https://192.0.2.1/", "-upstream-ip-pool"}), 0);
+    EXPECT_EQ(_config_upstream_wan_resolve(), -1); // globals may follow the server line
     reset(); EXPECT_EQ(parse({"server-https", "https://resolver.example/", "-upstream-ip-pool", "-bootstrap-dns"}), -1);
     reset(); EXPECT_EQ(parse({"server-https", "https://resolver.example/", "-upstream-ip-pool", "-upstream-round-robin", "-quota-group", "provider"}), -1);
     reset(); EXPECT_EQ(parse({"server-https", "https://resolver.example/", "-upstream-ip-pool", "-host-ip", "192.0.2.1", "-host-ip", "192.0.2.2"}), -1);
@@ -170,7 +230,8 @@ TEST_F(UpstreamPoolConfig, LegacyIdenticalGroupSetsKeepPointersAndQuotaValues) {
 
 TEST_F(UpstreamPoolConfig, FixedCooldownMillisecondsDefaultBoundsAndStrictGrammar) {
     ASSERT_EQ(parse({"server-https", "https://resolver.example/dns-query"}), 0);
-    EXPECT_EQ(dns_conf.servers[0].upstream_cooldown_ms, 1000U);
+    EXPECT_EQ(dns_conf.servers[0].upstream_cooldown_ms, 200U);
+    EXPECT_EQ(dns_conf.servers[0].upstream_retry_cooldown_ms, 1000U);
     for (const char *value : {"1", "1000", "10000"}) {
         reset(); ASSERT_EQ(parse({"server-https", "https://resolver.example/", "-upstream-cooldown-ms", value}), 0);
         EXPECT_EQ(dns_conf.servers[0].upstream_cooldown_ms, std::stoul(value));
@@ -184,13 +245,15 @@ TEST_F(UpstreamPoolConfig, FixedCooldownMillisecondsDefaultBoundsAndStrictGramma
 
 TEST_F(UpstreamPoolConfig, PathPolicyDefaultsAndExplicitZeroRemainDistinct) {
     ASSERT_EQ(parse({"server-https","https://resolver.example/","-upstream-ip-pool"}),0);
+    ASSERT_EQ(_config_upstream_wan_resolve(), 0);
     const auto &a=dns_conf.servers[0];
-    EXPECT_EQ(a.upstream_family,0U);EXPECT_EQ(a.upstream_response_timeout_ms,1000U);
-    EXPECT_EQ(a.upstream_query_timeout_ms,3000U);EXPECT_EQ(a.upstream_connect_timeout_ms,3000U);
+    EXPECT_EQ(a.upstream_family,0U);EXPECT_EQ(a.upstream_response_timeout_ms,5000U);
+    EXPECT_EQ(a.upstream_query_timeout_ms,8000U);EXPECT_EQ(a.upstream_connect_timeout_ms,3000U);
     EXPECT_EQ(a.upstream_connect_delay_ms,250U);EXPECT_EQ(a.upstream_keepalive_ms,30000U);
     reset();
     ASSERT_EQ(parse({"server-https","https://resolver.example/","-upstream-ip-pool","-upstream-family","ipv6",
         "-upstream-connect-delay-ms","0","-upstream-keepalive-ms","0"}),0);
+    ASSERT_EQ(_config_upstream_wan_resolve(), 0);
     EXPECT_EQ(dns_conf.servers[0].upstream_family,6U);EXPECT_EQ(dns_conf.servers[0].upstream_connect_delay_ms,0U);
     EXPECT_EQ(dns_conf.servers[0].upstream_keepalive_disabled,1U);
 }
@@ -202,7 +265,9 @@ TEST_F(UpstreamPoolConfig, PathPolicyRejectsInvalidUnitsBoundsAndLegacyUse) {
         {"-upstream-keepalive-ms","1e3"},{"-upstream-response-timeout-ms","10001"}}) {
         reset(); EXPECT_EQ(parse({"server-https","https://resolver.example/","-upstream-ip-pool",pair.first,pair.second}),-1);
     }
-    reset(); EXPECT_EQ(parse({"server-https","https://resolver.example/","-upstream-family","dual"}),-1);
+    reset(); ASSERT_EQ(parse({"server-https","https://resolver.example/","-upstream-family","dual"}),0);
+    EXPECT_EQ(_config_upstream_wan_resolve(), -1);
     reset(); EXPECT_EQ(parse({"server-https","https://resolver.example/","-upstream-ip-pool","-upstream-family","dual","-upstream-family","ipv4"}),-1);
-    reset(); EXPECT_EQ(parse({"server-https","https://resolver.example/","-upstream-ip-pool","-upstream-query-timeout-ms","1000"}),-1);
+    reset(); ASSERT_EQ(parse({"server-https","https://resolver.example/","-upstream-ip-pool","-upstream-query-timeout-ms","1000"}),0);
+    EXPECT_EQ(_config_upstream_wan_resolve(), -1);
 }

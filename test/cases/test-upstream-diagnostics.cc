@@ -1,4 +1,5 @@
 #include "gtest/gtest.h"
+#include <cstdlib>
 extern "C" {
 #include "dns_client/upstream_service.h"
 #include "smartdns/util.h"
@@ -41,6 +42,7 @@ TEST(UpstreamDiagnostics, EvidenceRingIsBoundedOrderedAndSeparateFromQueryOutcom
     _dns_service_detail(nullptr,&endpoint,DNS_DETAIL_DNS_REJECT,DNS_PHASE_RESPONSE,DNS_REJECT_FILTERED,0,0);
     EXPECT_EQ(service.detail.reject_counts[DNS_REJECT_FILTERED],1U);
     EXPECT_EQ(service.detail.kind_counts[DNS_DETAIL_RESPONSE_TIMEOUT],40U);
+    std::free(service.failures); std::free(service.event_sources);
     pthread_mutex_destroy(&service.detail_lock);
 }
 
@@ -51,5 +53,5 @@ TEST(UpstreamDiagnostics, OtherHttpStatusRetainsActualCodeWithoutInventingSocket
     EXPECT_EQ(s.diagnostics.events[DNS_EVENT_HTTP_OTHER],1U);
     EXPECT_EQ(s.detail.event_count,1U);EXPECT_EQ(s.detail.events[0].code,403);
     EXPECT_EQ(s.detail.events[0].phase,DNS_PHASE_RESPONSE);EXPECT_EQ(s.detail.events[0].system_error,0);
-    EXPECT_EQ(s.stats.failure_count,0U);pthread_mutex_destroy(&s.detail_lock);
+    EXPECT_EQ(s.stats.failure_count,0U);std::free(s.failures);std::free(s.event_sources);pthread_mutex_destroy(&s.detail_lock);
 }

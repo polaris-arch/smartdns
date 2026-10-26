@@ -29,13 +29,22 @@ struct ServiceState {
     static std::vector<dns_upstream_service *> &Live() {
         static std::vector<dns_upstream_service *> live; return live;
     }
-    ServiceState(unsigned n = 2, unsigned cap = 0, const char *quota = "", unsigned rate = 0, unsigned burst = 0, unsigned cooldown = 100)
+    ServiceState(unsigned n = 2, unsigned cap = 0, const char *quota = "", unsigned rate = 0, unsigned burst = 0, unsigned cooldown = 100,
+        unsigned wans = 0, bool adaptive = false)
       : endpoints(new dns_server_info[n]{}), count(n) {
         atomic_set(&s.refs, 1); pthread_mutex_init(&s.lock, nullptr); pthread_mutex_init(&s.turn_lock, nullptr); pthread_mutex_init(&s.detail_lock, nullptr);
         INIT_LIST_HEAD(&s.list); INIT_LIST_HEAD(&s.timer); INIT_LIST_HEAD(&s.waiters);
         s.started = 1; s.timer_due = ULONG_MAX; s.config.max_backends = n;
         s.type = DNS_SERVER_HTTPS; s.flags.type = s.type; s.flags.max_upstream_connections = cap;
         s.flags.max_query_rate = rate; s.flags.query_burst = burst;
+        s.flags.adaptive_query_rate = adaptive;
+        s.wan_count = wans;
+        if (wans) {
+            strcpy(s.id, "wan-fixture");
+            s.extra_turns = static_cast<dns_service_turn *>(calloc(wans - 1, sizeof(dns_service_turn)));
+            EXPECT_NE(s.extra_turns, nullptr);
+            for (unsigned i = 0; i < wans; i++) snprintf(s.wans[i].interface, sizeof(s.wans[i].interface), "fixture-wan%u", i);
+        }
         s.flags.upstream_cooldown_ms = cooldown; // explicit fixture timing; zero exercises the production default
         strncpy(s.flags.quota_group, quota, sizeof(s.flags.quota_group) - 1);
         EXPECT_EQ(_dns_policy_service_init(&s), 0);
@@ -46,6 +55,8 @@ struct ServiceState {
             atomic_set(&ep.refcnt, 1); INIT_LIST_HEAD(&ep.conn_stream_list);
             ep.fd = -1; ep.status = DNS_SERVER_STATUS_CONNECTED; ep.service_protocol_ready = 1; // simulated ready transport; no socket IO
             ep.type = s.type; ep.flags = s.flags; ep.service = &s;
+            ep.service_wan = wans ? i % wans : 0;
+            if (wans) strcpy(ep.flags.ifname, s.wans[ep.service_wan].interface);
             ep.service_member_id = i + 1; ep.service_valid_until = ULONG_MAX; ep.ai_family = AF_INET; ep.ai_addrlen = sizeof(ep.in);
             ep.in.sin_family = AF_INET; ep.in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             ep.in.sin_port = htons(63000 + i); ep.so_mark = -1;
@@ -65,6 +76,8 @@ struct ServiceState {
         Flush(); s.stopping = 1; list_del_init(&s.timer);
         for (unsigned i = 0; i < count; i++) { _dns_policy_detach(&endpoints[i]); pthread_mutex_destroy(&endpoints[i].lock); }
         _dns_policy_service_release(&s); EXPECT_EQ(atomic_read(&s.refs), 1);
+        free(s.extra_turns);
+        free(s.failures); free(s.event_sources);
         pthread_mutex_destroy(&s.turn_lock); pthread_mutex_destroy(&s.detail_lock); pthread_mutex_destroy(&s.lock);
         for (auto it = Live().begin(); it != Live().end(); ++it) if (*it == &s) { Live().erase(it); break; }
     }
@@ -80,9 +93,12 @@ struct ServiceQuery {
     ~ServiceQuery() {
         // A failed ASSERT may leave the fixture between synchronous write hooks.
         // Complete that synthetic call before tearing down observation ownership.
-        if (owner.s.turn_state == DNS_SERVICE_TURN_WRITING && owner.s.turn_observation &&
-            owner.s.turn_observation->query == &q && owner.s.turn_endpoint)
-            _dns_service_write_result(&q, owner.s.turn_endpoint, owner.s.turn_attempt_generation, 0, 0);
+        for (unsigned lane = 0; lane < (owner.s.wan_count ? owner.s.wan_count : 1); lane++) {
+            auto &turn = lane ? owner.s.extra_turns[lane - 1] : owner.s.turn;
+            if (turn.turn_state == DNS_SERVICE_TURN_WRITING && turn.turn_observation &&
+                turn.turn_observation->query == &q && turn.turn_endpoint)
+                _dns_service_write_result(&q, turn.turn_endpoint, turn.turn_attempt_generation, 0, 0);
+        }
         q.terminal = 1; _dns_service_query_terminal(&q);
         _dns_attempt_free_all(&q); owner.Flush(); _dns_service_query_free(&q);
         dns_query_budget_put(q.budget); EXPECT_EQ(atomic_read(&q.refcnt), 1);
@@ -120,7 +136,7 @@ TEST(UpstreamServiceState, WantWriteRetainsOneTurnAndAbortedOwnerCannotResume) {
     auto *ep = Pick(s, first); ASSERT_NE(ep, nullptr); auto gen = Generation(first, ep);
     ASSERT_EQ(_dns_attempt_wire_begin(&first.q, ep, gen), DNS_ADMIT_OK);
     _dns_service_write_result(&first.q, ep, gen, 0, 1);
-    EXPECT_EQ(s.s.turn_state, unsigned(DNS_SERVICE_TURN_WRITE_WAIT)); EXPECT_EQ(Pick(s, second), nullptr);
+    EXPECT_EQ(s.s.turn.turn_state, unsigned(DNS_SERVICE_TURN_WRITE_WAIT)); EXPECT_EQ(Pick(s, second), nullptr);
     EXPECT_EQ(s.s.cursor, 0U); EXPECT_EQ(s.s.stats.attempt_count, 0U);
     Retire(first, ep); s.Flush();
     EXPECT_EQ(_dns_service_write_begin(&first.q, ep, gen), DNS_ADMIT_DONE);
@@ -292,16 +308,49 @@ TEST(UpstreamServiceState, CancellationDuringSelectionCannotReleaseAnotherTurn) 
         std::unique_lock<std::mutex> lock(gate.lock);
         EXPECT_TRUE(gate.cv.wait_for(lock, std::chrono::seconds(1), [&] { return gate.entered; }));
     }
-    EXPECT_EQ(s.s.turn_state, unsigned(DNS_SERVICE_TURN_SELECTING));
+    EXPECT_EQ(s.s.turn.turn_state, unsigned(DNS_SERVICE_TURN_IDLE));
     pthread_mutex_lock(&canceled.q.lock); canceled.q.terminal = 1; pthread_mutex_unlock(&canceled.q.lock);
     _dns_service_query_terminal(&canceled.q); s.Flush();
-    EXPECT_EQ(s.s.turn_state, unsigned(DNS_SERVICE_TURN_SELECTING));
-    EXPECT_EQ(s.s.stats.skip_count, 0U); EXPECT_EQ(Pick(s, waiting), nullptr);
+    EXPECT_EQ(s.s.stats.skip_count, 0U);
+    auto *next = Pick(s, waiting); EXPECT_NE(next, nullptr);
+    EXPECT_EQ(s.s.turn.turn_state, unsigned(DNS_SERVICE_TURN_RESERVED));
     { std::lock_guard<std::mutex> lock(gate.lock); gate.release = true; gate.cv.notify_one(); }
     selector.join(); EXPECT_EQ(selected, nullptr); if (selected) dns_client_server_info_release(selected);
-    s.Flush(); EXPECT_EQ(s.s.turn_state, unsigned(DNS_SERVICE_TURN_IDLE));
+    ASSERT_NE(next, nullptr);
+    s.Flush(); EXPECT_EQ(s.s.turn.turn_state, unsigned(DNS_SERVICE_TURN_RESERVED));
     EXPECT_EQ(s.s.stats.skip_count, 1U); EXPECT_EQ(s.s.cursor, 0U);
-    auto *ep = Pick(s, waiting); ASSERT_EQ(ep, &s.endpoints[0]); Retire(waiting, ep); s.Flush();
+    Positive(s, waiting, next); Retire(waiting, next); s.Flush();
+}
+TEST(UpstreamServiceState, ABlockedWanWriterCannotHoldAnotherWanTurn) {
+    ServiceState s(2, 0, "", 0, 0, 100, 2);
+    ServiceQuery first(s), second(s);
+    auto *a = Pick(s, first); ASSERT_EQ(a, &s.endpoints[0]);
+    unsigned generation = Generation(first, a);
+    ASSERT_EQ(_dns_attempt_wire_begin(&first.q, a, generation), DNS_ADMIT_OK);
+    _dns_service_write_result(&first.q, a, generation, 0, 1);
+    ASSERT_EQ(s.s.turn.turn_state, unsigned(DNS_SERVICE_TURN_WRITE_WAIT));
+    auto *b = Pick(s, second); ASSERT_EQ(b, &s.endpoints[1]);
+    Positive(s, second, b);
+    EXPECT_EQ(s.s.turn.turn_state, unsigned(DNS_SERVICE_TURN_WRITE_WAIT));
+    EXPECT_EQ(s.s.stats.attempt_count, 1U);
+    Retire(first, a); s.Flush();
+    EXPECT_EQ(_dns_service_write_begin(&first.q, a, generation), DNS_ADMIT_DONE);
+    Retire(second, b);
+}
+TEST(UpstreamServiceState, PerExitAdaptiveCreditsAnd429SurviveServiceAggregation) {
+    ServiceState s(2, 0, "", 40, 1, 200, 2, true);
+    ServiceQuery first(s), second(s);
+    auto *a = Pick(s, first); ASSERT_EQ(a, &s.endpoints[0]); Positive(s, first, a);
+    _dns_policy_http_error_query(&first.q, a, 429, nullptr);
+    dns_upstream_wan_runtime_v1 limited{}, healthy{};
+    _dns_policy_wan_runtime(s.s.wans[0].policy, get_tick_count(), &limited);
+    _dns_policy_wan_runtime(s.s.wans[1].policy, get_tick_count(), &healthy);
+    EXPECT_EQ(limited.current_rate, 10U); EXPECT_EQ(limited.http_429, 1U);
+    EXPECT_EQ(healthy.current_rate, 20U); EXPECT_EQ(healthy.http_429, 0U);
+    EXPECT_EQ(healthy.cooldown_remaining_ms, 0U);
+    auto *b = Pick(s, second); ASSERT_EQ(b, &s.endpoints[1]);
+    Positive(s, second, b); // parent service must not spend WAN0's only credit for WAN1
+    Retire(first, a); Retire(second, b);
 }
 TEST(UpstreamServiceState, CancelBeforePositiveWriteSkipsButCancelAfterPositivePendingCountsFailure) {
     ServiceState s;
@@ -314,7 +363,7 @@ TEST(UpstreamServiceState, CancelBeforePositiveWriteSkipsButCancelAfterPositiveP
     {
         ServiceQuery after(s), waiting(s); auto *ep = Pick(s, after); ASSERT_NE(ep, nullptr); auto gen = Generation(after, ep);
         ASSERT_EQ(_dns_attempt_wire_begin(&after.q, ep, gen), DNS_ADMIT_OK); _dns_attempt_mark_sent(&after.q, ep, gen);
-        EXPECT_EQ(s.s.turn_state, unsigned(DNS_SERVICE_TURN_COMMIT_PENDING)); EXPECT_EQ(Pick(s, waiting), nullptr);
+        EXPECT_EQ(s.s.turn.turn_state, unsigned(DNS_SERVICE_TURN_COMMIT_PENDING)); EXPECT_EQ(Pick(s, waiting), nullptr);
         after.q.terminal = 1; _dns_service_query_terminal(&after.q); Retire(after, ep);
         EXPECT_EQ(s.s.stats.attempt_count, 0U); // finalization has not run, ownership still retained
         s.Flush(); EXPECT_EQ(s.s.cursor, 1U); EXPECT_EQ(s.s.stats.attempt_count, 1U);
@@ -335,7 +384,7 @@ TEST(UpstreamServiceState, StaleAttemptGenerationCannotWriteOrCommitNewTurn) {
     unsigned gen = Generation(q, ep);
     EXPECT_EQ(_dns_service_write_begin(&q.q, ep, gen + 1), DNS_ADMIT_DONE);
     _dns_service_write_result(&q.q, ep, gen + 1, 1, 0);
-    EXPECT_EQ(s.s.turn_state, unsigned(DNS_SERVICE_TURN_RESERVED)); EXPECT_EQ(s.s.cursor, 0U);
+    EXPECT_EQ(s.s.turn.turn_state, unsigned(DNS_SERVICE_TURN_RESERVED)); EXPECT_EQ(s.s.cursor, 0U);
     Positive(s, q, ep); EXPECT_EQ(s.s.stats.attempt_count, 1U); Retire(q, ep);
 }
 TEST(UpstreamServiceState, ExpiredAndRevokedMembersStopNewAdmissionImmediately) {
@@ -362,7 +411,7 @@ TEST(UpstreamServiceState, NoProgressWaitsWithoutEventfdSelfFeedOrDeadlineExtens
         EXPECT_GT(service.s.next_eligible, get_tick_count());
         // Do not use ServiceState::Flush: this exercises the real scheduler wake path.
         _dns_services_flush_pending();
-        EXPECT_EQ(service.s.turn_state, unsigned(DNS_SERVICE_TURN_IDLE));
+        EXPECT_EQ(service.s.turn.turn_state, unsigned(DNS_SERVICE_TURN_IDLE));
         for (unsigned i = 0; i < 4; i++) _dns_services_flush_pending();
         errno = 0; EXPECT_EQ(read(wake, &count, sizeof(count)), -1); EXPECT_EQ(errno, EAGAIN);
         EXPECT_LE(dns_query_budget_remaining_ms(query.q.budget), remaining);
@@ -414,7 +463,7 @@ TEST(UpstreamServiceState, DatagramBackpressureAbortsOwnerButWaitsWithoutSelfFee
         EXPECT_GT(service.s.next_eligible, get_tick_count());
         uint64_t count; ASSERT_EQ(read(wake, &count, sizeof(count)), ssize_t(sizeof(count)));
         _dns_services_flush_pending();
-        EXPECT_EQ(service.s.turn_state, unsigned(DNS_SERVICE_TURN_IDLE));
+        EXPECT_EQ(service.s.turn.turn_state, unsigned(DNS_SERVICE_TURN_IDLE));
         EXPECT_EQ(ep.active_attempts, 0U); EXPECT_EQ(service.s.stats.attempt_count, 0U);
         for (unsigned i = 0; i < 4; i++) _dns_services_flush_pending();
         errno = 0; EXPECT_EQ(read(wake, &count, sizeof(count)), -1); EXPECT_EQ(errno, EAGAIN);
@@ -424,6 +473,36 @@ TEST(UpstreamServiceState, DatagramBackpressureAbortsOwnerButWaitsWithoutSelfFee
     }
     pthread_mutex_destroy(&client.server_list_lock);
     client.fd_wakeup = previous; close(wake); close(sockets[0]); close(sockets[1]);
+}
+
+TEST(UpstreamServiceState, DatagramPressureLeavesAnotherWanEligible) {
+    int pipes[4];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, pipes), 0);
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, pipes + 2), 0);
+    int size = 4096; ASSERT_EQ(setsockopt(pipes[0], SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)), 0);
+    unsigned char fill[512]{};
+    while (send(pipes[0], fill, sizeof(fill), 0) == sizeof(fill)) {}
+    ASSERT_EQ(errno, EAGAIN);
+    int previous = client.fd_wakeup, wake = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    ASSERT_GE(wake, 0); client.fd_wakeup = wake;
+    pthread_mutex_init(&client.server_list_lock, nullptr);
+    {
+        ServiceState service(2, 0, "", 0, 0, 100, 2); ServiceQuery query(service);
+        for (unsigned i = 0; i < 2; i++) { service.endpoints[i].type = DNS_SERVER_UDP; service.endpoints[i].fd = pipes[i * 2]; }
+        dns_server_group group{}; INIT_LIST_HEAD(&group.head); group.service_members = 1;
+        dns_server_group_member member{}; member.service = &service.s; list_add_tail(&member.list, &group.head);
+        query.q.server_group = &group; query.q.budget = dns_query_budget_new(3, 2000);
+        unsigned char packet[12]{};
+        _dns_client_send_packet(&query.q, packet, sizeof(packet)); service.Flush();
+        EXPECT_GT(service.endpoints[0].service_retry_at, get_tick_count());
+        EXPECT_EQ(service.s.next_eligible, 0U);
+        _dns_client_send_packet(&query.q, packet, sizeof(packet)); service.Flush();
+        unsigned char reply[12]; EXPECT_EQ(recv(pipes[3], reply, sizeof(reply), 0), ssize_t(sizeof(packet)));
+        EXPECT_EQ(service.s.stats.attempt_count, 1U);
+        for (unsigned i = 0; i < 2; i++) service.endpoints[i].fd = -1;
+    }
+    pthread_mutex_destroy(&client.server_list_lock); client.fd_wakeup = previous; close(wake);
+    for (int fd : pipes) close(fd);
 }
 
 TEST(UpstreamServiceState, EpollBatchPinsLaterEndpointAcrossEarlierCallbackRetirement) {
@@ -486,6 +565,34 @@ TEST(UpstreamServiceState, CancelBetweenObservationPublicationAndRegistrationIsD
     EXPECT_EQ(s.s.hints, nullptr); EXPECT_EQ(atomic_read(&q.q.refcnt), 1);
 }
 
+TEST(UpstreamServiceState, SnapshotCountsHealthyWansNotDormantAlternateFamilies) {
+    ServiceState state(6, 0, "", 0, 0, 100, 3);
+    for (unsigned i = 0; i < 6; i++) {
+        auto &ep = state.endpoints[i];
+        ep.type = DNS_SERVER_HTTPS;
+        ep.ai_family = i < 3 ? AF_INET : AF_INET6;
+        strcpy(ep.ip, i < 3 ? "198.51.100.1" : "2001:db8::1");
+        ep.service_protocol_ready = i < 3;
+        ep.security_status = i < 3 ? DNS_CLIENT_SERVER_SECURITY_SECURE : DNS_CLIENT_SERVER_SECURITY_UNKNOW;
+        if (i < 3) state.s.wans[i].winner = ep.service_member_id;
+    }
+    dns_upstream_service_snapshot_v1 snapshot{};
+    _dns_service_snapshot_test(&state.s, &snapshot);
+    EXPECT_EQ(snapshot.endpoint_count, 6U); // Existing candidate-membership ABI is unchanged.
+    EXPECT_EQ(snapshot.status, DNS_SERVICE_READY);
+    EXPECT_EQ(snapshot.security, DNS_CLIENT_SERVER_SECURITY_SECURE);
+    state.endpoints[1].service_retry_at = get_tick_count() + 10000;
+    state.endpoints[1].service_protocol_ready = 0;
+    state.endpoints[1].security_status = DNS_CLIENT_SERVER_SECURITY_VERIFY_FAILED;
+    _dns_service_snapshot_test(&state.s, &snapshot);
+    EXPECT_EQ(snapshot.status, DNS_SERVICE_DEGRADED); // A real missing WAN must still be visible.
+    EXPECT_EQ(snapshot.security, DNS_CLIENT_SERVER_SECURITY_SECURE); // The two serving connections are verified.
+    for (unsigned i = 0; i < 3; i++) { state.endpoints[i].service_retry_at = get_tick_count() + 10000; state.endpoints[i].service_protocol_ready = 0; }
+    _dns_service_snapshot_test(&state.s, &snapshot);
+    EXPECT_EQ(snapshot.status, DNS_SERVICE_UNAVAILABLE);
+    EXPECT_EQ(snapshot.security, DNS_CLIENT_SERVER_SECURITY_VERIFY_FAILED);
+}
+
 TEST(UpstreamServiceState, SnapshotFreshnessHasNoInfiniteIntegerSentinel) {
     ServiceState state;
     dns_upstream_service_snapshot_v1 snapshot{};
@@ -523,7 +630,7 @@ TEST(UpstreamServiceState, SnapshotFreshnessHasNoInfiniteIntegerSentinel) {
 TEST(UpstreamServiceState, FixedCooldownDefaultsAndDoesNotGrowOrFollowRetryAfter) {
     for (unsigned configured : {0U, 1U, 1000U, 10000U}) {
         ServiceState s(1, 0, "", 0, 0, configured);
-        unsigned expected = configured ? configured : 1000;
+        unsigned expected = configured ? configured : 200;
         for (const char *header : {"0", "3600", "invalid", "18446744073709551615000"}) {
             unsigned long before = get_tick_count();
             _dns_policy_http_error(&s.endpoints[0], 429, header);
@@ -626,7 +733,8 @@ TEST(UpstreamServiceState, NodeIsolationCannotRefillOrBypassSharedServiceRate) {
 
 TEST(UpstreamServiceState, TransportFailureWaitUsesFixedConfiguredNodeCooldownWithoutGrowth) {
     for (unsigned configured : {0U, 1U, 1000U, 10000U}) {
-        ServiceState state(2, 0, "", 0, 0, configured);
+        ServiceState state(2, 0, "", 0, 0, 7000);
+        state.s.flags.upstream_retry_cooldown_ms = configured; // independent of HTTP cooldown
         auto *failed = &state.endpoints[0], *healthy = &state.endpoints[1];
         unsigned expected = configured ? configured : 1000;
         for (unsigned turn = 0; turn < 9; turn++) {

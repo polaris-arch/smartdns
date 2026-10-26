@@ -36,7 +36,7 @@ bool query_loopback(const std::string &name, int port) {
 }
 
 
-TEST(UpstreamServicePool, StaticTwoBackendsOneRuntimeServiceAndWireRoundRobin) {
+TEST(UpstreamServicePool, StaticAddressCandidatesReuseOneHealthyExit) {
     std::atomic<unsigned> sent[2]{};
     smartdns::MockServer a, b;
     auto response = [&](int index, smartdns::ServerRequestContext *r) {
@@ -60,7 +60,7 @@ response-mode fastest-response
 )"));
     for (int i = 0; i < 4; i++)
         ASSERT_TRUE(query_loopback("pool-" + std::to_string(i) + ".example", 62763));
-    EXPECT_EQ(sent[0].load(), 2U); EXPECT_EQ(sent[1].load(), 2U);
+    EXPECT_EQ(sent[0].load(), 4U); EXPECT_EQ(sent[1].load(), 0U);
     // Smartdns::Server may isolate the resolver process; copied C snapshots are
     // asserted by the native plugin REST test in that same process, not fabricated here.
 }

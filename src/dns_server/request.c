@@ -29,6 +29,7 @@
 #include "neighbor.h"
 #include "ptr.h"
 #include "request_pending.h"
+#include "prefetch.h"
 #include "rules.h"
 #include "soa.h"
 
@@ -181,6 +182,8 @@ static void _dns_server_delete_request(struct dns_request *request)
 	}
 
 	_dns_server_address_child_release(request);
+    void *ticket = request->prefetch_ticket; request->prefetch_ticket = NULL;
+    _dns_server_prefetch_done(ticket);
 	memset(request, 0, sizeof(*request));
 	free(request);
 	atomic_dec(&server.request_num);
@@ -403,7 +406,7 @@ int dns_server_request_is_prefetch(struct dns_request *request)
 		return 0;
 	}
 
-	return request->prefetch;
+	return request->prefetch || (request->prefetch_origin_flags & 14);
 }
 
 int dns_server_request_is_dualstack(struct dns_request *request)
@@ -827,6 +830,8 @@ struct dns_request *_dns_server_new_child_request(struct dns_request *request, c
 	safe_strncpy(child_request->domain, domain, sizeof(child_request->domain));
 	child_request->prefetch = request->prefetch;
 	child_request->prefetch_flags = request->prefetch_flags;
+    child_request->prefetch_origin_flags = request->prefetch_origin_flags;
+    child_request->prefetch_queue_wait_ms = request->prefetch_queue_wait_ms;
 	child_request->child_callback = child_callback;
 	child_request->parent_request = request;
 	child_request->qtype = qtype;
@@ -1238,6 +1243,14 @@ errout:
 int _dns_server_setup_query_option(struct dns_request *request, struct dns_query_options *options)
 {
 	memset(options, 0, sizeof(*options));
+    if (request->prefetch || (request->prefetch_origin_flags & 14)) {
+        options->enable_flag |= DNS_QUEY_OPTION_BACKGROUND;
+        options->background_origin_flags = request->prefetch_origin_flags;
+        options->background_queue_wait_ms = request->prefetch_queue_wait_ms;
+        if (request->prefetch_flags & PREFETCH_FLAGS_CACHE_HIT) options->enable_flag |= DNS_QUEY_OPTION_CACHE_HIT_REFRESH;
+        if ((request->prefetch_origin_flags & 6) || request->prefetch_flags & (PREFETCH_FLAGS_EXPIRED | PREFETCH_FLAGS_CACHE_HIT))
+            options->enable_flag |= DNS_QUEY_OPTION_EXPIRED_REFRESH;
+    }
 
 	if (request->has_ecs) {
 		memcpy(&options->ecs_dns, &request->ecs, sizeof(options->ecs_dns));

@@ -96,6 +96,7 @@ impl API {
         api.register(Method::GET, "/api/log/audit/stream", true, APIRoute!(API::api_audit_log_stream));
         api.register(Method::GET, "/api/server/version", false, APIRoute!(API::api_server_version));
         api.register(Method::GET, "/api/upstream-server", true, APIRoute!(API::api_upstream_server_get_list));
+        api.register(Method::GET, "/api/network/interfaces", true, APIRoute!(API::api_network_interfaces));
         api.register(Method::GET, "/api/upstream-server/{service_id}/backends", true, APIRoute!(API::api_upstream_server_get_backends));
         api.register(Method::GET, "/api/config/settings", true, APIRoute!(API::api_config_get_settings));
         api.register(Method::PUT, "/api/config/settings", true, APIRoute!(API::api_config_set_settings));
@@ -915,6 +916,17 @@ impl API {
         let ui_version = &smartdns::smartdns_ui_version();
         let msg = api_msg_gen_version(server_version, ui_version);
         API::response_build(StatusCode::OK, msg)
+    }
+
+    async fn api_network_interfaces(
+        _this: Arc<HttpServer>,
+        _param: APIRouteParam,
+        _req: Request<body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, HttpError> {
+        let interfaces = tokio::task::spawn_blocking(|| crate::data_network::interfaces().map_err(|e| e.to_string()))
+            .await.map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        API::response_build(StatusCode::OK, serde_json::json!({"interface_list":interfaces}).to_string())
     }
 
     async fn api_upstream_server_get_list(

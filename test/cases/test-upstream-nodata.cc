@@ -111,7 +111,7 @@ void pool_case(unsigned rate, bool fallback, bool nxdomain = false)
     EXPECT_EQ(stats.query_count, queries); EXPECT_EQ(stats.success_count, queries);
     EXPECT_EQ(stats.failure_count, 0U); EXPECT_EQ(stats.skip_count, 0U); EXPECT_EQ(stats.in_flight, 0U);
     EXPECT_EQ(stats.attempt_count, queries); EXPECT_EQ(sends[0] + sends[1], queries);
-    if (queries == 12) { EXPECT_EQ(sends[0], 6U); EXPECT_EQ(sends[1], 6U); }
+    if (queries == 12) { EXPECT_EQ(sends[0], 12U); EXPECT_EQ(sends[1], 0U); }
     if (fallback) EXPECT_EQ(other_sends, 1U);
 }
 } // namespace

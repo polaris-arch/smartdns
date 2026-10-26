@@ -1,6 +1,6 @@
 --- a/src/lib/backend/server.ts
 +++ b/src/lib/backend/server.ts
-@@ -264,7 +264,57 @@
+@@ -264,7 +264,78 @@
      registrar: string;
  }
  
@@ -14,6 +14,13 @@
 +    events: Array<{sequence: number; query_id: number; age_ms: number; ip: string; family: number; port: number;
 +      kind: number; phase: number; code: number; system_error: number; elapsed_ms: number; limit_ms: number; tls_error: number; message: string;
 +      timestamp_ms?: number | null; domain?: string | null; qtype?: number | null;
++      origin_flags?: number | null; queue_wait_ms?: number | null; interface?: string | null; wan_generation?: number | null;
++      connection_generation?: number; active_attempts?: number | null; timeout_stage?: number;
++      tls_operation?: number; tls_errors?: number[]; tls_error_overflow?: number;
++      quic_close?: {code: string; frame: string; local: boolean; transport: boolean} | null;
++      progress?: {generation: number; wire_started: boolean; request_complete: boolean;
++        headers_received: boolean; http_status: number; admission_to_send_ms: number | null;
++        send_duration_ms: number | null; headers_wait_ms: number | null; since_last_send_ms: number | null};
 +      dns_response?: {rcode: number; truncated: boolean; answers: number; authority: number; additional: number;
 +        a: number; aaaa: number; cname: number; soa: number} | null}>;
 +}
@@ -28,6 +35,20 @@
 +
 +export interface UpstreamDiagnosticsData {
 +    version: number;
++    runtime?: {version: number; qps_mode: 'off' | 'fixed_service' | 'adaptive_per_exit'; configured_cap: number;
++      foreground_waiting: number; refresh_waiting: number; prefetch_waiting: number;
++      wans: Array<{interface: string; interface_index: number; generation: number; family_mask: number;
++        connected: boolean; connected_family: number; ip: string; source: string;
++        current_rate: number | null; known_good_rate: number | null; probe_ceiling: number | null;
++        cooldown_remaining_ms: number; retry_remaining_ms: number; quota_group_http_429: number;
++        last_backpressure_ms: number | null}>;
++      refresh_queue?: {scope: 'process'; queued: number; active: number; peak: number; enqueued: number; merged: number;
++        admitted: number; rejected: number; dropped: number; completed: number; skipped_fresh: number; dispatch_errors: number;
++        oldest_wait_ms: number; metadata_bytes: number}} | null;
++    failures?: {version: number; retention: string;
++      rcodes: Array<{code: number; name: string; count: number; last_event: UpstreamPolicyData['events'][number] | null}>;
++      timeout_stages: Record<string, number>;
++      timeouts: UpstreamPolicyData['events']; io_errors: UpstreamPolicyData['events']} | null;
 +    qps: number;
 +    cooldown_ms: number;
 +    failure_end: Record<string, number>;
@@ -60,26 +81,30 @@
      port: number;
 --- a/src/components/dashboard/upstream-servers/upstream-servers-table.tsx
 +++ b/src/components/dashboard/upstream-servers/upstream-servers-table.tsx
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,8 @@
  "use client"
  
  import * as React from 'react';
 +import { UpstreamDiagnostics } from './upstream-diagnostics';
++import { upstreamAddressText } from './diagnostics-model';
  import { useMemo, useState } from 'react';
  import {
    MaterialReactTable,
-@@ -64,7 +65,8 @@
+@@ -64,7 +66,8 @@
          enableSorting: false,
        },
        {
 -        accessorKey: 'ip',
 +        id: 'ip',
-+        accessorFn: (row) => row.pool_enabled ? (row.endpoint_ips ?? []).join(', ') : row.ip,
++        accessorFn: upstreamAddressText,
          header: t('IP'),
          enableSorting: false,
          size: 330,
-@@ -95,9 +97,10 @@
+@@ -93,11 +96,14 @@
+       {
+         accessorKey: 'query_success_rate',
          header: t('Success Rate'),
++        enableClickToCopy: false,
          enableSorting: true,
          size: 160,
 -        Cell: ({ cell }) => {
@@ -87,11 +112,12 @@
            const rate = cell.getValue<number>();
 -          return <span>{rate} %</span>;
 +          const poolRate = row.original.response_statistics?.success_rate;
-+          return <><span style={{whiteSpace: 'nowrap'}} title={row.original.response_statistics ? '已发请求结算：排除竞速取消、未发送及本地取消 / Sent outcomes excluding races, unsent and local cancellation' : undefined}>{row.original.response_statistics ? (typeof poolRate === 'number' ? `${poolRate.toFixed(2)} %` : '—') : `${rate} %`}</span><UpstreamDiagnostics server={row.original} /></>;
++          const stats = row.original.response_statistics;
++          return <><span style={{whiteSpace: 'nowrap'}} title={stats ? '分母为已发送且结算的有效样本；排除竞速取消、未发送及本地取消 / Denominator: sent settled samples; excludes races, unsent and local cancellation' : undefined}>{stats ? (typeof poolRate === 'number' ? `${poolRate.toFixed(2)} %` : '—') : `${rate} %`}</span>{stats ? <small style={{display: 'block', whiteSpace: 'nowrap'}}>{i18n.language?.startsWith('zh') ? '已结算' : 'Settled'} {stats.accepted}/{stats.samples}</small> : null}<UpstreamDiagnostics server={row.original} /></>;
          },
        },
        {
-@@ -107,10 +110,10 @@
+@@ -107,10 +113,10 @@
          size: 140,
          Cell: ({ cell }) => {
            const avgTime = cell.getValue<number>();
@@ -104,7 +130,7 @@
          },
        },
        {
-@@ -191,6 +194,7 @@
+@@ -191,6 +197,7 @@
    const table = useMaterialReactTable({
      columns,
      data,
@@ -114,11 +140,11 @@
      enableColumnOrdering: false,
 --- /dev/null
 +++ b/src/components/dashboard/upstream-servers/upstream-diagnostics.tsx
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,274 @@
 +import type * as React from 'react';
 +import { useState } from 'react';
 +import { Box, Button, Chip, Dialog, DialogTitle, DialogContent, DialogActions, Paper, Tabs, Tab, Typography } from '@mui/material';
-+import { eventCategory, eventTime, groupEvents, type DiagnosticEvent } from './diagnostics-model';
++import { eventCategory, eventTime, groupEvents, queryAccounting, type DiagnosticEvent } from './diagnostics-model';
 +import { type UpStreamServers } from '@/lib/backend/server';
 +import i18n from '@/components/core/i18n';
 +
@@ -136,6 +162,9 @@
 +  http_429: ['HTTP 429', 'HTTP 429'], http_503: ['HTTP 503', 'HTTP 503'], http_other: ['其他 HTTP 错误', 'Other HTTP error'],
 +  dns_rcode: ['DNS 错误响应码', 'DNS error RCODE'], dns_callback_rejected: ['DNS 响应未被接受', 'DNS response not accepted'],
 +  attempt_timeout: ['发送尝试超时', 'Attempt timed out'], io_or_protocol_error: ['IO 或协议处理错误', 'IO or protocol processing error'],
++  unknown: ['阶段未确认', 'Stage unconfirmed'], not_sent: ['尚未发出请求数据', 'Request bytes not sent'],
++  sending: ['请求尚未完整发出', 'Request write incomplete'], wait_headers: ['等待 HTTP 响应头', 'Waiting for HTTP headers'],
++  read_body: ['已收响应头，等待完整响应体', 'Waiting for complete response body'], wait_response: ['等待 DNS 响应', 'Waiting for DNS response'],
 +};
 +
 +const kinds = ['响应尝试超时|Response attempt timeout','DNS 响应未被接受|DNS response not accepted','传输或协议错误|Transport or protocol error','空闲正常关闭|Normal idle close','服务端 GOAWAY|Peer GOAWAY','保活发送|Keepalive sent','保活确认|Keepalive acknowledged','保活探测超时|Keepalive timeout','建连超时|Connection timeout','服务期限耗尽|Service deadline expired','HTTP 429 限速|HTTP 429 rate limited','HTTP 503 不可用|HTTP 503 unavailable','DNS 错误响应码|DNS error RCODE'];
@@ -154,11 +183,12 @@
 +export function UpstreamDiagnostics({server}: {server: UpStreamServers}): React.JSX.Element | null {
 +  const [open,setOpen]=useState(false), [tab,setTab]=useState(0), [filter,setFilter]=useState('all');
 +  const d=server.diagnostics;
++  const accounting=queryAccounting(server);
 +  if (!d) return <Button size="small" disabled title="诊断采集暂不可用 / Diagnostic collection unavailable">诊断 / Diagnostics</Button>;
 +  const lang=i18n.language?.startsWith('zh') ? 0 : 1;
 +  const text=(cn:string,en:string):string => lang===0 ? cn : en;
 +  const name=(values:string[],index:number):string => values[index]?.split('|')[lang] ?? String(index);
-+  const policy=d.policy, loop=d.client_loop, stats=server.response_statistics;
++  const policy=d.policy, loop=d.client_loop, stats=server.response_statistics, failures=d.failures, runtime=d.runtime, room=runtime?.refresh_queue;
 +  const family=server.pool_enabled ? (policy?.family===4?'IPv4':policy?.family===6?'IPv6':text('双栈，按出口匹配','Dual stack, matched to egress')) : (server.ip?.includes(':')?'IPv6':'IPv4');
 +  const state=({ready:text('就绪','Ready'),cooldown:text('冷却中','Cooling down'),degraded:text('部分后端可用','Partially available'),
 +    discovering:text('发现后端中','Discovering'),unavailable:text('暂无可用后端','No eligible backend'),stale:text('使用旧地址','Using stale addresses')} as Record<string,string>)[server.service_status??'']??text('状态未确认','State unconfirmed');
@@ -177,6 +207,12 @@
 +  const qtype=(value?:number|null):string => ({1:'A',28:'AAAA',65:'HTTPS',16:'TXT',15:'MX',255:'ANY',2:'NS',6:'SOA'} as Record<number,string>)[value??0]??String(value??'—');
 +  const code=(value:number):string => ({0:'NOERROR',2:'SERVFAIL',3:'NXDOMAIN',5:'REFUSED'} as Record<number,string>)[value]??String(value);
 +  const title=(event:DiagnosticEvent):string => event.kind===2&&event.phase===0&&event.code>=300&&event.code<=599?`HTTP ${event.code}`:name(kinds,event.kind);
++  const origin=(flags?:number|null):string => {
++    if (!flags) return text('来源未记录','Source not recorded');
++    return [[1,text('前台查询','Foreground')],[2,text('缓存命中触发刷新','Cache-hit refresh')],
++      [4,text('过期定时刷新','Expiry timer')],[8,text('主动预取','Proactive prefetch')]]
++      .filter(([bit])=>(flags & Number(bit))!==0).map(([,label])=>label).join(' + ');
++  };
 +  const stamp=(event:DiagnosticEvent):React.JSX.Element => <Box component="span" sx={{fontVariantNumeric:'tabular-nums'}}>
 +    {eventTime(event.timestamp_ms,lang===0?'zh-CN':'en-GB')??text('绝对时间未记录','Absolute time not recorded')}
 +    <Box component="span" sx={{color:'text.secondary',ml:1}}>{text('采样前','Before snapshot')} {(event.age_ms/1000).toFixed(1)} s</Box>
@@ -185,6 +221,11 @@
 +    <Box sx={{fontWeight:600,overflowWrap:'anywhere'}}>{event.domain||text('未关联域名','No domain context')} · {qtype(event.qtype)} · #{event.query_id||event.qtype?event.query_id:'—'}</Box>
 +    <Box sx={{color:'text.secondary',mt:.25}}>{event.ip} · IPv{event.family} · {name(phases,event.phase)} · {text('事件','Event')} {event.sequence}</Box>
 +    <Box sx={{mt:.5}}>{stamp(event)}</Box>
++    <Box sx={{mt:.5,color:'text.secondary'}}>{origin(event.origin_flags)}
++      {!!(event.origin_flags&&event.origin_flags&14)&&` · ${text('后台任务排队','Refresh-room wait')} ${String(event.queue_wait_ms??'—')} ms`}
++      {event.interface&&` · ${text('出口','Exit')} ${event.interface}`}
++      {!!event.wan_generation&&` · ${text('出口代次','Exit generation')} ${String(event.wan_generation)}`}
++    </Box>
 +    {event.kind===1&&<Box sx={{mt:.5}}>{name(rejects,event.code)}</Box>}
 +    {event.kind===12&&<Box>DNS {code(event.code)}</Box>}
 +    {event.dns_response&&<Box sx={{mt:.5,color:'text.secondary',fontVariantNumeric:'tabular-nums'}}>
@@ -194,6 +235,17 @@
 +    {[10,11].includes(event.kind)?<Box sx={{mt:.5}}>{text('固定冷却','Fixed cooldown')}: {event.limit_ms} ms</Box>:
 +      (event.elapsed_ms>0||event.limit_ms>0)&&<Box sx={{mt:.5}}>{text('耗时 / 门限','Elapsed / limit')}: {event.elapsed_ms>0?event.elapsed_ms:'—'} / {event.limit_ms||'—'} ms</Box>}
 +    {event.kind===2&&<Box sx={{mt:.5}}>{event.message||text('错误文本未记录','No error text')} · {text('协议码 / 系统码','Protocol / system code')}: {event.code} / {event.system_error}</Box>}
++    {event.timeout_stage!==undefined&&event.kind===0&&<Box sx={{mt:.5,fontWeight:600}}>{text('超时阶段','Timeout stage')}: {labels[['unknown','not_sent','sending','wait_headers','read_body','wait_response'][event.timeout_stage]]?.[lang]??text('未确认','Unconfirmed')}</Box>}
++    {event.progress&&<Box sx={{mt:.5,color:'text.secondary'}}>
++      {text('发送耗时 / 等待响应头','Request write / response headers')}: {event.progress.send_duration_ms??'—'} / {event.progress.headers_wait_ms??'—'} ms
++      <br/>{text('完整发出 / 已收响应头','Request complete / headers received')}: {String(event.progress.request_complete)} / {String(event.progress.headers_received)}
++    </Box>}
++    {event.kind===2&&event.connection_generation!==undefined&&<Box sx={{mt:.5,color:'text.secondary'}}>
++      {text('连接代次 / 出错时在途数','Connection generation / active attempts at error')}: {event.connection_generation} / {event.active_attempts??'—'}
++      <br/>TLS {['—','handshake','read','write','events'][event.tls_operation??0]??'—'} · {(event.tls_errors??[]).map(value=>'0x'+value.toString(16)).join(' → ')||'—'}
++      {(event.tls_error_overflow??0)>0&&` (+${String(event.tls_error_overflow)})`}
++    </Box>}
++    {event.quic_close&&<Box sx={{mt:.5,color:'text.secondary'}}>QUIC {event.quic_close.code} · {event.quic_close.transport?text('传输层','Transport'):text('应用层','Application')} · {event.quic_close.local?text('本机关闭','Local close'):text('对端关闭','Peer close')} · frame {event.quic_close.frame}</Box>}
 +  </Box>;
 +  const groups=groupEvents((policy?.events??[]).filter(e=>filter==='all'||eventCategory(e)===filter));
 +  const columns={display:'grid',gridTemplateColumns:{xs:'minmax(0,1fr)',sm:'repeat(2,minmax(0,1fr))'},gap:1.5};
@@ -205,9 +257,17 @@
 +          <Typography component="h2" id="upstream-diagnostics-title" sx={{fontSize:'clamp(16px, 1vw + 12px, 20px)',fontWeight:700,m:0,overflowWrap:'anywhere'}}>{server.host}</Typography>
 +          <Chip size="small" variant="outlined" color={server.service_status==='ready'?'success':server.service_status==='cooldown'?'warning':'default'} label={state}/>
 +        </Box>
-+        <Box sx={{fontSize:12,color:'text.secondary',mt:.25}}>{server.pool_enabled?text('服务池诊断','Service pool diagnostics'):text('单节点上游诊断','Endpoint diagnostics')} · {text('请求结算、协议观测与连接状态','Query outcomes, protocol events and connections')}</Box>
++        <Box sx={{fontSize:12,color:'text.secondary',mt:.25}}>{server.pool_enabled?text('服务商诊断','Provider diagnostics'):text('上游诊断','Upstream diagnostics')} · {text('请求结算、协议观测与连接状态','Query outcomes, protocol events and connections')}</Box>
 +      </DialogTitle>
 +      <DialogContent sx={theme=>({p:{xs:1.5,sm:2.5},backgroundColor:'#edf1f6',...theme.applyStyles('dark',{backgroundColor:'#101722'}),'& details > summary':{cursor:'pointer',listStylePosition:'inside'},'& small':{fontSize:'.9em',color:'text.secondary'}})}>
++        {accounting?<Box sx={{p:1.5,mb:1.5,borderRadius:2,bgcolor:'background.paper',overflowWrap:'anywhere'}}>
++          <strong>{text('查询总数与成功次数的差额','Query totals and accepted responses')}</strong>
++          <Box>{quantity(accounting.total)} = {text('成功','Accepted')} {quantity(accounting.accepted)} + {text('已发送未成功','Sent unsuccessful')} {quantity(accounting.failed)} + {text('未发送','Unsent')} {quantity(accounting.unsent)} + {text('处理中','In flight')} {quantity(accounting.pending)}</Box>
++          <Box sx={{color:'text.secondary',mt:.5}}>{text('成功率分母仅含已发送且结算的有效样本；未发送、竞速取消和本地取消单列。','The success-rate denominator contains sent settled samples; unsent queries, races and local cancellation are separate.')}</Box>
++          {count(d.skip_end,'other_result')>0?<Box>{text('其他上游先返回，取消尚未发出的查询','Another upstream answered before this query was sent')}: {quantity(count(d.skip_end,'other_result'))}</Box>:null}
++          {count(d.skip_wait,'rate_limit')>0?<Box>{text('未发送查询中，最后在等待 QPS 额度','Unsent queries last waiting for QPS allowance')}: {quantity(count(d.skip_wait,'rate_limit'))}</Box>:null}
++          {accounting.closed?null:<Box sx={{color:'text.secondary'}}>{text('计数快照正在更新，以上分项暂未闭合；不把差额推算为网络失败。','Counters are updating; the snapshot is not yet closed. The difference is not inferred to be a network failure.')}</Box>}
++        </Box>:null}
 +        {tab===0?<><Box sx={{display:'grid',gridTemplateColumns:{xs:'repeat(2,minmax(0,1fr))',sm:'repeat(4,minmax(0,1fr))'},gap:1,mt:1}}>
 +          {[[text('已发请求成功率','Sent-query success rate'),typeof stats?.success_rate==='number'?stats.success_rate.toFixed(2)+'%':'—','primary.main'],
 +            [text('已接受响应','Accepted responses'),quantity(server.success_count),'text.primary'],
@@ -227,7 +287,7 @@
 +            <span>{text('竞速取消','Race cancelled')} {stats?quantity(stats.race_cancelled):'—'}</span>
 +          </Box>}
 +        <Tabs value={tab} onChange={(_,v:number)=>{setTab(v);}} variant="scrollable" scrollButtons="auto" aria-label={text('诊断分类','Diagnostic categories')} sx={{mb:2,borderBottom:'1px solid',borderColor:'divider',minHeight:40}}>
-+          <Tab label={text('结果概览','Outcomes')}/><Tab label={text('后端与延迟','Backends & latency')}/><Tab label={text('事件记录','Events')}/><Tab label={text('运行状态','Runtime')}/>
++          <Tab label={text('结果概览','Outcomes')}/><Tab label={text('连接与延迟','Connections & latency')}/><Tab label={text('事件记录','Events')}/><Tab label={text('运行状态','Runtime')}/><Tab label={text('故障证据','Failure evidence')}/>
 +        </Tabs>
 +        <Box role="tabpanel" sx={{minHeight:180,overflowWrap:'anywhere'}}>
 +          {tab===0&&<Box sx={{display:'grid',gap:1.5}}>
@@ -289,16 +349,56 @@
 +            <Box component="details" sx={{p:1,color:'text.secondary'}}><summary>{text('高级：结算前最后事件','Advanced: last event before settlement')}</summary>{counts(d.failure_last_event)}</Box>
 +            <Box sx={{color:'text.secondary',fontSize:'.9em'}}>{text('最近明细最多保留 32 条；已移出窗口','Up to 32 recent details; evicted')} {quantity(policy?.dropped_events)}。{text('累计计数不受影响。','Cumulative counters are retained.')}</Box>
 +          </Box>}
++          {tab===4&&<Box sx={{display:'grid',gap:1.5}}>
++            <Box sx={{color:'text.secondary',fontSize:'.9em'}}>{text('累计计数自进程启动；响应码各保留一条最新证据，超时和 IO 各保留最近8条，不受通用32条窗口覆盖影响。记录表示观测事件，不等同最终失败请求数。','Counters cover process lifetime. Each RCODE retains its latest evidence; timeouts and IO retain8 each, independently of the general32-event window. Events are not terminal failed-query counts.')}</Box>
++            {!failures&&<Panel title={text('故障证据暂不可用','Failure evidence unavailable')}><Box>{text('当前核心未提供独立故障快照。','The core does not provide an independent failure snapshot.')}</Box></Panel>}
++            {failures&&<><Panel title={text('DNS 错误响应码','DNS error RCODEs')}>
++              {failures.rcodes.map(item=><Box component="details" key={item.code} sx={{py:1,borderBottom:'1px solid',borderColor:'divider'}}>
++                <summary><strong>{item.name}</strong> · {quantity(item.count)}</summary>
++                {item.last_event?detail(item.last_event):text('尚无明细','No retained detail')}
++              </Box>)}
++              {failures.rcodes.length===0&&<Box sx={{color:'text.secondary'}}>{text('暂无错误响应码记录','No error RCODEs recorded')}</Box>}
++            </Panel><Panel title={text('发送尝试超时：阶段分布','Attempt timeouts by stage')}>{counts(failures.timeout_stages)}
++              <Box component="details" sx={{mt:1}}><summary>{text('最近超时明细','Recent timeout details')}</summary>{failures.timeouts.map(event=><Box key={event.sequence}>{detail(event)}</Box>)}</Box>
++            </Panel><Panel title={text('IO / TLS / 协议：最近错误','IO / TLS / protocol: recent errors')}>
++              {failures.io_errors.map(event=><Box key={event.sequence}>{detail(event)}</Box>)}
++              {failures.io_errors.length===0&&<Box sx={{color:'text.secondary'}}>{text('暂无错误记录','No errors recorded')}</Box>}
++            </Panel></>}
++          </Box>}
 +          {tab===3&&<Box sx={columns}>
 +            <Panel title={text('调度与期限','Scheduling and deadlines')}>
-+              <Box>QPS: {d.qps||text('不限','Unlimited')}</Box>
-+              <Box>{server.pool_enabled?text('节点固定冷却 / 故障等待','Fixed node cooldown / failure wait'):text('HTTP 固定冷却','Fixed HTTP cooldown')}: {d.cooldown_ms} ms</Box>
++              <Box>{runtime?.qps_mode==='adaptive_per_exit'?text('每出口 QPS 上限（动态学习）','Per-exit QPS cap (adaptive)'):text('服务 QPS 上限','Service QPS cap')}: {runtime?runtime.qps_mode==='off'?text('未启用','Off'):runtime.configured_cap:d.qps||text('不限','Unlimited')}</Box>
++              <Box>{text('HTTP 固定冷却','Fixed HTTP cooldown')}: {d.cooldown_ms} ms</Box>
 +              <Box>{server.pool_enabled?text('全部节点 HTTP 冷却时的最早解冻','Earliest thaw when all nodes are HTTP cooling'):text('节点冷却剩余','Node cooldown remaining')}: {server.cooldown_remaining_ms??'—'} ms</Box>
 +              {server.pool_enabled&&<Box>{text('两族建连间隔','Family connection delay')}: {policy?.connect_delay_ms??'—'} ms</Box>}
 +              <Box>{server.pool_enabled?text('响应 / 建连 / 总期限','Response / connect / total'):text('默认响应 / 总期限','Default response / total')}: {policy?.response_timeout_ms??'—'} / {server.pool_enabled?String(policy?.connect_timeout_ms??'—')+' / ':''}{policy?.query_timeout_ms??'—'} ms</Box>
-+              <Box sx={{mt:1,color:'text.secondary'}}>{text('冷却按后端节点隔离；QPS仍按服务或既有共享配额组累计。','Cooldown is isolated per backend node; QPS remains shared by service or configured quota group.')}</Box>
++              <Box sx={{mt:1,color:'text.secondary'}}>{runtime?.qps_mode==='adaptive_per_exit'?text('每条出口独立平滑发送和学习额度；两族地址、重连及更换目标 IP 共享该出口的额度。','Each exit is paced and learned independently; both families, reconnects and destination changes share its quota.'):text('旧固定 QPS 按服务或既有共享额度组累计。','Legacy fixed QPS is shared by service or configured quota group.')}</Box>
++              {runtime&&<Box sx={{mt:1}}>{text('服务内等待：前台 / 过期刷新 / 预取','Service waiters: foreground / refresh / prefetch')}: {runtime.foreground_waiting} / {runtime.refresh_waiting} / {runtime.prefetch_waiting}</Box>}
 +              <Box sx={{mt:1.5,color:'text.secondary'}}>{text('传输地址族','Transport family')}: {family}</Box>
 +            </Panel>
++            {runtime&&<Panel title={text('出口详情（高级）','Exit details (advanced)')}>
++              <Box component="details"><summary>{text('查看连接与动态额度','View connections and learned rates')} · {runtime.wans.length}</summary>
++                {runtime.wans.map((wan,index)=><Box key={index} sx={{mt:1,py:1,borderTop:'1px solid',borderColor:'divider',overflowWrap:'anywhere'}}>
++                  <strong>{wan.interface||text('系统路由 / 代理出口','System / proxy egress')}</strong> · {wan.connected?text('传输就绪','Transport ready'):text('未就绪','Not ready')}
++                  <Box>{wan.ip||'—'}{wan.connected_family?` · IPv${String(wan.connected_family)}`:''}</Box>
++                  <Box sx={{color:'text.secondary'}}>{text('源地址','Source')}: {wan.source||'—'} · {text('代次','Generation')} {wan.generation}</Box>
++                  {runtime.qps_mode==='adaptive_per_exit'&&<><Box>{text('当前发送速率 / 已验证下界','Current pace / observed lower bound')}: {wan.current_rate??'—'} / {wan.known_good_rate??'—'} QPS</Box>
++                    <Box>{text('当前回探上界','Current probe ceiling')}: {wan.probe_ceiling??'—'} QPS</Box></>}
++                  <Box>{text('HTTP 冷却 / 连接重试等待','HTTP cooldown / connection retry')}: {wan.cooldown_remaining_ms} / {wan.retry_remaining_ms} ms</Box>
++                  <Box>{text('额度组 HTTP 429','Quota-group HTTP 429')}: {quantity(wan.quota_group_http_429)}</Box>
++                  {wan.last_backpressure_ms&&<Box sx={{color:'text.secondary'}}>{text('最近限流 / 忙碌','Last backpressure')}: {eventTime(wan.last_backpressure_ms,lang===0?'zh-CN':'en-GB')}</Box>}
++                </Box>)}
++              </Box><Box sx={{mt:1,color:'text.secondary'}}>{text('观测下界不是服务商精确限额；低请求量不足以推断上限。多个接口也可能共用公网出口。','An observed lower bound is not the provider’s exact limit; sparse traffic cannot identify capacity. Interfaces may share a public exit.')}</Box>
++            </Panel>}
++            {room&&<Panel title={text('后台刷新等待室（全局）','Refresh room (global)')}>
++              <Box>{text('排队 / 执行中','Queued / active')}: {room.queued} / {room.active}</Box>
++              <Box>{text('最久等待','Oldest wait')}: {room.oldest_wait_ms} ms</Box>
++              <Box>{text('已准入 / 已结束','Admitted / ended')}: {quantity(room.admitted)} / {quantity(room.completed)}</Box>
++              <Box>{text('重复合并 / 缓存已更新而跳过','Merged / skipped fresh')}: {quantity(room.merged)} / {quantity(room.skipped_fresh)}</Box>
++              <Box>{text('未入队 / 到期或关闭丢弃 / 准入错误','Rejected / expired or stopped / dispatch errors')}: {quantity(room.rejected)} / {quantity(room.dropped)} / {quantity(room.dispatch_errors)}</Box>
++              <Box>{text('轻量任务内存','Metadata memory')}: {(room.metadata_bytes/1024).toFixed(2)} KiB</Box>
++              <Box sx={{mt:1,color:'text.secondary'}}>{text('这是一份全进程快照；已准入、已结束不代表网络发送或成功。','This is a process-wide snapshot; admitted and ended are not network sends or successes.')}</Box>
++            </Panel>}
 +            <Panel title={text('连接保活','Protocol keepalive')}>
 +              <Box>{text('配置间隔','Configured interval')}: {policy?.keepalive_ms?String(policy.keepalive_ms)+' ms':text('关闭','Off')}</Box>
 +              <Box sx={{mt:1}}>{text('保活发送 / HTTP/2 ACK','Keepalive sent / HTTP2 ACK')}: {quantity(policy?.kind_counts[5])} / {quantity(policy?.kind_counts[6])}</Box>
@@ -317,8 +417,22 @@
 +}
 --- /dev/null
 +++ b/src/components/dashboard/upstream-servers/diagnostics-model.ts
-@@ -0,0 +1,31 @@
-+import type { UpstreamPolicyData } from '@/lib/backend/server';
+@@ -0,0 +1,45 @@
++import type { UpstreamPolicyData, UpStreamServers } from '@/lib/backend/server';
++
++export function upstreamAddressText(server: Pick<UpStreamServers, 'pool_enabled' | 'diagnostics' | 'endpoint_ips' | 'ip'>): string {
++  if (!server.pool_enabled) return server.ip;
++  const runtime = server.diagnostics?.runtime;
++  const ips = runtime ? (Array.isArray(runtime.wans) ? runtime.wans.filter(wan => wan.connected && wan.ip).map(wan => wan.ip) : []) : (server.endpoint_ips ?? []);
++  return [...new Set(ips.filter(Boolean))].join(', ') || '—';
++}
++
++export function queryAccounting(server: Pick<UpStreamServers, 'query_count' | 'success_count' | 'failure_count' | 'skip_count' | 'in_flight'>): { total: number; accepted: number; failed: number; unsent: number; pending: number; closed: boolean } | null {
++  const values = [server.query_count, server.success_count, server.failure_count, server.skip_count, server.in_flight];
++  if (!values.every(value => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0)) return null;
++  const [total, accepted, failed, unsent, pending] = values as number[];
++  return { total, accepted, failed, unsent, pending, closed: total === accepted + failed + unsent + pending };
++}
 +
 +export type DiagnosticEvent = UpstreamPolicyData['events'][number];
 +export interface EventGroup { key: string; newest: DiagnosticEvent; events: DiagnosticEvent[]; ips: string[] }

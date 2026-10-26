@@ -35,6 +35,14 @@ struct dns_server_query_option {
 	struct dns_query_ecs_ip ecs_ip;
 };
 
+struct dns_refresh_queue_snapshot_v1 {
+    unsigned struct_size, version, queued, active, peak;
+    uint64_t enqueued, merged, dispatched, rejected, dropped, completed, skipped_fresh, dispatch_errors;
+    uint64_t oldest_wait_ms, metadata_bytes;
+};
+int dns_server_get_refresh_queue_v1(struct dns_refresh_queue_snapshot_v1 *out);
+void dns_server_refresh_notify(void);
+
 int dns_is_ipv6_ready(void);
 
 void dns_server_check_ipv6_ready(void);

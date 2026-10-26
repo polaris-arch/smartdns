@@ -69,6 +69,8 @@ pub struct MetricsData {
     pub cache_memory_size: u64,
     pub qps: u32,
     pub memory_usage: u64,
+    pub sqlite_memory_current: Option<u64>,
+    pub sqlite_memory_highwater: Option<u64>,
     pub is_metrics_suspended: bool,
 }
 
@@ -477,6 +479,7 @@ impl DataServer {
     }
 
     pub fn get_metrics(&self) -> Result<MetricsData, Box<dyn Error + Send>> {
+        let (sqlite_memory_current, sqlite_memory_highwater) = self.stat.get_sqlite_memory();
         let metrics = MetricsData {
             total_query_count: self.stat.get_total_request(),
             block_query_count: self.stat.get_total_blocked_request(),
@@ -488,6 +491,8 @@ impl DataServer {
             cache_memory_size: smartdns::Stats::get_cache_memory_size(),
             qps: self.stat.get_qps(),
             memory_usage: self.stat.get_memory_usage(),
+            sqlite_memory_current,
+            sqlite_memory_highwater,
             is_metrics_suspended: self.is_handle_request_disabled(),
         };
 

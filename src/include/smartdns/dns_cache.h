@@ -103,6 +103,7 @@ struct dns_cache {
 	struct dns_cache_info info;
 	struct dns_cache_data *cache_data;
 	unsigned int origin_flags;
+    uint64_t generation; /* runtime only; cache file format is unchanged */
 
 	struct tw_timer_list timer;
 };
@@ -121,6 +122,7 @@ struct dns_cache_key {
 };
 
 uint32_t dns_cache_get_query_flag(struct dns_cache *dns_cache);
+uint64_t dns_cache_get_generation(const struct dns_cache *dns_cache);
 
 const char *dns_cache_get_dns_group_name(struct dns_cache *dns_cache);
 

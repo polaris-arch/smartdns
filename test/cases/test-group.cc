@@ -619,6 +619,41 @@ server 127.0.0.1:62053
 	EXPECT_EQ(client.GetAuthority()[0].GetType(), "SOA");
 }
 
+TEST_F(Group, InheritedFlagOverrideDoesNotChangeParentOrSiblingDomains)
+{
+	smartdns::Server server;
+	smartdns::MockServer upstream;
+	ASSERT_TRUE(upstream.Start("udp://0.0.0.0:61053", [](struct smartdns::ServerRequestContext *request) {
+		if (request->qtype != DNS_T_A) return smartdns::SERVER_REQUEST_SOA;
+		smartdns::MockServer::AddIP(request, request->domain.c_str(), "1.2.3.4", 611);
+		return smartdns::SERVER_REQUEST_OK;
+	}));
+	ASSERT_TRUE(server.Start(R"(bind [::]:60053
+bind [::]:60054 -g child
+server 127.0.0.1:61053
+cache-size 0
+speed-check-mode none
+dualstack-ip-selection no
+address /exception.test/#
+address /sibling.test/#
+group-begin child -inherit default
+address /exception.test/-
+group-end
+)"));
+	smartdns::Client client;
+	ASSERT_TRUE(client.Query("exception.test", 60054));
+	ASSERT_EQ(client.GetAnswerNum(), 1);
+	EXPECT_EQ(client.GetAnswer()[0].GetData(), "1.2.3.4");
+	for (auto port : {60053, 60054}) {
+		ASSERT_TRUE(client.Query("sibling.test", port));
+		EXPECT_EQ(client.GetAnswerNum(), 0);
+		EXPECT_EQ(client.GetAuthorityNum(), 1);
+	}
+	ASSERT_TRUE(client.Query("exception.test", 60053));
+	EXPECT_EQ(client.GetAnswerNum(), 0);
+	EXPECT_EQ(client.GetAuthorityNum(), 1);
+}
+
 TEST_F(Group, group_inherit)
 {
 	smartdns::Server server;

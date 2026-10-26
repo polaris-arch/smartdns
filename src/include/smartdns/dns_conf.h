@@ -156,6 +156,7 @@ typedef enum {
 #define DOMAIN_FLAG_ADDR_HTTPS_SOA (1 << 21)
 #define DOMAIN_FLAG_ADDR_HTTPS_IGN (1 << 22)
 #define DOMAIN_FLAG_NO_IGNORE_IP (1 << 23)
+#define DOMAIN_FLAG_PTR_SOA (1U << 24)
 
 #define IP_RULE_FLAG_BLACKLIST (1 << 0)
 #define IP_RULE_FLAG_WHITELIST (1 << 1)
@@ -278,6 +279,7 @@ extern struct dns_nftset_names dns_conf_nftset;
 
 struct dns_domain_rule {
 	unsigned char capacity;   /* Current allocated capacity (max 255) */
+	atomic_t refcnt;          /* ART leaves and the bounded immutable-rule pool */
 	struct dns_rule *rules[]; /* Flexible array member */
 };
 
@@ -425,12 +427,20 @@ struct dns_servers {
 	unsigned int drop_packet_latency_ms;
 	int tcp_keepalive;
 	unsigned int max_query_rate;
+    unsigned int adaptive_query_rate;
 	unsigned int query_burst;
 	unsigned int upstream_cooldown_ms;
+    unsigned int upstream_retry_cooldown_ms;
+    unsigned int upstream_path_options;
+    unsigned int upstream_service;
+    unsigned int query_rate_disabled;
 	unsigned int max_concurrent_queries;
 	unsigned int upstream_round_robin;
 	unsigned int max_upstream_connections;
 	unsigned int upstream_ip_pool;
+    unsigned int upstream_wan_mode; /* 0 inherit, 1 off, 2 explicit selection */
+    unsigned int upstream_wan_count;
+    char upstream_wan_interfaces[DNS_UPSTREAM_WANS_MAX][DNS_SERVER_IFNAME_LEN];
 	unsigned int pool_compat_skip;
 	unsigned int max_upstream_backends;
 	unsigned int upstream_family;
@@ -752,6 +762,9 @@ struct dns_config {
 	ssize_t cache_max_memsize;
 	struct dns_servers servers[DNS_MAX_SERVERS];
 	int server_num;
+    int upstream_multi_wan;
+    unsigned int upstream_wan_count;
+    char upstream_wan_interfaces[DNS_UPSTREAM_WANS_MAX][DNS_SERVER_IFNAME_LEN];
 
 	/* proxy servers */
 	struct dns_proxy_servers proxy_servers[PROXY_MAX_SERVERS];

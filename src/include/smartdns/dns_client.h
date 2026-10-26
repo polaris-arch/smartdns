@@ -26,6 +26,7 @@ extern "C" {
 #endif
 
 #define DNS_SERVER_IFNAME_LEN 16
+#define DNS_UPSTREAM_WANS_MAX 16
 #define DNS_SERVER_SPKI_LEN 64
 #define DNS_SERVER_GROUP_DEFAULT "default"
 #define DNS_SERVER_GROUP_MDNS "mdns"
@@ -80,6 +81,9 @@ typedef enum dns_server_security_status {
 #define DNS_QUEY_OPTION_BOOTSTRAP_ONLY (1 << 6)
 /* Internal per-discovery/family fair start; only honored with BOOTSTRAP_ONLY. */
 #define DNS_QUEY_OPTION_BOOTSTRAP_START (1 << 7)
+#define DNS_QUEY_OPTION_BACKGROUND (1 << 8)
+#define DNS_QUEY_OPTION_CACHE_HIT_REFRESH (1 << 10)
+#define DNS_QUEY_OPTION_EXPIRED_REFRESH (1 << 9)
 
 struct dns_query_budget;
 struct dns_query_budget *dns_query_budget_new(unsigned int max_attempts, unsigned int timeout_ms);
@@ -91,6 +95,9 @@ void dns_query_budget_cancel(struct dns_query_budget *budget);
 int dns_query_budget_exhausted(struct dns_query_budget *budget);
 int dns_query_budget_timed_out(struct dns_query_budget *budget);
 unsigned int dns_query_budget_remaining_ms(struct dns_query_budget *budget);
+void dns_query_budget_shorten(struct dns_query_budget *budget, unsigned int remaining_ms);
+int dns_client_background_ready(const char *group_name, unsigned priority);
+unsigned dns_client_background_wait(const char *group_name, unsigned priority);
 int dns_client_group_has_ecs(const char *group_name);
 
 int dns_client_init(void);
@@ -145,6 +152,7 @@ struct dns_query_options {
 	/* Read only when DNS_QUEY_OPTION_BUDGET is set. */
 	struct dns_query_budget *budget;
     unsigned int bootstrap_start; /* read only with BOOTSTRAP_START */
+    unsigned int background_origin_flags, background_queue_wait_ms; /* read only with BACKGROUND */
 };
 
 /* query domain */
@@ -195,8 +203,12 @@ struct client_dns_server_flags {
 	long long set_mark;
 	int tcp_keepalive;
 	unsigned int max_query_rate;
+    unsigned int adaptive_query_rate;
 	unsigned int query_burst;
-	unsigned int upstream_cooldown_ms; /* 0 means default 1000ms; explicit configuration is 1..10000ms. */
+	unsigned int upstream_cooldown_ms; /* HTTP 429/503: default 200ms; explicit 1..10000ms. */
+    unsigned int upstream_retry_cooldown_ms; /* transport failure: default 1000ms; explicit 1..10000ms. */
+    unsigned int upstream_wan_count;
+    char upstream_wan_interfaces[DNS_UPSTREAM_WANS_MAX][DNS_SERVER_IFNAME_LEN];
 	unsigned int max_concurrent_queries;
 	unsigned int upstream_round_robin;
     /* Load-local discriminator for separately declared pool services. Not identity material. */

@@ -28,6 +28,17 @@ extern "C" {
 
 int _dns_server_prefetch_request(char *domain, dns_type_t qtype, struct dns_server_query_option *server_query_option,
 								 int prefetch_flag);
+int _dns_server_prefetch_cached(char *domain, dns_type_t qtype, struct dns_server_query_option *options,
+    int prefetch_flags, uint64_t cache_generation);
+void _dns_server_prefetch_run(unsigned long now);
+unsigned long _dns_server_prefetch_deadline(void);
+void _dns_server_prefetch_done(void *ticket);
+void _dns_server_prefetch_stop(void);
+void _dns_server_prefetch_start(void);
+#ifdef TEST
+extern int _dns_prefetch_test_paused;
+void _dns_server_prefetch_test_run(unsigned long now);
+#endif
 
 dns_cache_tmout_action_t _dns_server_prefetch_domain(struct dns_conf_group *conf_group, struct dns_cache *dns_cache);
 

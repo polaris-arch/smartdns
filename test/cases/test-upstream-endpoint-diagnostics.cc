@@ -12,6 +12,7 @@ extern "C" {
 #include <string>
 #include <chrono>
 #include <poll.h>
+#include <set>
 
 namespace {
 struct ObservedEndpoint {
@@ -138,6 +139,98 @@ TEST(UpstreamEndpointDiagnostics, DeadlineAndIoFailureAreRealEvidenceWithoutGene
     EXPECT_EQ(node.ep.diagnostic->detail.events[0].system_error, EHOSTUNREACH);
     EXPECT_EQ(node.ep.fd, -1);
 }
+TEST(UpstreamEndpointDiagnostics, RcodeCountsAndLastPerCodeSurviveUnrelatedEventFlood) {
+    ObservedEndpoint node; node.Observe();
+    node.q.origin_flags = 6; node.q.priority = 1; node.q.background_queue_wait_ms = 750;
+    strcpy(node.ep.flags.ifname, "ppp1"); node.ep.service_wan_generation = 7;
+    EXPECT_EQ(node.ep.diagnostic->failures, nullptr);
+    dns_packet packet{}; packet.head.rcode = DNS_RC_SERVFAIL;
+    _dns_service_detail_dns(&node.q, &node.ep, DNS_DETAIL_DNS_RCODE, DNS_PHASE_RESPONSE, DNS_RC_SERVFAIL, &packet);
+    auto *f = node.ep.diagnostic->failures; ASSERT_NE(f, nullptr);
+    auto sequence = f->last_rcode[DNS_RC_SERVFAIL].event.sequence;
+    for (unsigned i = 0; i < 80; i++)
+        _dns_service_detail(&node.q, &node.ep, DNS_DETAIL_HTTP_429, DNS_PHASE_HTTP2, 429, 0, 200);
+    EXPECT_EQ(f->rcode_counts[DNS_RC_SERVFAIL], 1U);
+    EXPECT_EQ(f->last_rcode[DNS_RC_SERVFAIL].event.sequence, sequence);
+    EXPECT_GT(f->last_rcode[DNS_RC_SERVFAIL].context.unix_ms, 0U);
+    EXPECT_EQ(std::string(f->last_rcode[DNS_RC_SERVFAIL].context.domain), "dualstack.example");
+    EXPECT_EQ(f->last_rcode[DNS_RC_SERVFAIL].context.dns_summary_valid, 1U);
+    EXPECT_EQ(f->last_rcode[DNS_RC_SERVFAIL].context.rcode, DNS_RC_SERVFAIL);
+    EXPECT_EQ(f->last_rcode[DNS_RC_SERVFAIL].origin_flags, 6U);
+    EXPECT_EQ(f->last_rcode[DNS_RC_SERVFAIL].queue_wait_ms, 750U);
+    EXPECT_STREQ(f->last_rcode[DNS_RC_SERVFAIL].interface, "ppp1");
+    EXPECT_EQ(f->last_rcode[DNS_RC_SERVFAIL].wan_generation, 7U);
+    ASSERT_NE(node.ep.diagnostic->event_sources, nullptr);
+    EXPECT_EQ(node.ep.diagnostic->event_sources[0].sequence, node.ep.diagnostic->detail.events[0].sequence);
+    EXPECT_EQ(node.ep.diagnostic->event_sources[0].origin_flags, 6U);
+    EXPECT_STREQ(node.ep.diagnostic->event_sources[0].interface, "ppp1");
+    EXPECT_GT(node.ep.diagnostic->detail.dropped_events, 0U);
+    _dns_service_detail_dns(&node.q, &node.ep, DNS_DETAIL_DNS_RCODE, DNS_PHASE_RESPONSE, DNS_RC_REFUSED, &packet);
+    EXPECT_EQ(f->rcode_counts[DNS_RC_SERVFAIL], 1U); EXPECT_EQ(f->rcode_counts[DNS_RC_REFUSED], 1U);
+}
+TEST(UpstreamEndpointDiagnostics, InterfaceInventoryIsBoundedCopiedAndDoesNotSelectOrCreateUpstreams) {
+    dns_network_interface_v1 items[DNS_NETWORK_INTERFACES_MAX]{};
+    int count = dns_client_get_network_interfaces_v1(items, DNS_NETWORK_INTERFACES_MAX);
+    ASSERT_GE(count, 0); ASSERT_LE(count, DNS_NETWORK_INTERFACES_MAX);
+    std::set<unsigned> indices; std::string previous;
+    for (int i = 0; i < count; i++) {
+        EXPECT_EQ(items[i].version, 1U); EXPECT_EQ(items[i].struct_size, sizeof(items[i]));
+        EXPECT_GT(items[i].index, 0U); EXPECT_TRUE(indices.insert(items[i].index).second);
+        EXPECT_LT(previous, std::string(items[i].name)); previous = items[i].name;
+        EXPECT_LE(items[i].up, 1U); EXPECT_LE(items[i].running, 1U);
+    }
+    EXPECT_GE(dns_client_get_network_interfaces_v1(nullptr, 0), 0);
+    EXPECT_EQ(dns_client_get_network_interfaces_v1(nullptr, 1), -1);
+    dns_network_interface_v1 bounded[2]; memset(bounded, 0xa5, sizeof(bounded));
+    dns_network_interface_v1 guard = bounded[1];
+    EXPECT_GE(dns_client_get_network_interfaces_v1(bounded, 1), 0);
+    EXPECT_EQ(memcmp(&bounded[1], &guard, sizeof(guard)), 0);
+}
+TEST(UpstreamEndpointDiagnostics, HttpTimeoutStagesFollowPositiveWriteCompleteAndHeaders) {
+    ObservedEndpoint node; node.ep.type = DNS_SERVER_HTTPS; strcpy(node.ep.alpn_selected, "h2");
+    node.Observe(); ASSERT_EQ(_dns_attempt_begin(&node.q, &node.ep), DNS_ADMIT_OK);
+    auto gen = _dns_attempt_generation(&node.q, &node.ep);
+    auto detail = [&] { _dns_service_detail(&node.q, &node.ep, DNS_DETAIL_RESPONSE_TIMEOUT, DNS_PHASE_RESPONSE, 0, 1000, 1000); };
+    detail(); auto *f = node.ep.diagnostic->failures; ASSERT_NE(f, nullptr);
+    EXPECT_EQ(f->timeouts[0].timeout_stage, DNS_TIMEOUT_NOT_SENT);
+    _dns_attempt_mark_sent(&node.q, &node.ep, gen); detail();
+    EXPECT_EQ(f->timeouts[0].timeout_stage, DNS_TIMEOUT_SENDING);
+    _dns_attempt_progress_update(&node.q, &node.ep, gen, 1, 0); detail();
+    EXPECT_EQ(f->timeouts[0].timeout_stage, DNS_TIMEOUT_WAIT_HEADERS);
+    _dns_attempt_progress_update(&node.q, &node.ep, gen, 0, 200); detail();
+    EXPECT_EQ(f->timeouts[0].timeout_stage, DNS_TIMEOUT_READ_BODY);
+    EXPECT_EQ(f->timeouts[0].progress.http_status, 200U);
+    EXPECT_EQ(f->timeouts[0].progress.generation, gen);
+    for (unsigned stage = DNS_TIMEOUT_NOT_SENT; stage <= DNS_TIMEOUT_READ_BODY; stage++)
+        EXPECT_EQ(f->timeout_stages[stage], 1U);
+    _dns_attempt_progress_update(&node.q, &node.ep, gen + 1, 0, 500);
+    detail(); EXPECT_EQ(f->timeouts[0].progress.http_status, 200U); // stale stream generation cannot overwrite context
+}
+TEST(UpstreamEndpointDiagnostics, CompletedQueryCannotAcquireNewTimeoutEvidenceFromPeriodicSweep) {
+    ObservedEndpoint node; node.Observe(); node.Send();
+    node.q.terminal = 1; node.q.has_result = 1;
+    _dns_attempt_expire(&node.q, get_tick_count() + 10000);
+    EXPECT_EQ(node.ep.diagnostic->detail.kind_counts[DNS_DETAIL_RESPONSE_TIMEOUT], 0U);
+    EXPECT_EQ(node.ep.diagnostic->failures, nullptr);
+    EXPECT_EQ(node.ep.diagnostic->breakdown.events[DNS_EVENT_ATTEMPT_TIMEOUT], 0U);
+}
+TEST(UpstreamEndpointDiagnostics, IoRetentionIsBoundedAndIndependentOfTimeoutsAndHttpFlood) {
+    ObservedEndpoint node; node.Observe();
+    node.ep.service_error_connection_generation = 17; node.ep.service_error_active_attempts = 3;
+    node.ep.service_tls_operation = DNS_TLS_OP_READ; node.ep.service_tls_error_count = 2;
+    node.ep.service_tls_errors[0] = 0x1234; node.ep.service_tls_errors[1] = 0x5678;
+    for (unsigned i = 0; i < 12; i++)
+        _dns_service_detail(&node.q, &node.ep, DNS_DETAIL_TRANSPORT_ERROR, DNS_PHASE_TLS, EIO, 0, 0);
+    auto *f = node.ep.diagnostic->failures; ASSERT_NE(f, nullptr);
+    EXPECT_EQ(f->io_count, DNS_UPSTREAM_FAILURE_RECENT); EXPECT_EQ(f->timeout_count, 0U);
+    EXPECT_EQ(f->io_errors[0].connection_generation, 17U); EXPECT_EQ(f->io_errors[0].active_attempts, 3U);
+    EXPECT_EQ(f->io_errors[0].tls_operation, DNS_TLS_OP_READ);
+    EXPECT_EQ(f->io_errors[0].tls_errors[1], 0x5678U);
+    auto sequence = f->io_errors[0].event.sequence;
+    for (unsigned i = 0; i < 50; i++)
+        _dns_service_detail(&node.q, &node.ep, DNS_DETAIL_HTTP_429, DNS_PHASE_HTTP2, 429, 0, 200);
+    EXPECT_EQ(f->io_errors[0].event.sequence, sequence); EXPECT_EQ(f->io_count, DNS_UPSTREAM_FAILURE_RECENT);
+}
 TEST(UpstreamEndpointDiagnostics, IdentityIgnoresUnusedUnionBytesAndLoadDiscriminatorButIncludesEgress) {
     ObservedEndpoint node; std::string original = node.ep.diagnostic->base.service_id;
     _dns_endpoint_observer_destroy(&node.ep);
@@ -166,6 +259,9 @@ TEST(UpstreamEndpointDiagnostics, ExistingCopiedApisResolveOrdinaryEndpointAndKe
     dns_upstream_policy_snapshot_v1 policy{}; dns_upstream_event_context_snapshot_v1 context{};
     EXPECT_EQ(dns_client_get_service_policy_v1(id.c_str(), &policy), 0);
     EXPECT_EQ(dns_client_get_service_event_context_v1(id.c_str(), &context), 0);
+    dns_upstream_failure_snapshot_v1 failures{};
+    EXPECT_EQ(dns_client_get_service_failures_v1(id.c_str(), &failures), 0);
+    EXPECT_EQ(failures.version, 1U); EXPECT_EQ(failures.timeout_count, 0U);
     EXPECT_EQ(policy.path_count, 1U); EXPECT_EQ(std::string(policy.paths[0].ip), "192.0.2.7");
     EXPECT_EQ(dns_client_get_service_endpoint_activity_v1(nullptr, &activity, 1), -1);
     EXPECT_EQ(dns_client_get_service_endpoint_activity_v1(id.c_str(), nullptr, 1), -1);

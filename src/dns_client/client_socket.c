@@ -1,4 +1,5 @@
 #include "upstream_policy.h"
+#include "smartdns/upstream_service.h"
 #include "client_http3_control.h"
 /*************************************************************************
  *
@@ -49,12 +50,20 @@ int _dns_client_create_socket(struct dns_server_info *server_info)
         return -1;
     }
 
+    server_info->diagnostic_connection_generation++;
     server_info->service_connect_tick = get_tick_count();
     server_info->service_keepalive_tick = server_info->service_connect_tick;
     server_info->service_ping_tick = 0; server_info->service_draining = 0;
     server_info->service_protocol_ready = 0; server_info->service_rotation = 0;
     server_info->service_tls_error = 0; server_info->service_system_error = server_info->service_error_code = 0;
+    server_info->service_error_phase = DNS_PHASE_SOCKET;
+    server_info->service_error_connection_generation = server_info->diagnostic_connection_generation;
+    server_info->service_error_active_attempts = 0;
     server_info->service_normal_close = 0;
+    server_info->service_tls_operation = server_info->service_tls_error_count = server_info->service_tls_error_overflow = 0;
+    memset(server_info->service_tls_errors, 0, sizeof(server_info->service_tls_errors));
+    server_info->service_quic_close_valid = server_info->service_quic_close_local = server_info->service_quic_close_transport = 0;
+    server_info->service_quic_close_code = server_info->service_quic_close_frame = 0;
 	time(&server_info->last_send);
 	time(&server_info->last_recv);
 

@@ -138,6 +138,8 @@ struct dns_server_info {
 	unsigned long send_tick;
 	int prohibit;
 	struct dns_upstream_policy *policy;
+    unsigned service_wan;
+    uint64_t service_wan_generation;
 	unsigned int active_attempts;
 	uint64_t rr_member_id;
 	int policy_connection_held;
@@ -185,6 +187,12 @@ struct dns_server_info {
     unsigned service_draining, service_normal_close, service_protocol_ready, service_keepalive_interval_ms, service_rotation;
     int service_error_phase, service_error_code, service_system_error;
     uint64_t service_tls_error;
+    uint64_t diagnostic_connection_generation, service_error_connection_generation;
+    unsigned service_error_active_attempts;
+    unsigned service_tls_operation, service_tls_error_count, service_tls_error_overflow;
+    uint64_t service_tls_errors[4];
+    unsigned service_quic_close_valid, service_quic_close_local, service_quic_close_transport;
+    uint64_t service_quic_close_code, service_quic_close_frame;
 	int process_depth;
 	int close_deferred;
 };
@@ -338,6 +346,8 @@ struct dns_query_struct {
 	int checking_disabled;
     int bootstrap_only;
     unsigned bootstrap_cursor;
+    unsigned priority; /* 0 foreground, 1 cache-hit refresh, 2 proactive prefetch */
+    unsigned origin_flags, background_queue_wait_ms;
 
 	/* retry count */
 	atomic_t retry_count;

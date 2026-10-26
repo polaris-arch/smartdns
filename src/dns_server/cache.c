@@ -460,7 +460,7 @@ out_update_cache:
 	}
 	if (dns_cache_get_ttl(dns_cache) == 0) {
 		struct dns_server_query_option dns_query_options;
-		int prefetch_flags = 0;
+		int prefetch_flags = PREFETCH_FLAGS_CACHE_HIT;
 		dns_query_options.server_flags = request->server_flags;
 		dns_query_options.dns_group_name = request->dns_group_name;
 		if (request->conn == NULL) {
@@ -479,7 +479,7 @@ out_update_cache:
 			prefetch_flags |= PREFETCH_FLAGS_NOPREFETCH;
 		}
 
-		_dns_server_prefetch_request(request->domain, request->qtype, &dns_query_options, prefetch_flags);
+		_dns_server_prefetch_cached(request->domain, request->qtype, &dns_query_options, prefetch_flags, dns_cache_get_generation(dns_cache));
 	} else {
 		dns_cache_update(dns_cache);
 	}

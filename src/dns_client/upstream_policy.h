@@ -5,6 +5,12 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+struct dns_upstream_attempt_progress_v1;
+struct dns_upstream_wan_runtime_v1;
+void _dns_attempt_get_progress(struct dns_query_struct *q, struct dns_server_info *ep,
+    struct dns_upstream_attempt_progress_v1 *out);
+void _dns_attempt_progress_update(struct dns_query_struct *q, struct dns_server_info *ep,
+    unsigned generation, int request_complete, int http_status);
 struct dns_upstream_endpoint_activity_v1;
 /* Admission is not a transport error. */
 #define DNS_ADMIT_OK 0
@@ -41,6 +47,9 @@ void _dns_attempt_mark_buffered(struct dns_query_struct *query, struct dns_serve
 void _dns_attempt_expire(struct dns_query_struct *query, unsigned long now);
 void _dns_attempt_free_all(struct dns_query_struct *query);
 int _dns_query_budget_take(struct dns_query_budget *budget);
+unsigned long _dns_policy_background_wait(struct dns_server_info *server, unsigned long now);
+void _dns_policy_wan_runtime(struct dns_upstream_policy *policy, unsigned long now, struct dns_upstream_wan_runtime_v1 *out);
+void _dns_policy_wan_network_changed(struct dns_upstream_policy *policy, unsigned long now);
 #ifdef __cplusplus
 }
 #endif

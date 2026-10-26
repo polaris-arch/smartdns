@@ -637,7 +637,7 @@ TEST(AnyOffline, DefaultUniqueBurstFallsBackToNativeWhenCoordinatorFull)
 	default_passthrough_burst(true);
 }
 
-TEST(UpstreamRoundRobinWire, TwoBackendSerialFairnessAndLegacyFanout) {
+TEST(UpstreamRoundRobinWire, SingleExitReusesOneDestinationAndOrdinaryProvidersStillFanOut) {
     for (int cap : {0, 1, 2}) for (bool compatibility : {false, true}) {
         if (!cap && compatibility) continue;
         SCOPED_TRACE(cap);
@@ -683,10 +683,10 @@ TEST(UpstreamRoundRobinWire, TwoBackendSerialFairnessAndLegacyFanout) {
             ASSERT_TRUE(response_is(answer, DNS_RC_NOERROR, 1, false, DNS_T_A, name.c_str()));
             if (cap) {
                 EXPECT_EQ(a + b, i + 1);
-                EXPECT_LE(abs(a.load() - b.load()), 1);
+                EXPECT_EQ(a.load(), i + 1); EXPECT_EQ(b.load(), 0);
             } else ASSERT_TRUE(wait_until([&] { return a == i + 1 && b == i + 1; }));
         }
-        EXPECT_EQ(a, cap ? 3 : 6); EXPECT_EQ(b, cap ? 3 : 6);
+        EXPECT_EQ(a, 6); EXPECT_EQ(b, cap ? 0 : 6);
     }
 }
 

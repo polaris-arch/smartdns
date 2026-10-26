@@ -118,8 +118,7 @@ void MockServer::Run()
 			unsigned char response_packet_buff[4096];
 			memset(packet_buff, 0, sizeof(packet_buff));
 			struct dns_packet *packet = (struct dns_packet *)packet_buff;
-			struct ServerRequestContext request;
-			memset(&request, 0, sizeof(request));
+			struct ServerRequestContext request{};
 
 			ret = dns_decode(packet, sizeof(packet_buff), in_buff, len);
 			if (ret == 0) {

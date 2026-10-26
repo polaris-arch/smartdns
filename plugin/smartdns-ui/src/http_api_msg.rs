@@ -713,6 +713,8 @@ pub fn api_msg_gen_metrics_data(data: &MetricsData) -> String {
         "cache_memory_size": data.cache_memory_size,
         "qps": data.qps,
         "memory_usage": data.memory_usage,
+        "sqlite_memory_current": data.sqlite_memory_current,
+        "sqlite_memory_highwater": data.sqlite_memory_highwater,
         "is_metrics_suspended": data.is_metrics_suspended,
     });
 
@@ -784,6 +786,8 @@ pub fn api_msg_parse_metrics_data(data: &str) -> Result<MetricsData, Box<dyn Err
         cache_memory_size: cache_memory_size.unwrap() as u64,
         qps: qps.unwrap() as u32,
         memory_usage: memory_usage.unwrap() as u64,
+        sqlite_memory_current: v["sqlite_memory_current"].as_u64(),
+        sqlite_memory_highwater: v["sqlite_memory_highwater"].as_u64(),
         is_metrics_suspended: is_metrics_suspended.unwrap_or(false),
     })
 }

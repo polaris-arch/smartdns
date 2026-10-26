@@ -420,6 +420,13 @@ static int _dns_client_server_add_ext(const char *server_ip, const char *server_
 	safe_strncpy(server_info->ip, server_ip, sizeof(server_info->ip));
 	server_info->port = port;
     server_info->service = service;
+    if (service) {
+        for (unsigned i = 0; i < service->wan_count; i++) if (!strcmp(flags->ifname, service->wans[i].interface)) {
+            server_info->service_wan = i;
+            server_info->service_wan_generation = __atomic_load_n(&service->wans[i].generation, __ATOMIC_ACQUIRE);
+            break;
+        }
+    }
     _dns_service_get(service);
 	server_info->ai_family = gai->ai_family;
 	server_info->ai_addrlen = gai->ai_addrlen;
@@ -720,7 +727,11 @@ int _dns_client_server_add(const char *ip, const char *host, int port, dns_serve
 { return _dns_client_server_add_ext(ip, host, port, type, flags, NULL, NULL); }
 int _dns_client_service_endpoint_add(struct dns_upstream_service *service, const char *ip,
     struct dns_server_info **out)
+{ return _dns_client_service_endpoint_add_on_interface(service, ip, service->flags.ifname, out); }
+int _dns_client_service_endpoint_add_on_interface(struct dns_upstream_service *service, const char *ip,
+    const char *interface, struct dns_server_info **out)
 {
     struct client_dns_server_flags flags = service->flags;
+    safe_strncpy(flags.ifname, interface, sizeof(flags.ifname));
     return _dns_client_server_add_ext(ip, service->host, service->port, service->type, &flags, service, out);
 }

@@ -85,6 +85,7 @@ enum dns_upstream_detail_kind { DNS_DETAIL_RESPONSE_TIMEOUT, DNS_DETAIL_DNS_REJE
     DNS_DETAIL_CONNECT_TIMEOUT, DNS_DETAIL_QUERY_TIMEOUT, DNS_DETAIL_HTTP_429, DNS_DETAIL_HTTP_503, DNS_DETAIL_DNS_RCODE, DNS_DETAIL_COUNT };
 enum dns_upstream_phase { DNS_PHASE_RESPONSE, DNS_PHASE_CONNECT, DNS_PHASE_TLS,
     DNS_PHASE_HTTP2, DNS_PHASE_HTTP3, DNS_PHASE_SOCKET, DNS_PHASE_POLICY };
+enum dns_tls_operation { DNS_TLS_OP_NONE, DNS_TLS_OP_HANDSHAKE, DNS_TLS_OP_READ, DNS_TLS_OP_WRITE, DNS_TLS_OP_EVENTS };
 enum dns_upstream_reject_reason { DNS_REJECT_UNCLASSIFIED, DNS_REJECT_FILTERED,
     DNS_REJECT_TRUNCATED, DNS_REJECT_NO_USABLE_RECORDS, DNS_REJECT_COMPLETED,
     DNS_REJECT_QUESTION, DNS_REJECT_COUNT };
@@ -127,6 +128,79 @@ struct dns_upstream_event_context_snapshot_v1 {
 };
 int dns_client_get_service_event_context_v1(const char *service_id,
     struct dns_upstream_event_context_snapshot_v1 *out);
+/* Separate companion preserves the published context-v1 allocation size.
+ * Sources are a bitset: foreground=1, stale cache hit=2, expiry timer=4,
+ * proactive prefetch=8; merged refreshes can carry more than one bit. */
+struct dns_upstream_event_source_v1 {
+    uint64_t sequence, wan_generation;
+    unsigned origin_flags, queue_wait_ms, priority;
+    char interface[DNS_SERVER_IFNAME_LEN];
+};
+struct dns_upstream_event_sources_v1 {
+    unsigned struct_size, version, event_count;
+    struct dns_upstream_event_source_v1 events[DNS_UPSTREAM_DETAIL_EVENTS];
+};
+int dns_client_get_service_sources_v1(const char *service_id, struct dns_upstream_event_sources_v1 *out);
+struct dns_upstream_wan_runtime_v1 {
+    char interface[DNS_SERVER_IFNAME_LEN], ip[DNS_UPSTREAM_IP_TEXT_MAX], source[DNS_UPSTREAM_IP_TEXT_MAX];
+    unsigned interface_index, family_mask, connected_family, connected;
+    unsigned rate_known, current_rate, known_good_rate, probe_ceiling;
+    uint64_t generation, cooldown_remaining_ms, retry_remaining_ms, http_429, last_backpressure_unix_ms;
+};
+struct dns_upstream_runtime_v1 {
+    unsigned struct_size, version, wan_count, qps_mode, configured_cap;
+    unsigned foreground_waiting, refresh_waiting, prefetch_waiting;
+    struct dns_upstream_wan_runtime_v1 wans[DNS_UPSTREAM_WANS_MAX];
+};
+int dns_client_get_service_runtime_v1(const char *service_id, struct dns_upstream_runtime_v1 *out);
+/* Independent bounded failure evidence. RCODE counters/last-per-code do not
+ * disappear when the general event ring is overwritten. Cumulative is process
+ * lifetime, not durable across reload/restart. Older v1 ABIs are unchanged. */
+#define DNS_UPSTREAM_RCODE_SLOTS 17 /* base codes0..15, slot16 for other */
+#define DNS_UPSTREAM_FAILURE_RECENT 8
+struct dns_upstream_attempt_progress_v1 {
+    unsigned generation, wire_started, request_complete, headers_received, http_status;
+    uint64_t admitted_tick, first_sent_tick, last_sent_tick, complete_tick, headers_tick;
+};
+enum dns_timeout_stage { DNS_TIMEOUT_UNKNOWN, DNS_TIMEOUT_NOT_SENT, DNS_TIMEOUT_SENDING,
+    DNS_TIMEOUT_WAIT_HEADERS, DNS_TIMEOUT_READ_BODY, DNS_TIMEOUT_WAIT_RESPONSE, DNS_TIMEOUT_STAGE_COUNT };
+struct dns_upstream_failure_event_v1 {
+    struct dns_upstream_event_v1 event;
+    struct dns_upstream_event_context_v1 context;
+    struct dns_upstream_attempt_progress_v1 progress;
+    uint64_t connection_generation;
+    unsigned active_attempts, tls_operation, tls_error_count, tls_error_overflow, timeout_stage;
+    unsigned origin_flags, queue_wait_ms;
+    char interface[DNS_SERVER_IFNAME_LEN];
+    uint64_t wan_generation;
+    unsigned quic_close_valid, quic_close_local, quic_close_transport;
+    uint64_t quic_close_code, quic_close_frame;
+    uint64_t tls_errors[4];
+};
+struct dns_upstream_failure_snapshot_v1 {
+    unsigned struct_size, version, timeout_count, io_count;
+    uint64_t rcode_counts[DNS_UPSTREAM_RCODE_SLOTS], timeout_stages[DNS_TIMEOUT_STAGE_COUNT];
+    struct dns_upstream_failure_event_v1 last_rcode[DNS_UPSTREAM_RCODE_SLOTS];
+    struct dns_upstream_failure_event_v1 timeouts[DNS_UPSTREAM_FAILURE_RECENT];
+    struct dns_upstream_failure_event_v1 io_errors[DNS_UPSTREAM_FAILURE_RECENT];
+};
+int dns_client_get_service_failures_v1(const char *service_id, struct dns_upstream_failure_snapshot_v1 *out);
+/* Recommendations never select an interface or prove Internet reachability. */
+#define DNS_NETWORK_INTERFACES_MAX 256
+enum dns_network_interface_role {
+    DNS_INTERFACE_OTHER, DNS_INTERFACE_DEFAULT_EXIT, DNS_INTERFACE_PPP,
+    DNS_INTERFACE_NAMED_WAN, DNS_INTERFACE_INTERNAL, DNS_INTERFACE_TUNNEL
+};
+struct dns_network_interface_v1 {
+    unsigned struct_size, version, index, up, running, loopback, point_to_point;
+    unsigned ipv4_count, ipv6_count;
+    char name[DNS_SERVER_IFNAME_LEN], address4[DNS_UPSTREAM_IP_TEXT_MAX], address6[DNS_UPSTREAM_IP_TEXT_MAX];
+    unsigned link_type, master_index, default_route4, default_route6;
+    unsigned link_inventory_complete, route_inventory_complete, role, recommended;
+    char kind[32];
+};
+/* Copied snapshot, sizing/fill contract matches the other copied APIs. */
+int dns_client_get_network_interfaces_v1(struct dns_network_interface_v1 *out, unsigned capacity);
 /* A callback can attach a semantic rejection reason without changing its action. */
 void dns_client_response_reject_reason(unsigned reason);
 

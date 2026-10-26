@@ -70,12 +70,14 @@ void _dns_endpoint_observer_init(struct dns_server_info *ep)
     d->base.freshness_kind = DNS_FRESHNESS_NOT_APPLICABLE;
     d->breakdown.struct_size = sizeof(d->breakdown); d->breakdown.version = 1;
     d->breakdown.qps = ep->flags.max_query_rate; d->breakdown.burst = ep->flags.query_burst;
-    d->breakdown.cooldown_ms = ep->flags.upstream_cooldown_ms ? ep->flags.upstream_cooldown_ms : 1000;
+    d->breakdown.cooldown_ms = ep->flags.upstream_cooldown_ms ? ep->flags.upstream_cooldown_ms : 200;
     ep->diagnostic = d;
 }
 void _dns_endpoint_observer_destroy(struct dns_server_info *ep)
 {
     if (!ep->diagnostic) return;
+    free(ep->diagnostic->failures);
+    free(ep->diagnostic->event_sources);
     pthread_mutex_destroy(&ep->diagnostic->lock); free(ep->diagnostic); ep->diagnostic = NULL;
 }
 static struct dns_endpoint_observation *find_observation(struct dns_query_struct *q, struct dns_server_info *ep)

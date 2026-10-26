@@ -53,6 +53,10 @@ typedef int (*dns_cache_read_callback)(struct dns_cache_record *cache_record, st
 
 static int is_cache_init;
 static struct dns_cache_head dns_cache_head;
+static uint64_t cache_generation;
+
+uint64_t dns_cache_get_generation(const struct dns_cache *entry)
+{ return entry ? __atomic_load_n(&entry->generation, __ATOMIC_ACQUIRE) : 0; }
 
 static int _dns_cache_is_ready(void)
 {
@@ -353,6 +357,7 @@ static int _dns_cache_replace(struct dns_cache_key *cache_key, int rcode, int tt
 		time(&dns_cache->info.insert_time);
 	}
 	time(&dns_cache->info.replace_time);
+    __atomic_store_n(&dns_cache->generation, __atomic_add_fetch(&cache_generation, 1, __ATOMIC_RELAXED), __ATOMIC_RELEASE);
 	list_del(&dns_cache->list);
 	list_add_tail(&dns_cache->list, &dns_cache_head.cache_list);
 	if (dns_timer_mod(&dns_cache->timer, timeout) == 0) {
@@ -453,6 +458,7 @@ static int _dns_cache_insert(struct dns_cache_info *info, struct dns_cache_data 
 	memcpy(&dns_cache->info, info, sizeof(*info));
 	dns_cache->cache_data = cache_data;
 	dns_cache->origin_flags = origin_flags;
+    __atomic_store_n(&dns_cache->generation, __atomic_add_fetch(&cache_generation, 1, __ATOMIC_RELAXED), __ATOMIC_RELEASE);
 	dns_cache->timer.function = dns_cache_expired;
 	dns_cache->timer.expires = timeout;
 	dns_cache->timer.data = dns_cache;

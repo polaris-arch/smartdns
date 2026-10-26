@@ -322,6 +322,20 @@ impl DataStats {
         return pages * pagesizie;
     }
 
+    /// SQLite's own outstanding allocations and lifetime peak. This excludes
+    /// native DNS/TLS memory and allocator-retained freed pages, so it must not
+    /// be subtracted from RSS to claim a complete allocation breakdown.
+    pub fn get_sqlite_memory(&self) -> (Option<u64>, Option<u64>) {
+        let (mut current, mut peak, mut count, mut count_peak) = (0i64, 0i64, 0i64, 0i64);
+        let status = unsafe { rusqlite::ffi::sqlite3_status64(rusqlite::ffi::SQLITE_STATUS_MEMORY_USED,
+            &mut current, &mut peak, 0) };
+        let count_status = unsafe { rusqlite::ffi::sqlite3_status64(rusqlite::ffi::SQLITE_STATUS_MALLOC_COUNT,
+            &mut count, &mut count_peak, 0) };
+        if status != rusqlite::ffi::SQLITE_OK || count_status != rusqlite::ffi::SQLITE_OK ||
+            current < 0 || peak < current || (current == 0 && count == 0) { return (None, None); }
+        (Some(current as u64), Some(peak as u64))
+    }
+
     pub fn init(self: &Arc<Self>) -> Result<(), Box<dyn Error>> {
         dns_log!(LogLevel::DEBUG, "init data stats");
         self.load_status_data()?;

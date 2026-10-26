@@ -32,6 +32,8 @@ int _config_server_tls(void *data, int argc, char *argv[]);
 int _config_server_https(void *data, int argc, char *argv[]);
 int _config_server_quic(void *data, int argc, char *argv[]);
 int _config_server_http3(void *data, int argc, char *argv[]);
+int _config_upstream_wan_interfaces(void *data, int argc, char *argv[]);
+int _config_upstream_wan_resolve(void);
 
 #ifdef __cplusplus
 }

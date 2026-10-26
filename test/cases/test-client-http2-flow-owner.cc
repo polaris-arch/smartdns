@@ -2,12 +2,16 @@
 extern "C" {
 #include "dns_client/client_http2.h"
 #include "dns_client/client_socket.h"
+#include "dns_client/client_tls.h"
 #include "dns_client/conn_stream.h"
 #include "dns_client/upstream_policy.h"
+#include "dns_client/upstream_service.h"
+#include "dns_client/upstream_discovery.h"
 #include "smartdns/http2.h"
 #include "smartdns/util.h"
 }
 #include <openssl/ssl.h>
+#include <openssl/err.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <unistd.h>
@@ -222,6 +226,61 @@ TEST_F(ClientH2FlowOwner, WindowUpdateAfterDeadlineCannotEmitExpiredBody) {
 TEST_F(ClientH2FlowOwner, PeerCloseWithoutOrphanMustReachEOF) {
     SSL_shutdown(peer);
     EXPECT_LT(PumpClient(), 0);
+}
+TEST_F(ClientH2FlowOwner, StaleThreadErrorCannotTurnWantReadIntoFatalTlsFailure) {
+    Pump();
+    ERR_put_error(ERR_LIB_SSL, 0, SSL_R_BAD_WRITE_RETRY, __FILE__, __LINE__);
+    ASSERT_NE(ERR_peek_error(), 0U);
+    unsigned char buffer[32]{};
+    EXPECT_LT(_dns_client_socket_ssl_recv(&server, buffer, sizeof(buffer)), 0);
+    EXPECT_EQ(errno, EAGAIN);
+    EXPECT_EQ(server.service_tls_error, 0U);
+    EXPECT_EQ(ERR_peek_error(), 0U);
+}
+TEST_F(ClientH2FlowOwner, RecentDnsTrafficPostponesTheKeepaliveTimerWithoutPolling) {
+    dns_upstream_service service{}; dns_discovery_snapshot desired{};
+    pthread_mutex_init(&service.lock, nullptr);
+    service.desired = &desired; service.config.keepalive_ms = 1000;
+    service.member_count = 1; service.members[0] = &server;
+    unsigned long now = get_tick_count();
+    server.type = DNS_SERVER_HTTPS; server.status = DNS_SERVER_STATUS_CONNECTED;
+    server.service_keepalive_tick = now - 1500; server.send_tick = now - 500;
+    server.service_ping_tick = 0; server.active_attempts = 0; server.service_protocol_ready = 1;
+    _dns_service_connection_tick(&service, now);
+    EXPECT_EQ(service.connection_due, now + 500);
+    EXPECT_EQ(server.service_ping_tick, 0U);
+    pthread_mutex_destroy(&service.lock);
+}
+TEST(ClientQuicCloseEvidence, ActiveQueriesAndTransportAlertsAreNotIdleH3Closure) {
+    dns_server_info endpoint{}; endpoint.type = DNS_SERVER_HTTP3;
+    endpoint.service_quic_close_valid = 1; endpoint.service_quic_close_code = 0x100;
+    endpoint.active_attempts = 1; _ssl_quic_close_normal(&endpoint); EXPECT_FALSE(endpoint.service_normal_close);
+    endpoint.active_attempts = 0; _ssl_quic_close_normal(&endpoint); EXPECT_TRUE(endpoint.service_normal_close);
+    endpoint.service_quic_close_transport = 1;
+    _ssl_quic_close_normal(&endpoint); EXPECT_FALSE(endpoint.service_normal_close); // TLS alert, not H3_NO_ERROR
+    endpoint.service_quic_close_code = 0;
+    _ssl_quic_close_normal(&endpoint); EXPECT_TRUE(endpoint.service_normal_close);
+}
+TEST_F(ClientH2FlowOwner, BadTlsRecordRetainsErrorAtOperationAndDoesNotRetryOrShutdown) {
+    server.active_attempts = 2; server.diagnostic_connection_generation = 17;
+    // Inject an unauthentic encrypted record beneath TLS on the peer BIO.
+    // No network or external server is involved.
+    unsigned char corrupt[22] = {0x17, 0x03, 0x03, 0, 17};
+    ASSERT_EQ(BIO_write(SSL_get_wbio(peer), corrupt, sizeof(corrupt)), static_cast<int>(sizeof(corrupt)));
+    unsigned char buffer[32]{};
+    EXPECT_LT(_dns_client_socket_ssl_recv(&server, buffer, sizeof(buffer)), 0);
+    EXPECT_NE(errno, EAGAIN);
+    EXPECT_EQ(server.service_error_phase, DNS_PHASE_TLS);
+    EXPECT_EQ(server.service_error_code, SSL_ERROR_SSL);
+    EXPECT_EQ(server.service_tls_operation, DNS_TLS_OP_READ);
+    EXPECT_GT(server.service_tls_error_count, 0U);
+    EXPECT_LE(server.service_tls_error_count, 4U);
+    EXPECT_EQ(server.service_error_connection_generation, 17U);
+    EXPECT_EQ(server.service_error_active_attempts, 2U);
+    EXPECT_FALSE(server.service_normal_close);
+    EXPECT_EQ(ERR_peek_error(), 0U);
+    EXPECT_EQ(_ssl_shutdown(&server), -1);
+    server.active_attempts = 0;
 }
 
 TEST_F(ClientH2FlowOwner, LateCancelledResponseAndPeerCloseMustReachEOF) {

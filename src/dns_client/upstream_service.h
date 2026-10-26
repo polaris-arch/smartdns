@@ -24,6 +24,22 @@ struct dns_service_observation {
     unsigned last_wait, end_reason, last_event;
     unsigned terminal, success, waiting, writer_pending, settled, active_attempts, hint_queued, registered;
 };
+struct dns_service_wan {
+    char interface[DNS_SERVER_IFNAME_LEN], source4[DNS_UPSTREAM_IP_TEXT_MAX], source6[DNS_UPSTREAM_IP_TEXT_MAX];
+    unsigned index, race_family, address_cursor;
+    uint64_t generation, winner;
+    unsigned long race_due, family_retry_at[2];
+    struct dns_upstream_policy *policy;
+    struct { char ip[DNS_UPSTREAM_IP_TEXT_MAX]; unsigned long valid_until; } candidates[2];
+};
+struct dns_service_turn {
+    uint64_t turn_sequence;
+    unsigned turn_state, cancel_requested;
+    struct dns_server_info *turn_endpoint;
+    struct dns_service_observation *turn_observation;
+    unsigned turn_attempt_generation;
+    unsigned long turn_accepted_tick;
+};
 #ifdef TEST
 extern void (*_dns_service_observe_published_test_hook)(struct dns_service_observation *);
 #endif
@@ -40,8 +56,10 @@ struct dns_upstream_service {
     pthread_mutex_t detail_lock; /* leaf: never acquire other locks while held */
     struct dns_upstream_policy_snapshot_v1 detail;
     struct dns_upstream_event_context_v1 event_context[DNS_UPSTREAM_DETAIL_EVENTS];
+    struct dns_upstream_event_source_v1 *event_sources; /* lazy bounded ring companion */
     uint64_t path_epoch;
     unsigned long path_refresh_due, race_due, connection_due;
+    unsigned long background_demand_until;
     unsigned race_family;
     char id[DNS_UPSTREAM_SERVICE_ID_MAX], host[DNS_MAX_HOSTNAME];
     int port;
@@ -49,23 +67,25 @@ struct dns_upstream_service {
     struct client_dns_server_flags flags;
     struct dns_upstream_pool_config config;
     struct dns_upstream_policy *policy;
+    unsigned wan_count;
+    struct dns_service_wan wans[DNS_UPSTREAM_WANS_MAX];
     struct dns_upstream_discovery *discovery;
     struct dns_server_info *members[DNS_UPSTREAM_BACKENDS_MAX * 2];
     unsigned member_count, selected_count, connections, active_attempts;
     unsigned discovered_count, rejected_count, stale;
     unsigned long freshness_until, next_eligible;
     unsigned next_wait;
-    uint64_t member_sequence, cursor, turn_sequence;
-    unsigned turn_state, cancel_requested, wake_pending, stopping;
-    struct dns_server_info *turn_endpoint;
-    struct dns_service_observation *turn_observation;
-    unsigned turn_attempt_generation;
-    unsigned long turn_accepted_tick;
+    uint64_t member_sequence, cursor;
+    unsigned wake_pending, stopping, membership_dirty, paths_dirty;
+    struct dns_service_turn turn, *extra_turns; /* extra lanes allocated only for multi-WAN */
     struct dns_upstream_service *pending_next;
     struct list_head waiters; /* Ready observations only, not all in-flight work. */
+    unsigned waiting_count, waiting_peak;
+    uint64_t queue_rejected;
     struct dns_service_observation *hints, *deferred_hints;
     struct dns_upstream_service_snapshot_v1 stats;
     struct dns_upstream_service_diagnostics_v1 diagnostics;
+    struct dns_upstream_failure_snapshot_v1 *failures; /* lazy, allocated on first retained error */
     unsigned freshness_known; /* Observation only: published positive-membership TTL. */
 };
 void _dns_service_get(struct dns_upstream_service *s);
@@ -94,6 +114,7 @@ void _dns_service_endpoint_failure(struct dns_server_info *endpoint);
 void _dns_service_endpoint_ready(struct dns_server_info *endpoint);
 void _dns_service_transport_changed(struct dns_server_info *endpoint);
 int _dns_service_endpoint_eligible(struct dns_server_info *endpoint, unsigned long now);
+int _dns_service_wan_turn_available(struct dns_upstream_service *service, unsigned lane);
 int _dns_service_has_ecs(struct dns_upstream_service *s);
 void _dns_service_diagnostic_event(struct dns_query_struct *q, struct dns_server_info *ep, unsigned event);
 void _dns_service_detail(struct dns_query_struct *q, struct dns_server_info *ep,

@@ -144,7 +144,10 @@ static int _dns_server_get_rules(unsigned char *key, uint32_t key_len, int is_su
 				continue;
 			}
 
-			request_domain_rule->flags |= ((struct dns_rule_flags *)domain_rule->rules[i])->flags;
+			/* This opt-in policy supports an explicit, more-specific "no".
+			 * Keep the existing accumulation semantics for the older flags. */
+			request_domain_rule->flags &= ~(rule_flags->is_flag_set & DOMAIN_FLAG_PTR_SOA);
+			request_domain_rule->flags |= rule_flags->flags;
 		}
 
 		if (domain_rule->rules[i]->sub_only == 1 && is_effective_sub == 0) {

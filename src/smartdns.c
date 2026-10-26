@@ -84,6 +84,7 @@ static void _help(void)
 #endif
 		"  --cache-print [file]  print cache.\n"
 		"  --is-quic-supported   is quic http3 supported.\n"
+		"  --network-interfaces show local interface inventory as JSON.\n"
 		""
 
 		"Online help: https://pymumu.github.io/smartdns\n"
@@ -125,7 +126,47 @@ static void _show_version(void)
 	char str_ver[256] = {0};
 	_smartdns_get_version(str_ver, sizeof(str_ver));
 	printf("smartdns %s\n", str_ver);
-    printf("features: smartdns-upstream-service-pool-v1 smartdns-upstream-path-policy-v1 smartdns-upstream-fixed-cooldown-v1\n");
+    printf("features: smartdns-upstream-service-pool-v1 smartdns-upstream-path-policy-v1 smartdns-upstream-fixed-cooldown-v1 smartdns-network-interfaces-v1 smartdns-upstream-wan-admission-v1 smartdns-any-address-v1\n");
+}
+
+static void _network_json_text(const char *text)
+{
+    putchar('"');
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if (*p == '"' || *p == '\\') { putchar('\\'); putchar(*p); }
+        else if (*p < 32 || *p >= 127) printf("\\u%04x", *p);
+        else putchar(*p);
+    }
+    putchar('"');
+}
+
+/* A control-plane reader can reuse the exact same portable recommendation as
+ * the plugin, even when the optional HTTP UI is disabled. Never starts DNS. */
+static int _show_network_interfaces(void)
+{
+    struct dns_network_interface_v1 *items = calloc(DNS_NETWORK_INTERFACES_MAX, sizeof(*items));
+    if (!items) return 1;
+    int count = dns_client_get_network_interfaces_v1(items, DNS_NETWORK_INTERFACES_MAX);
+    if (count < 0 || count > DNS_NETWORK_INTERFACES_MAX) { free(items); return 1; }
+    static const char *roles[] = {"other", "default_exit", "ppp", "name_hint", "internal", "tunnel"};
+    putchar('[');
+    for (int i = 0; i < count; i++) {
+        struct dns_network_interface_v1 *n = items + i;
+        if (i) putchar(',');
+        printf("{\"name\":"); _network_json_text(n->name);
+        printf(",\"index\":%u,\"up\":%s,\"running\":%s,\"loopback\":%s,\"point_to_point\":%s,",
+            n->index, n->up ? "true" : "false", n->running ? "true" : "false",
+            n->loopback ? "true" : "false", n->point_to_point ? "true" : "false");
+        printf("\"ipv4_count\":%u,\"ipv6_count\":%u,\"master_index\":%u,\"address4\":", n->ipv4_count, n->ipv6_count, n->master_index);
+        _network_json_text(n->address4); printf(",\"address6\":"); _network_json_text(n->address6);
+        printf(",\"kind\":"); _network_json_text(n->kind);
+        printf(",\"default_route4\":%s,\"default_route6\":%s,\"link_inventory_complete\":%s,\"route_inventory_complete\":%s,\"recommended\":%s,\"role\":",
+            n->default_route4 ? "true" : "false", n->default_route6 ? "true" : "false",
+            n->link_inventory_complete ? "true" : "false", n->route_inventory_complete ? "true" : "false", n->recommended ? "true" : "false");
+        _network_json_text(n->role < sizeof(roles) / sizeof(roles[0]) ? roles[n->role] : "other");
+        putchar('}');
+    }
+    puts("]"); free(items); return ferror(stdout) ? 1 : 0;
 }
 
 static int _smartdns_load_from_resolv_file(const char *resolv_file)
@@ -245,8 +286,12 @@ static int _smartdns_prepare_server_flags(struct client_dns_server_flags *flags,
 	flags->drop_packet_latency_ms = server->drop_packet_latency_ms;
 	flags->tcp_keepalive = server->tcp_keepalive;
 	flags->max_query_rate = server->max_query_rate;
+    flags->adaptive_query_rate = server->adaptive_query_rate;
 	flags->query_burst = server->query_burst;
 	flags->upstream_cooldown_ms = server->upstream_cooldown_ms;
+    flags->upstream_retry_cooldown_ms = server->upstream_retry_cooldown_ms;
+    flags->upstream_wan_count = server->upstream_wan_count;
+    memcpy(flags->upstream_wan_interfaces, server->upstream_wan_interfaces, sizeof(flags->upstream_wan_interfaces));
 	flags->max_concurrent_queries = server->max_concurrent_queries;
 	flags->upstream_round_robin = server->upstream_round_robin;
 	flags->max_upstream_connections = server->max_upstream_connections;
@@ -802,12 +847,10 @@ static void _sig_error_exit(int signo, siginfo_t *siginfo, void *ct)
 	build_info = __DATE__ " " __TIME__;
 #endif
 #if defined(__i386__)
-	int *pgregs = (int *)(&(context->uc_mcontext.gregs));
-	PC = pgregs[REG_EIP];
+	PC = (unsigned long)context->uc_mcontext.gregs[REG_EIP];
 	arch = "i386";
 #elif defined(__x86_64__)
-	int *pgregs = (int *)(&(context->uc_mcontext.gregs));
-	PC = pgregs[REG_RIP];
+	PC = (unsigned long)context->uc_mcontext.gregs[REG_RIP];
 	arch = "x86_64";
 #elif defined(__arm__)
 	PC = context->uc_mcontext.arm_pc;
@@ -1163,6 +1206,7 @@ int smartdns_main(int argc, char *argv[])
 
 	static struct option long_options[] = {{"cache-print", required_argument, NULL, 256},
 										   {"is-quic-supported", no_argument, NULL, 257},
+                                           {"network-interfaces", no_argument, NULL, 258},
 										   {"help", no_argument, NULL, 'h'},
 										   {NULL, 0, NULL, 0}};
 
@@ -1212,6 +1256,8 @@ int smartdns_main(int argc, char *argv[])
 			_show_version();
 			return 0;
 			break;
+        case 258:
+            return _show_network_interfaces();
 #ifdef DEBUG
 		case 'N':
 			return dns_packet_debug(optarg);

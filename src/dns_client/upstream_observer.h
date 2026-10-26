@@ -9,8 +9,10 @@ struct dns_endpoint_diagnostics {
     pthread_mutex_t lock;
     struct dns_upstream_service_snapshot_v1 base;
     struct dns_upstream_service_diagnostics_v1 breakdown;
+    struct dns_upstream_failure_snapshot_v1 *failures;
     struct dns_upstream_policy_snapshot_v1 detail;
     struct dns_upstream_event_context_v1 context[DNS_UPSTREAM_DETAIL_EVENTS];
+    struct dns_upstream_event_source_v1 *event_sources;
 };
 void _dns_endpoint_observer_init(struct dns_server_info *ep);
 void _dns_endpoint_observer_destroy(struct dns_server_info *ep);

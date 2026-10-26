@@ -27,6 +27,37 @@
 #include <errno.h>
 #include <arpa/inet.h>
 
+int _config_upstream_wan_interfaces(void *data, int argc, char *argv[])
+{
+    char names[DNS_UPSTREAM_WANS_MAX][DNS_SERVER_IFNAME_LEN] = {{0}};
+    unsigned count = 0;
+    if (argc < 2) return -1;
+    for (int i = 1; i < argc; i++) {
+        const char *begin = argv[i];
+        while (*begin) {
+            const char *end = strchr(begin, ','); size_t n = end ? (size_t)(end - begin) : strlen(begin);
+            if (!n || n >= DNS_SERVER_IFNAME_LEN || count == DNS_UPSTREAM_WANS_MAX) return -1;
+            for (size_t at = 0; at < n; at++) {
+                char c = begin[at];
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strchr("_.:-", c))) return -1;
+            }
+            memcpy(names[count], begin, n);
+            for (unsigned old = 0; old < count; old++) if (!strcmp(names[old], names[count])) return -1;
+            count++;
+            if (!end) break;
+            begin = end + 1; if (!*begin) return -1;
+        }
+    }
+    if (!count) return -1;
+    if (data) {
+        struct dns_servers *server = data;
+        server->upstream_wan_count = count; memcpy(server->upstream_wan_interfaces, names, sizeof(names));
+    } else {
+        dns_conf.upstream_wan_count = count; memcpy(dns_conf.upstream_wan_interfaces, names, sizeof(names));
+    }
+    return 0;
+}
+
 /* Strict bounded pool parsing. Keep the original authority separate from its
  * numeric backends; legacy host-ip substitution is intentionally unchanged. */
 static int _config_pool_number(const char *text, unsigned int *value)
@@ -99,7 +130,7 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 	unsigned char *spki = NULL;
 	int drop_packet_latency_ms = 0;
 	int tcp_keepalive = -1;
-    unsigned path_options_seen = 0;
+    unsigned path_options_seen = 0, wan_option_seen = 0, rate_cap_seen = 0;
 	int is_bootstrap_dns = 0;
 	const char *host_ip = NULL;
 	unsigned int host_ip_occurrences = 0;
@@ -147,6 +178,11 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		{"upstream-ip-pool", no_argument, NULL, 273},
 		{"max-upstream-backends", required_argument, NULL, 274},
 		{"upstream-cooldown-ms", required_argument, NULL, 275},
+        {"upstream-wan", required_argument, NULL, 282},
+        {"adaptive-query-rate", required_argument, NULL, 283},
+        {"upstream-wan-interfaces", required_argument, NULL, 284},
+        {"upstream-retry-cooldown-ms", required_argument, NULL, 285},
+        {"upstream-service", no_argument, NULL, 286},
         {"upstream-family", required_argument, NULL, 276},
         {"upstream-response-timeout-ms", required_argument, NULL, 277},
         {"upstream-query-timeout-ms", required_argument, NULL, 278},
@@ -184,6 +220,8 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 	server->upstream_round_robin = 0;
 	server->max_upstream_connections = 0;
 	server->upstream_ip_pool = 0;
+    server->upstream_wan_mode = 0; server->upstream_wan_count = 0;
+    memset(server->upstream_wan_interfaces, 0, sizeof(server->upstream_wan_interfaces));
 	server->pool_compat_skip = 0;
 	server->max_upstream_backends = 0;
 	server->pool_ip_count = 0;
@@ -389,16 +427,49 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
             if (opt == 281) { server->upstream_keepalive_ms = v; server->upstream_keepalive_disabled = !v; }
             break;
         }
-		case 275: {
+		case 275: case 285: {
             if (!*optarg) return -1;
             for (const char *digit = optarg; *digit; digit++) if (*digit < '0' || *digit > '9') return -1;
             char *end = NULL;
             errno = 0;
             unsigned long value = strtoul(optarg, &end, 10);
             if (errno || *end || value < 1 || value > 10000) return -1;
-            server->upstream_cooldown_ms = value;
+            if (opt == 275) server->upstream_cooldown_ms = value;
+            else server->upstream_retry_cooldown_ms = value;
             break;
         }
+        case 282:
+            if (wan_option_seen & 1) return -1;
+            wan_option_seen |= 1;
+            if (!strcmp(optarg, "inherit")) server->upstream_wan_mode = 0;
+            else if (!strcmp(optarg, "off")) server->upstream_wan_mode = 1;
+            else if (!strcmp(optarg, "custom")) server->upstream_wan_mode = 2;
+            else {
+                if (wan_option_seen & 2) return -1;
+                wan_option_seen |= 2;
+                char *args[] = {"upstream-wan-interfaces", optarg};
+                if (_config_upstream_wan_interfaces(server, 2, args)) return -1;
+                server->upstream_wan_mode = 2;
+            }
+            break;
+        case 284: {
+            if (wan_option_seen & 2) return -1;
+            wan_option_seen |= 2;
+            char *args[] = {"upstream-wan-interfaces", optarg};
+            if (_config_upstream_wan_interfaces(server, 2, args)) return -1;
+            break;
+        }
+        case 283:
+            if (wan_option_seen & 4) return -1;
+            wan_option_seen |= 4;
+            if (!strcmp(optarg, "on")) { server->adaptive_query_rate = 1; server->query_rate_disabled = 0; }
+            else if (!strcmp(optarg, "off")) { server->adaptive_query_rate = 0; server->query_rate_disabled = 1; }
+            else return -1;
+            break;
+        case 286:
+            server->upstream_service = 1;
+            server->upstream_ip_pool = 1;
+            break;
 		case 267:
 		case 268:
 		case 269: {
@@ -407,7 +478,7 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
             errno = 0;
 			unsigned long value = strtoul(optarg, &end, 10);
 			if (errno || !*optarg || *optarg == '-' || *end || value > (opt == 267 ? 1000000UL : 65535UL) || (opt == 268 && value == 0)) return -1;
-			if (opt == 267) server->max_query_rate = value;
+			if (opt == 267) { server->max_query_rate = value; rate_cap_seen = 1; }
 			else if (opt == 268) server->query_burst = value;
 			else server->max_concurrent_queries = value;
 			break;
@@ -436,7 +507,7 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		}
 		default:
 			/* Do not silently turn malformed opt-in options into defaults. */
-			if ((optopt >= 275 && optopt <= 281) || optopt == 271 || optopt == 272 || optopt == 273 || optopt == 274 || optopt == 258) return -1;
+			if ((optopt >= 275 && optopt <= 286) || optopt == 271 || optopt == 272 || optopt == 273 || optopt == 274 || optopt == 258) return -1;
 			if (optind > optind_last) {
 				tlog(TLOG_WARN, "unknown server option: %s at '%s:%d'.", argv[optind - 1], conf_get_conf_file(),
 					 conf_get_current_lineno());
@@ -447,32 +518,22 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		optind_last = optind;
 	}
 
+    server->upstream_path_options = path_options_seen;
 	if (server->upstream_ip_pool) {
-		if (server->upstream_round_robin || is_bootstrap_dns || server->proxyname[0] ||
-			type == DNS_SERVER_MDNS || check_is_ipaddr(server->server) == 0 || host_ip_occurrences > 1) {
+		if (server->upstream_round_robin || is_bootstrap_dns || (server->proxyname[0] && !server->upstream_service) ||
+			type == DNS_SERVER_MDNS || host_ip_occurrences > 1) {
 			tlog(TLOG_ERROR, "upstream-ip-pool requires a domain authority and cannot use proxy, bootstrap, mDNS or legacy RR");
 			return -1;
 		}
-        if (!server->upstream_response_timeout_ms) server->upstream_response_timeout_ms = 1000;
-        if (!server->upstream_query_timeout_ms) server->upstream_query_timeout_ms = 3000;
-        if (!server->upstream_connect_timeout_ms) server->upstream_connect_timeout_ms = 3000;
-        if (!server->upstream_connect_delay_ms) server->upstream_connect_delay_ms = 251;
-        server->upstream_connect_delay_ms--;
-        if (!server->upstream_keepalive_ms && !server->upstream_keepalive_disabled) server->upstream_keepalive_ms = 30000;
-        if (server->upstream_response_timeout_ms > server->upstream_query_timeout_ms ||
-            server->upstream_connect_timeout_ms > server->upstream_query_timeout_ms) return -1;
-        if ((path_options_seen & (1U << 6)) && type != DNS_SERVER_HTTPS && type != DNS_SERVER_HTTP3) return -1;
 		if (!server->max_upstream_backends) server->max_upstream_backends = 4;
 		if (server->max_upstream_connections > server->max_upstream_backends) return -1;
 		if (host_ip && _config_pool_ips(server, host_ip)) return -1;
 		if (server->pool_ip_count > server->max_upstream_backends)
-			tlog(TLOG_WARN, "pool %s configured %u unique addresses, selecting first %u (overflow %u)",
-				server->server, server->pool_ip_count, server->max_upstream_backends,
-				server->pool_ip_count - server->max_upstream_backends);
+			tlog(TLOG_WARN, "service %s configured %u destination candidates; healthy connections are reused and candidates retained for failover",
+				server->server, server->pool_ip_count);
 	} else {
-        if (path_options_seen || server->upstream_family || server->upstream_response_timeout_ms || server->upstream_query_timeout_ms ||
-            server->upstream_connect_timeout_ms || server->upstream_connect_delay_ms || server->upstream_keepalive_ms ||
-            server->upstream_keepalive_disabled) return -1;
+        /* Global inheritance may appear after this line. Resolve logical
+         * service ownership and path-only validation after the full parse. */
 		if (server->max_upstream_backends || legacy_host_ip_invalid || legacy_connection_invalid) return -1;
 		/* Preserve the legacy single-digit 1..4 grammar, including rejection of 01. */
 		if (connection_limit_text && (connection_limit_text[0] < '1' || connection_limit_text[0] > '4' ||
@@ -482,14 +543,29 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 			if (!server->max_upstream_connections) server->max_upstream_connections = 2;
 		} else if (server->max_upstream_connections) return -1;
 	}
+    if (server->query_rate_disabled) server->max_query_rate = server->query_burst = 0;
+    if (server->adaptive_query_rate) {
+        if (is_bootstrap_dns || (type != DNS_SERVER_HTTPS && type != DNS_SERVER_TLS &&
+            type != DNS_SERVER_QUIC && type != DNS_SERVER_HTTP3)) {
+            tlog(TLOG_ERROR, "adaptive-query-rate requires non-bootstrap DoH, DoT, DoQ or DoH3");
+            return -1;
+        }
+        if (rate_cap_seen && !server->max_query_rate) return -1;
+        if (!server->max_query_rate) server->max_query_rate = 20;
+        if (server->query_burst > 1) return -1;
+    }
 	if (server->query_burst && !server->max_query_rate) return -1;
-	if (!server->upstream_cooldown_ms) server->upstream_cooldown_ms = 1000;
+    if (!server->upstream_retry_cooldown_ms) {
+        server->upstream_retry_cooldown_ms = 1000;
+    }
+	if (!server->upstream_cooldown_ms) server->upstream_cooldown_ms = 200;
 	if (server->max_query_rate && !server->query_burst) server->query_burst = 1;
 	if (server->quota_group[0]) {
 		for (int n = 0; n < index; n++) {
 			struct dns_servers *other = &dns_conf.servers[n];
 			if (strcmp(other->quota_group, server->quota_group) == 0 &&
 				(other->max_query_rate != server->max_query_rate || other->query_burst != server->query_burst ||
+                 other->adaptive_query_rate != server->adaptive_query_rate ||
                  other->upstream_cooldown_ms != server->upstream_cooldown_ms ||
 				 other->upstream_round_robin != server->upstream_round_robin ||
 				 (server->upstream_round_robin && other->max_upstream_connections != server->max_upstream_connections))) {

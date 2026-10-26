@@ -658,7 +658,7 @@ static int _dns_client_quic_flush_stream(struct dns_server_info *server_info, st
 	}
 
 	if (send_len < 0 && send_errno == EAGAIN) {
-		_ssl_do_handevent(server_info);
+		if (!_ssl_do_handevent(server_info) && !server_info->service_quic_close_valid) return -1;
 	}
 
 	return 0;
@@ -719,28 +719,19 @@ int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_e
 	/* An ICMP/socket error can be reported without EPOLLIN. Let QUIC consume
 	 * the network event instead of leaving a level-triggered error pending. */
 	if (event->events & (EPOLLIN | EPOLLERR)) {
-		_ssl_do_handevent(server_info);
+		if (!_ssl_do_handevent(server_info) && !server_info->service_quic_close_valid) {
+            _dns_client_close_socket(server_info); return -1;
+        }
 
-		/* connection is closed, reconnect */
-		if (SSL_get_shutdown(server_info->ssl) != 0) {
-			int ret = 0;
-			_dns_client_close_socket_ext(server_info, 1);
-			pthread_mutex_lock(&server_info->lock);
-			server_info->recv_buff.len = 0;
-			if (!list_empty(&server_info->conn_stream_list)) {
-				/* still remain request data, reconnect and send*/
-				ret = _dns_client_create_socket(server_info);
-			} else {
-				ret = 0;
-			}
-			pthread_mutex_unlock(&server_info->lock);
-			tlog(TLOG_DEBUG, "quic server %s:%d peer close", server_info->ip, server_info->port);
-			return ret;
-		}
-
+        /* A close can arrive with the last DNS response. Drain decoded data
+         * before retiring streams, then consume the persistent close event. */
 		if (_dns_client_process_quic_poll(server_info) != 0) {
 			goto errout;
 		}
+        if (server_info->service_quic_close_valid || SSL_get_shutdown(server_info->ssl) != 0) {
+            _ssl_quic_close_normal(server_info);
+            _dns_client_close_socket(server_info); return -1;
+        }
 	}
 
 	if (event->events & EPOLLOUT) {

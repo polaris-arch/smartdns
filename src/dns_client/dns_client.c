@@ -184,21 +184,19 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
         response_reject_reason = saved_reason;
         int accepted = (ret == DNS_CLIENT_ACTION_OK || ret == DNS_CLIENT_ACTION_OK_WAIT) &&
             (packet->head.rcode == DNS_RC_NOERROR || packet->head.rcode == DNS_RC_NXDOMAIN);
-        int completed = !accepted && reject_reason == DNS_REJECT_COMPLETED &&
-            (packet->head.rcode == DNS_RC_NOERROR || packet->head.rcode == DNS_RC_NXDOMAIN);
-        if (!accepted && !completed) _dns_service_diagnostic_event(query, server_info,
+        int completed = !accepted && reject_reason == DNS_REJECT_COMPLETED;
+        int bad_rcode = packet->head.rcode != DNS_RC_NOERROR && packet->head.rcode != DNS_RC_NXDOMAIN;
+        if (!accepted && (bad_rcode || !completed)) _dns_service_diagnostic_event(query, server_info,
             packet->head.rcode != DNS_RC_NOERROR && packet->head.rcode != DNS_RC_NXDOMAIN ?
             DNS_EVENT_DNS_RCODE : DNS_EVENT_DNS_REJECTED);
         if (!accepted) {
-            int bad_rcode = packet->head.rcode != DNS_RC_NOERROR && packet->head.rcode != DNS_RC_NXDOMAIN;
             _dns_service_detail_dns(query, server_info, bad_rcode ? DNS_DETAIL_DNS_RCODE : DNS_DETAIL_DNS_REJECT,
                 DNS_PHASE_RESPONSE, bad_rcode ? packet->head.rcode : reject_reason, packet);
         }
-        /* A late valid response can no longer be consumed by the native
-         * request. Preserve its completion evidence without penalizing the
-         * endpoint or scheduling another backend attempt. Real wire RCODE
-         * errors above remain observable even after another provider won. */
+        /* Completed requests cannot consume this response. Preserve real wire
+         * RCODE errors, but never retry work after another provider has won. */
         if (completed) {
+            if (bad_rcode) _dns_attempt_reply_outcome(query, server_info, 0);
             if (server_info->service) stats_inc(&server_info->service->stats.recv_count);
             ret = DNS_CLIENT_ACTION_UNDEFINE;
         } else _dns_service_query_result(query, server_info, accepted);
@@ -329,9 +327,13 @@ static int _dns_client_send_one_packet(struct dns_server_info *server_info, stru
                 if (ret) {
                     /* Datagram failure leaves no buffered owner. Revoke this
                      * lease, but do not self-feed a new turn on socket pressure. */
-                    if (send_err == EAGAIN || send_err == EWOULDBLOCK)
+                    if (send_err == EAGAIN || send_err == EWOULDBLOCK) {
+                        unsigned long until = get_tick_count() + 100;
+                        __atomic_store_n(&server_info->service_retry_at, until, __ATOMIC_RELEASE);
+                        __atomic_store_n(&server_info->service->next_wait, DNS_WAIT_SCHEDULER, __ATOMIC_RELAXED);
                         __atomic_store_n(&server_info->service->next_eligible,
-                            get_tick_count() + 100, __ATOMIC_RELEASE);
+                            server_info->service->wan_count > 1 ? 0 : until, __ATOMIC_RELEASE);
+                    }
                     _dns_service_write_result(query, server_info, generation, 0, 0);
                 }
             }
@@ -608,6 +610,15 @@ int dns_client_query(const char *domain, int qtype, dns_client_callback callback
 	query->single_upstream = !!(options->enable_flag & DNS_QUEY_OPTION_SINGLE_UPSTREAM);
 	query->checking_disabled = !!(options->enable_flag & DNS_QUEY_OPTION_CD);
     query->bootstrap_only = !!(options->enable_flag & DNS_QUEY_OPTION_BOOTSTRAP_ONLY);
+    query->priority = options->enable_flag & DNS_QUEY_OPTION_EXPIRED_REFRESH ? 1 :
+        options->enable_flag & DNS_QUEY_OPTION_BACKGROUND ? 2 : 0;
+    query->origin_flags = 1;
+    if (options->enable_flag & DNS_QUEY_OPTION_BACKGROUND) {
+        query->origin_flags = options->background_origin_flags & 14;
+        if (!query->origin_flags) query->origin_flags = options->enable_flag & DNS_QUEY_OPTION_CACHE_HIT_REFRESH ? 2 :
+            options->enable_flag & DNS_QUEY_OPTION_EXPIRED_REFRESH ? 4 : 8;
+        query->background_queue_wait_ms = options->background_queue_wait_ms;
+    }
 	if (options->enable_flag & DNS_QUEY_OPTION_BUDGET) {
 		query->budget = options->budget;
 		dns_query_budget_get(query->budget);
@@ -619,9 +630,10 @@ int dns_client_query(const char *domain, int qtype, dns_client_callback callback
         _dns_client_get_dnsserver_group(group_name);
     if (query->bootstrap_only && (!query->server_group || list_empty(&query->server_group->head) ||
         query->server_group->service_members)) goto errout;
-    if (query->bootstrap_only)
+    if (query->bootstrap_only) {
         query->bootstrap_cursor = (options->enable_flag & DNS_QUEY_OPTION_BOOTSTRAP_START) ? options->bootstrap_start :
             __atomic_fetch_add(&query->server_group->bootstrap_query_sequence, 1, __ATOMIC_RELAXED);
+    }
 	if (query->server_group == NULL) {
 		tlog(TLOG_ERROR, "get dns server group %s failed.", group_name);
 		goto errout;
@@ -887,9 +899,15 @@ static void *_dns_client_work(void *arg)
             _dns_client_loop_diagnostic_ready(server_info, event->events, now, live_event);
             pthread_mutex_unlock(&server_info->lock);
             if (live_event) {
+                pthread_mutex_lock(&server_info->lock);
                 server_info->service_error_phase = DNS_PHASE_SOCKET;
                 server_info->service_error_code = server_info->service_system_error = 0;
                 server_info->service_tls_error = 0;
+                server_info->service_tls_operation = server_info->service_tls_error_count = server_info->service_tls_error_overflow = 0;
+                memset(server_info->service_tls_errors, 0, sizeof(server_info->service_tls_errors));
+                server_info->service_error_connection_generation = server_info->diagnostic_connection_generation;
+                server_info->service_error_active_attempts = server_info->active_attempts;
+                pthread_mutex_unlock(&server_info->lock);
                 int processed = _dns_client_process(server_info, event, now);
                 if (processed < 0 && (server_info->service || server_info->diagnostic) &&
                     !_dns_policy_endpoint_cooldown(server_info, get_tick_count())) {

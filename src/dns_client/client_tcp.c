@@ -375,6 +375,7 @@ int _dns_client_process_stream_writes(struct dns_server_info *server)
         _dns_attempt_mark_sent(q, server, stream->attempt_generation);
         stream->send_offset += sent;
         if (stream->send_offset < stream->send_buff.len) break;
+        _dns_attempt_progress_update(q, server, stream->attempt_generation, 1, 0);
         if (server->type == DNS_SERVER_HTTPS) {
             stream->http1_sent = 1;
             stream->send_buff.len = 0;
@@ -599,8 +600,7 @@ void _dns_client_check_tcp(void)
             /* Pool QUIC is driven by its exact event deadline and drains decoded
              * streams under the transport guard. Do not consume its UDP input here. */
 			if (server_info->ssl && !server_info->service) {
-				_ssl_do_handevent(server_info);
-				if (SSL_get_shutdown(server_info->ssl) != 0) {
+				if (!_ssl_do_handevent(server_info) || SSL_get_shutdown(server_info->ssl) != 0) {
 					_dns_client_close_socket_ext(server_info, 1);
 					tlog(TLOG_DEBUG, "quick server %s:%d shutdown.", server_info->ip, server_info->port);
 				}

@@ -107,11 +107,6 @@ static int _dns_client_http2_mod_epoll_events(struct dns_server_info *server_inf
 	return 0;
 }
 
-static int _dns_client_http2_retry_later_events(int err)
-{
-	return err == ENOSPC ? EPOLLIN : (EPOLLIN | EPOLLOUT);
-}
-
 static int _dns_client_http2_ctx_events(struct dns_server_info *server, struct http2_ctx *http2_ctx)
 {
 	int epoll_events = EPOLLIN;
@@ -159,6 +154,13 @@ static void _dns_http2_release_write_owner(struct dns_server_info *server)
     struct dns_conn_stream *owner = server->http2_write_owner;
     server->http2_write_owner = NULL;
     if (owner) _dns_client_conn_stream_put(owner);
+}
+
+static void _dns_http2_complete_write_owner(struct dns_server_info *server)
+{
+    struct dns_conn_stream *owner = server->http2_write_owner;
+    if (owner && owner->query)
+        _dns_attempt_progress_update(owner->query, server, owner->attempt_generation, 1, 0);
 }
 
 static int _dns_http2_owner_pending(struct dns_server_info *server, struct http2_ctx *ctx)
@@ -233,7 +235,7 @@ static int _dns_client_send_http2_stream(struct dns_server_info *server_info, st
 	conn_stream->http2_stream = http2_stream;
 	pthread_mutex_unlock(&server_info->lock);
 	http2_stream_set_ex_data(http2_stream, conn_stream);
-    if (!_dns_http2_owner_pending(server_info, http2_ctx)) _dns_http2_release_write_owner(server_info);
+    if (!_dns_http2_owner_pending(server_info, http2_ctx)) { _dns_http2_complete_write_owner(server_info); _dns_http2_release_write_owner(server_info); }
 	http2_ctx_put(http2_ctx);
 	return DNS_CLIENT_HTTP2_STREAM_SEND_OK;
 
@@ -443,7 +445,7 @@ static int _dns_client_flush_http2_writes(struct dns_server_info *server, struct
         if (result < 0 && result != HTTP2_ERR_EAGAIN) return -1;
         if (server->http2_policy_blocked || result == HTTP2_ERR_EAGAIN) break;
 	}
-    if (!_dns_http2_owner_pending(server, http2_ctx)) _dns_http2_release_write_owner(server);
+    if (!_dns_http2_owner_pending(server, http2_ctx)) { _dns_http2_complete_write_owner(server); _dns_http2_release_write_owner(server); }
     return 0;
 }
 
@@ -710,6 +712,7 @@ static int _dns_client_http2_process_stream_one(struct dns_server_info *server_i
 
 	/* Check HTTP status code first */
 	int status = http2_stream_get_status(http2_stream);
+    if (status >= 200) _dns_attempt_progress_update(conn_stream->query, server_info, conn_stream->attempt_generation, 0, status);
     if (status >= 100 && status < 200 && status != 101) return 0;
 	if (status > 0 && status != 200) {
         _dns_service_diagnostic_http(conn_stream->query, server_info, status);

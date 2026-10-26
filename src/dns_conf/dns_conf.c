@@ -171,6 +171,8 @@ static int _config_server_name(void *data, int argc, char *argv[])
 }
 
 static struct config_item _config_item[] = {
+    CONF_YESNO("upstream-multi-wan", &dns_conf.upstream_multi_wan),
+    CONF_CUSTOM("upstream-wan-interfaces", _config_upstream_wan_interfaces, NULL),
 	CONF_CUSTOM("any-response-mode", _config_any_mode, NULL),
 	CONF_CUSTOM("any-aggregate-types", _config_any_types, NULL),
 	CONF_CUSTOM("any-aggregate-concurrency", _config_any_number, group_member(any.concurrency)),
@@ -399,6 +401,7 @@ void dns_server_load_exit(void)
 	_config_proxy_table_destroy();
 	_config_plugin_table_destroy();
 	_config_plugin_table_conf_destroy();
+	_config_domain_rule_pool_clear();
 
 	dns_conf.server_num = 0;
 	dns_server_bind_destroy();
@@ -626,9 +629,8 @@ static int _dns_conf_normalize_pool_compat(void)
 			if (written < 0 || (size_t)written >= sizeof(address_list) - used) break;
 			used += (size_t)written;
 		}
-		tlog(TLOG_WARN, "%s:%u: legacy RR %s normalized in memory to one service %s; preserve common authority/security/routing options and replace RR/address options with: -upstream-ip-pool -host-ip %s -max-upstream-backends %u -max-upstream-connections %u; actual-send RR and service-v1 counters now apply; configuration file unchanged",
-			s->source_file, s->source_line, s->quota_group, s->authority, address_list,
-			s->max_upstream_backends, s->max_upstream_connections);
+		tlog(TLOG_WARN, "%s:%u: legacy RR %s normalized in memory to one service %s; preserve authority/security/routing options and use -upstream-service -host-ip %s; destinations are failover candidates, not quota multipliers; configure WAN exits explicitly; configuration file unchanged",
+			s->source_file, s->source_line, s->quota_group, s->authority, address_list);
 	}
 	ret = 0;
 out:
@@ -670,6 +672,55 @@ static int _dns_conf_verify_pool_bootstrap(void)
 	return 0;
 }
 
+int _config_upstream_wan_resolve(void)
+{
+    if (dns_conf.upstream_multi_wan && !dns_conf.upstream_wan_count) {
+        tlog(TLOG_ERROR, "upstream-multi-wan requires an explicit interface selection"); return -1;
+    }
+    for (int i = 0; i < dns_conf.server_num; i++) {
+        struct dns_servers *s = &dns_conf.servers[i];
+        int explicit = s->upstream_wan_mode == 2;
+        int enabled = explicit || (!s->upstream_wan_mode && dns_conf.upstream_multi_wan);
+        int excluded = s->proxyname[0] || s->ifname[0] || s->type == DNS_SERVER_MDNS || _pool_is_bootstrap(s);
+        if (excluded && explicit) {
+            tlog(TLOG_ERROR, "upstream-wan cannot override proxy, interface, bootstrap or mDNS ownership"); return -1;
+        }
+        if (!enabled || excluded || s->pool_compat_skip) {
+            s->upstream_wan_count = 0;
+            if (s->pool_compat_skip) continue;
+            if (!s->adaptive_query_rate && !s->upstream_ip_pool && !s->upstream_service) {
+                if (s->upstream_path_options) return -1;
+                continue;
+            }
+            if (_pool_is_bootstrap(s) || s->type == DNS_SERVER_MDNS) return -1;
+        }
+        else if (!explicit) {
+            s->upstream_wan_count = dns_conf.upstream_wan_count;
+            memcpy(s->upstream_wan_interfaces, dns_conf.upstream_wan_interfaces, sizeof(s->upstream_wan_interfaces));
+        }
+        if (enabled && !excluded && !s->upstream_wan_count) return -1;
+        if (s->upstream_ip_pool && !check_is_ipaddr(s->server) && !s->upstream_wan_count && !s->adaptive_query_rate && !s->upstream_service) return -1;
+        if (!check_is_ipaddr(s->server) && !s->pool_ip_count) {
+            safe_strncpy(s->pool_ips[0], s->server, sizeof(s->pool_ips[0])); s->pool_ip_count = 1;
+        }
+        /* Preserve an ordinary host-ip's explicit numeric destination while
+         * restoring the original authority for SNI and HTTP Host. */
+        if (s->authority[0]) safe_strncpy(s->server, s->authority, sizeof(s->server));
+        s->upstream_ip_pool = 1;
+        s->max_upstream_backends = s->upstream_wan_count ? s->upstream_wan_count * 2 : 2;
+        s->max_upstream_connections = 0;
+        if (!s->upstream_response_timeout_ms) s->upstream_response_timeout_ms = 5000;
+        if (!s->upstream_query_timeout_ms) s->upstream_query_timeout_ms = 8000;
+        if (!s->upstream_connect_timeout_ms) s->upstream_connect_timeout_ms = 3000;
+        if (!s->upstream_keepalive_ms && !s->upstream_keepalive_disabled) s->upstream_keepalive_ms = 30000;
+        s->upstream_connect_delay_ms = s->upstream_connect_delay_ms ? s->upstream_connect_delay_ms - 1 : 250;
+        if (s->upstream_response_timeout_ms > s->upstream_query_timeout_ms ||
+            s->upstream_connect_timeout_ms > s->upstream_query_timeout_ms) return -1;
+        if ((s->upstream_path_options & (1U << 6)) && s->type != DNS_SERVER_HTTPS && s->type != DNS_SERVER_HTTP3) return -1;
+    }
+    return 0;
+}
+
 static int _dns_conf_load_post(void)
 {
 	_config_current_group_pop_to_default();
@@ -687,6 +738,7 @@ static int _dns_conf_load_post(void)
 	_dns_conf_group_post();
 	if (_config_any_verify() != 0) return -1;
 	if (_dns_conf_normalize_pool_compat() != 0) return -1;
+    if (_config_upstream_wan_resolve() != 0) return -1;
 	if (_dns_conf_verify_pool_bootstrap() != 0) return -1;
 
 	_dns_conf_dns64_post();

@@ -717,6 +717,29 @@ fn test_rest_api_cache_domains() {
 }
 
 #[test]
+fn test_rest_api_network_interfaces_requires_auth_and_has_no_wan_side_effect() {
+    let mut server = common::TestServer::new();
+    assert!(server.start().is_ok());
+    let mut client = common::TestClient::new(&server.get_host());
+    let (status, _) = client.get("/api/network/interfaces").unwrap();
+    assert_eq!(status, 401);
+    client.login("admin", "password").unwrap();
+    let (status, body) = client.get("/api/network/interfaces").unwrap();
+    assert_eq!(status, 200);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let rows = value["interface_list"].as_array().unwrap();
+    assert!(rows.len() <= 256);
+    let mut indices = std::collections::BTreeSet::new();
+    for row in rows {
+        assert!(indices.insert(row["index"].as_u64().unwrap()));
+        assert!(row["name"].is_string()); assert!(row["up"].is_boolean());
+        assert!(row["address4"].is_string()); assert!(row["address6"].is_string());
+        assert!(row.get("selected").is_none()); // inventory never silently enables a NIC
+        assert!(row.get("wan").is_none()); // interface flags cannot prove an Internet exit
+    }
+}
+
+#[test]
 fn test_rest_api_service_pool_configuration_and_backend_identity() {
     let mut server = common::TestServer::new();
     server.enable_mock_server();
@@ -742,8 +765,8 @@ fn test_rest_api_service_pool_configuration_and_backend_identity() {
         let pools: Vec<_> = rows.iter().filter(|row| row.service.as_ref().map(|v| v.pool_enabled).unwrap_or(false)).collect();
         let ready = pools.len()==3 && pools.iter().all(|row| {
             let service=row.service.as_ref().unwrap();
-            service.freshness_status=="non_expiring" && service.endpoint_count==2 &&
-                service.diagnostics.as_ref().map(|d| d.backends.len()==2).unwrap_or(false) && service.diagnostics.as_ref()
+            service.freshness_status=="non_expiring" && service.endpoint_count==1 &&
+                service.diagnostics.as_ref().map(|d| d.backends.len()==1).unwrap_or(false) && service.diagnostics.as_ref()
                 .and_then(|d|d.policy.as_ref()).and_then(|p|p.get("paths")).and_then(serde_json::Value::as_array)
                 .map(|paths|paths.len()==2).unwrap_or(false)
         });
@@ -763,8 +786,8 @@ fn test_rest_api_service_pool_configuration_and_backend_identity() {
         assert_eq!(details.freshness_status, "non_expiring");
         assert_eq!(details.freshness_remaining_ms, None);
         let policy=details.diagnostics.as_ref().unwrap().policy.as_ref().unwrap();
-        assert_eq!(policy["version"],1);assert_eq!(policy["response_timeout_ms"],1000);
-        assert_eq!(policy["query_timeout_ms"],3000);assert_eq!(policy["paths"].as_array().unwrap().len(),2);
+        assert_eq!(policy["version"],1);assert_eq!(policy["response_timeout_ms"],5000);
+        assert_eq!(policy["query_timeout_ms"],8000);assert_eq!(policy["paths"].as_array().unwrap().len(),2);
         assert!(policy["events"].as_array().unwrap().len()<=32);
     }
     let ids: std::collections::HashSet<_> = pools.iter()
@@ -791,17 +814,17 @@ fn test_rest_api_service_pool_configuration_and_backend_identity() {
     let row = pools.iter().find(|row| row.host == "resolver.example"
         && row.service.as_ref().unwrap().config_identity.path == "/dns-query").unwrap();
     assert_eq!(row.host, "resolver.example");
-    assert!(row.ip.is_empty());
+    assert_eq!(row.ip, "127.0.0.1", "the logical row exposes its single healthy candidate");
     let details = row.service.as_ref().unwrap();
     assert_eq!(details.stats_semantics, "service-v1");
-    assert_eq!(details.endpoint_count, 2);
-    assert_eq!(details.endpoint_ips, vec!["127.0.0.1", "127.0.0.2"]);
-    assert_eq!(details.backend_cap, 4);
-    assert_eq!(details.connection_cap, 2, "unspecified connections follows actual members, not cap");
+    assert_eq!(details.endpoint_count, 1);
+    assert_eq!(details.endpoint_ips, vec!["127.0.0.1"]);
+    assert_eq!(details.backend_cap, 2);
+    assert_eq!(details.connection_cap, 1, "one WAN keeps one healthy IPv4 connection");
     let (code, body) = client.get(&format!("/api/upstream-server/{}/backends", details.service_id)).unwrap();
     assert_eq!(code, 200);
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(body["backend_list"].as_array().unwrap().len(), 2);
+    assert_eq!(body["backend_list"].as_array().unwrap().len(), 1);
     let (code, _) = client.get("/api/upstream-server/not-an-id/backends").unwrap();
     assert_eq!(code, 400);
     // The historical helper's set_with_auth_header argument actually sets

@@ -16,7 +16,7 @@ struct Routes {
         desired.count=2; std::strcpy(desired.addresses[0].text,"127.0.0.2");
         std::strcpy(desired.addresses[1].text,"::1");
     }
-    ~Routes(){_dns_paths_close();pthread_mutex_destroy(&service.detail_lock);}
+    ~Routes(){_dns_paths_close();std::free(service.failures);std::free(service.event_sources);pthread_mutex_destroy(&service.detail_lock);}
     void refresh(){service.path_refresh_due=0;_dns_paths_refresh(&service,get_tick_count());}
 };
 void route_changes() {

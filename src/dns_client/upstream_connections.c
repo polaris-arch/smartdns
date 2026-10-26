@@ -145,7 +145,11 @@ static void connection_maintain(struct dns_upstream_service *s, struct dns_serve
             goto out;
         } else ep->service_keepalive_tick = now; /* HTTP/1 has no protocol PING. */
     }
-    next_due(s, now, ep->service_keepalive_tick + interval);
+    /* Recent DNS traffic postpones the ping too. Using only the last ping
+     * scheduled an already-expired deadline every 50ms during normal traffic. */
+    last = ep->service_keepalive_tick;
+    if (ep->send_tick > last) last = ep->send_tick;
+    next_due(s, now, interval > ULONG_MAX - last ? ULONG_MAX : last + interval);
 out:
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
     if ((ep->type==DNS_SERVER_HTTP3 || ep->type==DNS_SERVER_QUIC) && _dns_client_quic_buffered(ep))
@@ -166,7 +170,7 @@ void _dns_service_connection_tick(struct dns_upstream_service *s, unsigned long 
         if (pass == 0 ? ep->service_member_id <= s->cursor : ep->service_member_id > s->cursor) continue;
         members[count++] = ep; dns_client_server_info_get(ep);
     }
-    int demand = s->stats.in_flight != 0;
+    int demand = s->stats.in_flight != 0 || __atomic_load_n(&s->background_demand_until, __ATOMIC_ACQUIRE) > now;
     pthread_mutex_unlock(&s->lock);
     for (unsigned i = 0; i < count; i++) connection_maintain(s, members[i], now);
     if (demand && !_dns_policy_service_cooldown(s, now)) {
@@ -177,8 +181,11 @@ void _dns_service_connection_tick(struct dns_upstream_service *s, unsigned long 
             int needs = ep->fd < 0; unsigned family = strchr(ep->ip, ':') ? 6 : 4;
             pthread_mutex_unlock(&ep->lock);
             if (!needs) continue;
-            if (s->race_due > now && s->race_family != family) {
-                next_due(s, now, s->race_due); continue;
+            struct dns_service_wan *wan = s->wan_count ? s->wans + ep->service_wan : NULL;
+            unsigned long race_due = wan ? wan->race_due : s->race_due;
+            unsigned race_family = wan ? wan->race_family : s->race_family;
+            if (race_due > now && race_family != family) {
+                next_due(s, now, race_due); continue;
             }
             _dns_service_prepare_connection(ep);
             unsigned cap = s->flags.max_upstream_connections ? s->flags.max_upstream_connections : s->selected_count;
@@ -195,10 +202,13 @@ void _dns_service_connection_tick(struct dns_upstream_service *s, unsigned long 
                 }
                 continue;
             }
-            s->race_family = family; s->race_due = now + s->config.connect_delay_ms;
+            if (wan) { wan->race_family = family; wan->race_due = now + s->config.connect_delay_ms; }
+            else { s->race_family = family; s->race_due = now + s->config.connect_delay_ms; }
             next_due(s, now, now + s->config.connect_timeout_ms);
-            next_due(s, now, s->race_due);
-            break; /* one new connection per service turn, within its shared cap */
+            next_due(s, now, wan ? wan->race_due : s->race_due);
+            if (!wan) break;
+            /* Different selected WANs warm independently in this bounded turn.
+             * Family staggering belongs to a WAN, never to the entire service. */
         }
     }
     for (unsigned i = 0; i < count; i++) dns_client_server_info_release(members[i]);

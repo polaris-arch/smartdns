@@ -316,6 +316,8 @@ int _dns_server_address_child_start(const struct dns_request *parent, dns_type_t
 	 * reply-TTL policy instead of changing it via no_serve_expired. */
 	copy_context(request, parent);
 	request->prefetch_flags = PREFETCH_FLAGS_NO_DUALSTACK | PREFETCH_FLAGS_NOPREFETCH;
+    request->prefetch_origin_flags = parent->prefetch_origin_flags;
+    request->prefetch_queue_wait_ms = parent->prefetch_queue_wait_ms;
 	/* No connection and no parent_request: neither child can reply directly or
 	 * overwrite a sibling. Native references retain it after this launch ref. */
 	int ret = _dns_server_do_query(request, 0);

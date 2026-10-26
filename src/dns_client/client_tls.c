@@ -40,118 +40,179 @@
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 
-static ssize_t _ssl_read_ext(struct dns_server_info *server, SSL *ssl, void *buff, int num)
+/* SSL_get_error must observe the same operation, thread and error queue.
+ * Keep classification inside the SSL lock, before shutdown/free or another IO.
+ * Copy the bounded queue before logging: OpenSSL3 can report a low-level cause
+ * followed by a generic record-layer error. Never retry a fatal SSL error. */
+struct tls_io_result {
+    int error, system_error;
+    unsigned long first_error;
+};
+static void tls_error_capture_locked(struct dns_server_info *server,
+    unsigned operation, struct tls_io_result *result)
 {
-	ssize_t ret = 0;
-	pthread_mutex_lock(&server->lock);
-	if (server == NULL || buff == NULL || ssl == NULL) {
-		pthread_mutex_unlock(&server->lock);
-		return SSL_ERROR_SYSCALL;
-	}
-	ret = SSL_read(ssl, buff, num);
-	/* HTTP/2 and HTTP/3 bypass the DNS-over-TCP packet parser. Refresh actual
-	 * receive activity here too, including protocol PING/ACK and control data. */
-	if (ret > 0) time(&server->last_recv);
-	pthread_mutex_unlock(&server->lock);
-	return ret;
+    result->first_error = 0;
+    server->service_error_phase = DNS_PHASE_TLS;
+    server->service_error_code = result->error;
+    server->service_system_error = result->system_error;
+    server->service_tls_operation = operation;
+    server->service_error_connection_generation = server->diagnostic_connection_generation;
+    server->service_error_active_attempts = server->active_attempts;
+    server->service_tls_error_count = server->service_tls_error_overflow = 0;
+    memset(server->service_tls_errors, 0, sizeof(server->service_tls_errors));
+    for (unsigned i = 0; i < 16; i++) {
+        unsigned long code = ERR_get_error();
+        if (!code) break;
+        if (!result->first_error) result->first_error = code;
+        if (server->service_tls_error_count < 4)
+            server->service_tls_errors[server->service_tls_error_count++] = code;
+        else server->service_tls_error_overflow++;
+    }
+    if (ERR_peek_error()) { server->service_tls_error_overflow++; ERR_clear_error(); }
+    server->service_tls_error = result->first_error;
+    server->service_normal_close = 0;
 }
-
-static ssize_t _ssl_write_ext2(struct dns_server_info *server, SSL *ssl, const void *buff, int num, uint64_t flags)
+void _ssl_quic_close_normal(struct dns_server_info *server)
 {
-	ssize_t ret = 0;
-	size_t written = 0;
-	pthread_mutex_lock(&server->lock);
-	if (server == NULL || buff == NULL || ssl == NULL) {
-		pthread_mutex_unlock(&server->lock);
-		return SSL_ERROR_SYSCALL;
-	}
-
+    if (!server || !server->service_quic_close_valid) return;
+    uint64_t code = server->service_quic_close_code;
+    int normal = code == 0 || (!server->service_quic_close_transport && server->type == DNS_SERVER_HTTP3 && code == 0x100);
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
-	ret = SSL_write_ex2(ssl, buff, num, flags, &written);
-#elif OPENSSL_VERSION_NUMBER >= 0x10101000L
-	ret = SSL_write_ex(ssl, buff, num, &written);
-#else
-	ret = SSL_write(ssl, buff, num);
-	written = ret;
+    normal |= server->service_quic_close_transport && code == OSSL_QUIC_LOCAL_ERR_IDLE_TIMEOUT;
 #endif
-	pthread_mutex_unlock(&server->lock);
-
-	if (ret <= 0) {
-		return ret;
-	}
-
-	return written;
+    server->service_normal_close = normal && !__atomic_load_n(&server->active_attempts, __ATOMIC_ACQUIRE);
 }
-
+static int tls_quic_close_locked(struct dns_server_info *server)
+{
+#if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
+    if (server->type != DNS_SERVER_QUIC && server->type != DNS_SERVER_HTTP3) return 0;
+    SSL_CONN_CLOSE_INFO info;
+    if (!SSL_get_conn_close_info(server->ssl, &info, sizeof(info))) return 0;
+    server->service_quic_close_valid = 1;
+    server->service_quic_close_local = !!(info.flags & SSL_CONN_CLOSE_FLAG_LOCAL);
+    server->service_quic_close_transport = !!(info.flags & SSL_CONN_CLOSE_FLAG_TRANSPORT);
+    server->service_quic_close_code = info.error_code; server->service_quic_close_frame = info.frame_type;
+    /* HTTP/3 H3_NO_ERROR is application code 0x100; the same transport
+     * number denotes a TLS alert and must not be mistaken for normal closure. */
+    __atomic_store_n(&server->service_protocol_ready, 0, __ATOMIC_RELEASE);
+    _ssl_quic_close_normal(server);
+    return 1;
+#else
+    (void)server; return 0;
+#endif
+}
+static void tls_io_finish_locked(struct dns_server_info *server, SSL *ssl, int ret,
+    unsigned operation, struct tls_io_result *result)
+{
+    result->system_error = errno;
+    result->error = ret > 0 ? SSL_ERROR_NONE : SSL_get_error(ssl, ret);
+    result->first_error = 0;
+    if (result->error == SSL_ERROR_NONE || result->error == SSL_ERROR_WANT_READ ||
+        result->error == SSL_ERROR_WANT_WRITE) return;
+    tls_error_capture_locked(server, operation, result);
+    int eof = result->error == SSL_ERROR_ZERO_RETURN ||
+        (result->error == SSL_ERROR_SYSCALL && !result->system_error);
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+    eof |= result->error == SSL_ERROR_SSL &&
+        ERR_GET_REASON(result->first_error) == SSL_R_UNEXPECTED_EOF_WHILE_READING;
+#endif
+#ifdef SSL_R_STREAM_FINISHED
+    eof |= result->error == SSL_ERROR_SSL && ERR_GET_REASON(result->first_error) == SSL_R_STREAM_FINISHED;
+#endif
+    /* An idle peer close is lifecycle evidence; an in-flight close still fails
+     * the outstanding attempt. Retain the close's actual TLS/errno evidence. */
+    server->service_normal_close = eof && !server->active_attempts;
+    tls_quic_close_locked(server);
+}
+static ssize_t _ssl_read_ext(struct dns_server_info *server, SSL *ssl, void *buff, int num,
+    struct tls_io_result *result)
+{
+    if (!server || !buff || !ssl) { errno = EINVAL; return -1; }
+    pthread_mutex_lock(&server->lock);
+    ERR_clear_error(); errno = 0;
+    int ret = SSL_read(ssl, buff, num);
+    tls_io_finish_locked(server, ssl, ret, DNS_TLS_OP_READ, result);
+    if (ret > 0) time(&server->last_recv);
+    pthread_mutex_unlock(&server->lock);
+    errno = result->system_error;
+    return ret;
+}
+static ssize_t _ssl_write_ext2(struct dns_server_info *server, SSL *ssl, const void *buff, int num,
+    uint64_t flags, struct tls_io_result *result)
+{
+    if (!server || !buff || !ssl) { errno = EINVAL; return -1; }
+    size_t written = 0;
+    pthread_mutex_lock(&server->lock);
+    ERR_clear_error(); errno = 0;
+#if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
+    int ret = SSL_write_ex2(ssl, buff, num, flags, &written);
+#elif OPENSSL_VERSION_NUMBER >= 0x10101000L
+    int ret = SSL_write_ex(ssl, buff, num, &written);
+#else
+    int ret = SSL_write(ssl, buff, num);
+    if (ret > 0) written = ret;
+#endif
+    tls_io_finish_locked(server, ssl, ret, DNS_TLS_OP_WRITE, result);
+    pthread_mutex_unlock(&server->lock);
+    errno = result->system_error;
+    return ret > 0 ? (ssize_t)written : ret;
+}
 int _ssl_shutdown(struct dns_server_info *server)
 {
-	int ret = 0;
-	pthread_mutex_lock(&server->lock);
-	if (server == NULL || server->ssl == NULL) {
-		pthread_mutex_unlock(&server->lock);
-		return SSL_ERROR_SYSCALL;
-	}
-
-	ret = SSL_shutdown(server->ssl);
-	pthread_mutex_unlock(&server->lock);
-	return ret;
-}
-
-static int _ssl_get_error_ext(struct dns_server_info *server, SSL *ssl, int ret)
-{
-	int err = 0;
-	pthread_mutex_lock(&server->lock);
-	if (server == NULL || ssl == NULL) {
-		pthread_mutex_unlock(&server->lock);
-		return SSL_ERROR_SYSCALL;
-	}
-
-    int system_error = errno;
-	err = SSL_get_error(ssl, ret);
-    if (err != SSL_ERROR_NONE && err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
-        server->service_error_phase = DNS_PHASE_TLS;
-        server->service_error_code = err; server->service_system_error = system_error;
-        server->service_tls_error = ERR_peek_error();
-        if (err == SSL_ERROR_ZERO_RETURN && !server->active_attempts) server->service_normal_close = 1;
+    if (!server) return -1;
+    pthread_mutex_lock(&server->lock);
+    /* Fatal SSL/SYSCALL errors require immediate release, not more TLS IO. */
+    if (!server->ssl || (server->service_error_phase == DNS_PHASE_TLS &&
+        (server->service_error_code == SSL_ERROR_SSL || server->service_error_code == SSL_ERROR_SYSCALL ||
+         (server->service_tls_operation == DNS_TLS_OP_EVENTS && !server->service_normal_close)))) {
+        pthread_mutex_unlock(&server->lock); return -1;
     }
-	pthread_mutex_unlock(&server->lock);
-	return err;
+    ERR_clear_error(); errno = 0;
+    int ret = SSL_shutdown(server->ssl);
+    int error = errno;
+    pthread_mutex_unlock(&server->lock);
+    errno = error;
+    return ret;
 }
-
-static int _ssl_get_error(struct dns_server_info *server, int ret)
+static int _ssl_do_handshake(struct dns_server_info *server, struct tls_io_result *result)
 {
-	return _ssl_get_error_ext(server, server->ssl, ret);
+    if (!server) { errno = EINVAL; return -1; }
+    pthread_mutex_lock(&server->lock);
+    if (!server->ssl) { pthread_mutex_unlock(&server->lock); errno = EINVAL; return -1; }
+    ERR_clear_error(); errno = 0;
+    int ret = SSL_do_handshake(server->ssl);
+    tls_io_finish_locked(server, server->ssl, ret, DNS_TLS_OP_HANDSHAKE, result);
+    pthread_mutex_unlock(&server->lock);
+    errno = result->system_error;
+    return ret;
 }
-
-static int _ssl_do_handshake(struct dns_server_info *server)
-{
-	int err = 0;
-	pthread_mutex_lock(&server->lock);
-	if (server == NULL || server->ssl == NULL) {
-		pthread_mutex_unlock(&server->lock);
-		return SSL_ERROR_SYSCALL;
-	}
-
-	err = SSL_do_handshake(server->ssl);
-	pthread_mutex_unlock(&server->lock);
-	return err;
-}
-
 int _ssl_do_handevent(struct dns_server_info *server)
 {
-	int err = 0;
-	pthread_mutex_lock(&server->lock);
-	if (server == NULL || server->ssl == NULL) {
-		pthread_mutex_unlock(&server->lock);
-		return SSL_ERROR_SYSCALL;
-	}
+    if (!server) return 0;
+    pthread_mutex_lock(&server->lock);
+    if (!server->ssl) { pthread_mutex_unlock(&server->lock); return 0; }
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
-	err = SSL_handle_events(server->ssl);
+    ERR_clear_error(); errno = 0;
+    int ret = SSL_handle_events(server->ssl);
+    int saved_errno = errno;
+    /* SSL_get_error is not defined for SSL_handle_events. Preserve the actual
+     * queue and errno, leaving its SSL error classification unknown (zero). */
+    struct tls_io_result result = {.error = 0, .system_error = saved_errno};
+    if (!ret) tls_error_capture_locked(server, DNS_TLS_OP_EVENTS, &result);
+    if (tls_quic_close_locked(server)) {
+        if (ret) {
+            int normal = server->service_normal_close;
+            tls_error_capture_locked(server, DNS_TLS_OP_EVENTS, &result);
+            server->service_normal_close = normal;
+        }
+        ret = 0; /* consume a persistent connection-close readiness event */
+    }
 #else
-	err = SSL_ERROR_SYSCALL;
+    int ret = 1, saved_errno = errno;
 #endif
-	pthread_mutex_unlock(&server->lock);
-	return err;
+    pthread_mutex_unlock(&server->lock);
+    errno = saved_errno;
+    return ret;
 }
 
 static int _ssl_session_reused(struct dns_server_info *server)
@@ -571,12 +632,13 @@ int _dns_client_socket_ssl_send_ext(struct dns_server_info *server, SSL *ssl, co
 		return -1;
 	}
 
-	ret = _ssl_write_ext2(server, ssl, buf, num, flags);
+	struct tls_io_result io = {.error = SSL_ERROR_SYSCALL};
+	ret = _ssl_write_ext2(server, ssl, buf, num, flags, &io);
 	if (ret > 0) {
 		return ret;
 	}
 
-	ssl_ret = _ssl_get_error_ext(server, ssl, ret);
+	ssl_ret = io.error;
 	switch (ssl_ret) {
 	case SSL_ERROR_NONE:
 	case SSL_ERROR_ZERO_RETURN:
@@ -592,14 +654,7 @@ int _dns_client_socket_ssl_send_ext(struct dns_server_info *server, SSL *ssl, co
 		break;
 	case SSL_ERROR_SSL: {
 		char buff[256];
-		ssl_err = ERR_get_error();
-		int ssl_reason = ERR_GET_REASON(ssl_err);
-		if (ssl_reason == SSL_R_UNINITIALIZED || ssl_reason == SSL_R_PROTOCOL_IS_SHUTDOWN ||
-			ssl_reason == SSL_R_BAD_LENGTH || ssl_reason == SSL_R_SHUTDOWN_WHILE_IN_INIT ||
-			ssl_reason == SSL_R_BAD_WRITE_RETRY) {
-			errno = EAGAIN;
-			return -1;
-		}
+		ssl_err = io.first_error;
 
 		tlog(TLOG_WARN, "server %s SSL write fail error: %s", server->ip, ERR_error_string(ssl_err, buff));
 		errno = EFAULT;
@@ -628,12 +683,13 @@ int _dns_client_socket_ssl_recv_ext(struct dns_server_info *server, SSL *ssl, vo
 		return -1;
 	}
 
-	ret = _ssl_read_ext(server, ssl, buf, num);
+	struct tls_io_result io = {.error = SSL_ERROR_SYSCALL};
+	ret = _ssl_read_ext(server, ssl, buf, num, &io);
 	if (ret > 0) {
 		return ret;
 	}
 
-	ssl_ret = _ssl_get_error_ext(server, ssl, ret);
+	ssl_ret = io.error;
 	switch (ssl_ret) {
 	case SSL_ERROR_NONE:
 	case SSL_ERROR_ZERO_RETURN:
@@ -650,13 +706,10 @@ int _dns_client_socket_ssl_recv_ext(struct dns_server_info *server, SSL *ssl, vo
 	case SSL_ERROR_SSL: {
 		char buff[256];
 
-		ssl_err = ERR_get_error();
+		ssl_err = io.first_error;
 		int ssl_reason = ERR_GET_REASON(ssl_err);
 
 		switch (ssl_reason) {
-		case SSL_R_UNINITIALIZED:
-			errno = EAGAIN;
-			return -1;
 		case SSL_R_SHUTDOWN_WHILE_IN_INIT:
 		case SSL_R_PROTOCOL_IS_SHUTDOWN:
 #ifdef SSL_R_STREAM_FINISHED
@@ -1090,17 +1143,18 @@ int _dns_client_process_tls(struct dns_server_info *server_info, struct epoll_ev
 
 	if (server_info->status == DNS_SERVER_STATUS_CONNECTING) {
 		/* do SSL handshake */
-		ret = _ssl_do_handshake(server_info);
+		struct tls_io_result io = {.error = SSL_ERROR_SYSCALL};
+		ret = _ssl_do_handshake(server_info, &io);
 		if (ret <= 0) {
 			memset(&fd_event, 0, sizeof(fd_event));
-			ssl_ret = _ssl_get_error(server_info, ret);
+			ssl_ret = io.error;
 			if (_dns_client_ssl_poll_event(server_info, ssl_ret) == 0) {
 				return 0;
 			}
 
 			_dns_client_tls_clear_session(server_info);
 			if (ssl_ret != SSL_ERROR_SYSCALL) {
-				unsigned long ssl_err = ERR_get_error();
+				unsigned long ssl_err = io.first_error;
 				int ssl_reason = ERR_GET_REASON(ssl_err);
 				tlog(TLOG_WARN, "Handshake with %s failed, error no: %s(%d, %d, %d)\n", server_info->ip,
 					 ERR_reason_error_string(ssl_err), ret, ssl_ret, ssl_reason);

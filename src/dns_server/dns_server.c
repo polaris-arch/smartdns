@@ -39,6 +39,7 @@
 #include "neighbor.h"
 #include "ptr.h"
 #include "request.h"
+#include "prefetch.h"
 #include "request_pending.h"
 #include "rules.h"
 #include "server_https.h"
@@ -798,10 +799,17 @@ int dns_server_run(void)
 			pthread_mutex_unlock(&server.request_list_lock);
 		}
 
+        _dns_server_prefetch_run(now);
+        now = get_tick_count();
 		sleep_time = (int)(expect_time - now);
 		if (sleep_time < 0) {
 			sleep_time = 0;
 		}
+        unsigned long refresh_due = _dns_server_prefetch_deadline();
+        if (refresh_due != ULONG_MAX) {
+            unsigned long delay = refresh_due > now ? refresh_due - now : 0;
+            if (delay < (unsigned)sleep_time) sleep_time = delay;
+        }
 
 		num = epoll_wait(server.epoll_fd, events, DNS_MAX_EVENTS, sleep_time);
 		if (num < 0) {
@@ -906,6 +914,7 @@ errout:
 
 int dns_server_init(void)
 {
+    _dns_server_prefetch_start();
 	pthread_mutexattr_t attr;
 	int epollfd = -1;
 	int ret = -1;
@@ -1008,6 +1017,7 @@ void dns_server_stop(void)
 
 void dns_server_exit(void)
 {
+    _dns_server_prefetch_stop();
 	if (is_server_init == 0) {
 		return;
 	}

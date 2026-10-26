@@ -194,11 +194,11 @@ void automatic_pool_case()
     smartdns::Server resolver(smartdns::Server::CREATE_MODE_THREAD);
     ASSERT_TRUE(resolver.Start(config(62773, 62673, 62873)));
     dns_upstream_service_snapshot_v1 before{};
-    ASSERT_TRUE(await_pool(before, [](const auto &s) { return s.endpoint_count == 2; }));
-    EXPECT_EQ(before.backend_cap, 4U); EXPECT_EQ(before.rejected_count, 0U);
+    ASSERT_TRUE(await_pool(before, [](const auto &s) { return s.endpoint_count == 1; }));
+    EXPECT_EQ(before.backend_cap, 2U); EXPECT_EQ(before.rejected_count, 0U);
     EXPECT_GT(bootstrap_queries[0].load(), 0U); EXPECT_GT(bootstrap_queries[1].load(), 0U);
     for (unsigned i = 0; i < 4; i++) ASSERT_TRUE(query_udp("auto-pool-" + std::to_string(i) + ".example", 62773));
-    EXPECT_EQ(sends[0].load(), 2U); EXPECT_EQ(sends[1].load(), 2U);
+    EXPECT_EQ(sends[0].load(), 4U); EXPECT_EQ(sends[1].load(), 0U);
     ASSERT_TRUE(await_pool(before, [](const auto &s) { return s.success_count == 4 && !s.in_flight; }));
     EXPECT_EQ(before.query_count, 4U); EXPECT_EQ(before.attempt_count, 4U);
     EXPECT_EQ(before.failure_count, 0U); EXPECT_EQ(before.skip_count, 0U);
@@ -212,7 +212,7 @@ void automatic_pool_case()
     EXPECT_EQ(stable_id, after.service_id);
     EXPECT_EQ(after.query_count, 4U); EXPECT_EQ(after.success_count, 4U);
     for (unsigned i = 4; i < 6; i++) ASSERT_TRUE(query_udp("auto-pool-" + std::to_string(i) + ".example", 62773));
-    EXPECT_EQ(sends[0].load(), 2U); EXPECT_EQ(sends[1].load(), 4U);
+    EXPECT_EQ(sends[0].load(), 4U); EXPECT_EQ(sends[1].load(), 2U);
     ASSERT_TRUE(await_pool(after, [](const auto &s) { return s.success_count == 6 && !s.in_flight; }));
     EXPECT_EQ(after.query_count, 6U); EXPECT_EQ(after.attempt_count, 6U);
     EXPECT_EQ(after.query_count, after.success_count + after.failure_count + after.skip_count + after.in_flight);
@@ -245,7 +245,7 @@ void precise_listener_recursion_case()
 }
 }
 
-TEST(UpstreamServiceDiscovery, RealBootstrapRrsetWireRoundRobinStableIdentityAndStats)
+TEST(UpstreamServiceDiscovery, RealBootstrapRrsetStickyAddressWithdrawalAndStableIdentity)
 {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT({ automatic_pool_case(); _exit(::testing::Test::HasFailure() ? 1 : 0); },

@@ -385,12 +385,12 @@ void transport_case(bool h2, bool throttle, unsigned nodata_rate = 0, unsigned c
         if (snapshot.success_count == queries && !snapshot.in_flight) break;
         poll(nullptr, 0, 5);
     } while (std::chrono::steady_clock::now() < deadline);
-    EXPECT_EQ(snapshot.endpoint_count, 2U); EXPECT_EQ(snapshot.query_count, queries);
+    EXPECT_EQ(snapshot.endpoint_count, 1U); EXPECT_EQ(snapshot.query_count, queries);
     EXPECT_EQ(snapshot.success_count, queries); EXPECT_EQ(snapshot.failure_count, 0U); EXPECT_EQ(snapshot.skip_count, 0U);
     EXPECT_EQ(snapshot.attempt_count, queries + (throttle ? 1 : 0));
     EXPECT_EQ(first.requests + second.requests, queries + (throttle ? 1 : 0));
-    if (!throttle) EXPECT_LE(std::abs(static_cast<int>(first.requests) - static_cast<int>(second.requests)), 1);
-    EXPECT_EQ(first.connections, 1U); EXPECT_EQ(second.connections, 1U);
+    EXPECT_EQ(second.requests, 0U);
+    EXPECT_EQ(first.connections, 1U); EXPECT_EQ(second.connections, 0U);
     if (h2 && throttle) {
         dns_upstream_policy_snapshot_v1 detail{};
         ASSERT_EQ(dns_client_get_service_policy_v1(snapshot.service_id, &detail), 0);
@@ -438,26 +438,25 @@ void transport_case(bool h2, bool throttle, unsigned nodata_rate = 0, unsigned c
     }
     std::lock_guard<std::mutex> guard(lock);
     if (!throttle) {
-        for (size_t i = 1; i < wire_backend.size(); i++) EXPECT_NE(wire_backend[i - 1], wire_backend[i]);
+        for (size_t i = 1; i < wire_backend.size(); i++) EXPECT_EQ(wire_backend[i - 1], wire_backend[i]);
     } else {
         ASSERT_GE(wire_times.size(), 2U);
         unsigned limited = wire_backend.front();
-        EXPECT_NE(wire_backend[1], limited); // healthy peer remains usable immediately
+        EXPECT_EQ(wire_backend[1], limited); // another IP is not another egress quota
         for (size_t i = 1; i < wire_times.size(); i++) if (wire_backend[i] == limited)
             EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(wire_times[i] - wire_times[0]).count(),
-                cooldown_ms ? cooldown_ms - 10 : 900);
+                cooldown_ms ? cooldown_ms - 10 : 190);
         dns_upstream_endpoint_activity_v1 nodes[2]{};
-        ASSERT_EQ(dns_client_get_service_endpoint_activity_v1(snapshot.service_id, nodes, 2), 2);
-        EXPECT_EQ(nodes[0].http_429 + nodes[1].http_429, 1U);
-        EXPECT_EQ(nodes[0].http_503 + nodes[1].http_503, 0U);
+        ASSERT_EQ(dns_client_get_service_endpoint_activity_v1(snapshot.service_id, nodes, 2), 1);
+        EXPECT_EQ(nodes[0].http_429, 1U); EXPECT_EQ(nodes[0].http_503, 0U);
     }
 }
 } // namespace
-TEST(UpstreamServiceTransport, RealTlsDualBackendRoundRobinAndConnectionReuse) {
+TEST(UpstreamServiceTransport, RealTlsSingleWanReusesOneHealthyAddress) {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT({ transport_case(false, false); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
 }
-TEST(UpstreamServiceTransport, RealH2DualBackendNode429IsolationAndConnectionReuse) {
+TEST(UpstreamServiceTransport, RealH2SingleWan429WaitsWithoutSwitchingIpQuota) {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT({ transport_case(true, true); _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), "");
 }
@@ -535,7 +534,7 @@ void path_transport_case(unsigned cap, bool delayed_response, bool keepalive) {
             "\ncache-size 0\ncache-persist no\nprefetch-domain no\nserve-expired no\ndualstack-ip-selection no\nspeed-check-mode none\nresponse-mode fastest-response\n"));
         auto started=std::chrono::steady_clock::now();ASSERT_TRUE(query_udp("policy-first.example",listener));
         auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count();
-        if(cap==2)EXPECT_LT(elapsed,600);if(cap==1){EXPECT_GE(elapsed,550);EXPECT_LT(elapsed,1500);}
+        if(cap)EXPECT_LT(elapsed,600); // WAN capacity supersedes legacy physical caps
         if(delayed_response){EXPECT_GE(elapsed,650);EXPECT_LT(elapsed,1500);}
         dns_upstream_service_snapshot_v1 info{};ASSERT_EQ(dns_client_get_service_snapshot_v1(&info,1),1);
         EXPECT_EQ(info.attempt_count,1U);EXPECT_EQ(peer.requests,1U);
@@ -559,7 +558,7 @@ TEST(UpstreamServiceTransport, H2SlowValidResponseDoesNotTriggerLegacy500msRetry
 TEST(UpstreamServiceTransport, DualFamilyStaggerFallsBackBeforeStalledTlsTimeout){
     ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({path_transport_case(2,false,false);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }
-TEST(UpstreamServiceTransport, OneConnectionCapCannotRaceBothFamilies){
+TEST(UpstreamServiceTransport, LegacySingleConnectionCapDoesNotDisableWanFamilyFallback){
     ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({path_transport_case(1,false,false);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }
 TEST(UpstreamServiceTransport, H2IdlePingAcknowledgedWithoutDnsBudgetAndReusesSocket){
@@ -582,7 +581,7 @@ void dual_family_case(const char *family,unsigned rate){
     EXPECT_EQ(info.attempt_count,16U);EXPECT_EQ(info.success_count,16U);EXPECT_EQ(info.failure_count,0U);
     if(!strcmp(family,"ipv4")){EXPECT_EQ(a.requests,16U);EXPECT_EQ(b.requests,0U);}
     else if(!strcmp(family,"ipv6")){EXPECT_EQ(a.requests,0U);EXPECT_EQ(b.requests,16U);}
-    else{EXPECT_EQ(a.requests,8U);EXPECT_EQ(b.requests,8U);EXPECT_EQ(a.connections,1U);EXPECT_EQ(b.connections,1U);}
+    else{EXPECT_EQ(a.requests+b.requests,16U);EXPECT_TRUE(a.requests==16U||b.requests==16U);EXPECT_EQ(a.connections+b.connections,1U);}
     dns_upstream_policy_snapshot_v1 details{};ASSERT_EQ(dns_client_get_service_policy_v1(info.service_id,&details),0);
     EXPECT_EQ(details.path_count,2U);EXPECT_EQ(details.kind_counts[DNS_DETAIL_RESPONSE_TIMEOUT],0U);
 }
@@ -593,10 +592,10 @@ TEST(UpstreamServiceTransport, ForcedIPv4StillCarriesValidAaaaNodata){
 TEST(UpstreamServiceTransport, ForcedIPv6UsesActualIpv6TlsSocket){
     ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({dual_family_case("ipv6",0);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }
-TEST(UpstreamServiceTransport, DualFamily20BalancesPerIpAndSharesQps){
+TEST(UpstreamServiceTransport, DualFamily20ReusesHealthyFamilyAndSharesQps){
     ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({dual_family_case("dual",20);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }
-TEST(UpstreamServiceTransport, DualFamily40BalancesPerIpAndSharesQps){
+TEST(UpstreamServiceTransport, DualFamily40ReusesHealthyFamilyAndSharesQps){
     ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({dual_family_case("dual",40);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }
 
@@ -619,21 +618,20 @@ void capped_reuse_case(unsigned rate){
         ASSERT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-query_started).count(),600);
 
         dns_upstream_service_snapshot_v1 info{};ASSERT_EQ(dns_client_get_service_snapshot_v1(&info,1),1);
-        if(info.connection_count>max_connections)max_connections=info.connection_count;EXPECT_LE(info.connection_count,2U);
+        if(info.connection_count>max_connections)max_connections=info.connection_count;EXPECT_LE(info.connection_count,1U);
     }
     auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count();
     fprintf(stderr,"capped reuse rate=%u elapsed=%ldms connections=%u/%u/%u/%u requests=%u/%u/%u/%u\n",rate,(long)elapsed,a.connections.load(),b.connections.load(),c.connections.load(),d.connections.load(),a.requests.load(),b.requests.load(),c.requests.load(),d.requests.load());
     EXPECT_LT(elapsed,80000/rate+1500);
     unsigned hits[]={a.requests,b.requests,c.requests,d.requests};
-    unsigned least=hits[0],most=hits[0];for(unsigned hit:hits){if(hit<least)least=hit;if(hit>most)most=hit;}
-    EXPECT_GT(least,0U);EXPECT_LE(most-least,rate);
-    EXPECT_LT(a.connections+b.connections+c.connections+d.connections,16U);
-    EXPECT_EQ(a.requests+b.requests+c.requests+d.requests,80U);EXPECT_EQ(max_connections,2U);
+    unsigned used=0;for(unsigned hit:hits)if(hit)used++;
+    EXPECT_EQ(used,1U);EXPECT_EQ(a.connections+b.connections+c.connections+d.connections,1U);
+    EXPECT_EQ(a.requests+b.requests+c.requests+d.requests,80U);EXPECT_EQ(max_connections,1U);
 }
 }
-TEST(UpstreamServiceTransport, FourIpsTwoConnectionsReuseAndRotateAt20Qps){
+TEST(UpstreamServiceTransport, FourCandidatesOneHealthyConnectionAt20Qps){
     ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({capped_reuse_case(20);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }
-TEST(UpstreamServiceTransport, FourIpsTwoConnectionsReuseAndRotateAt40Qps){
+TEST(UpstreamServiceTransport, FourCandidatesOneHealthyConnectionAt40Qps){
     ::testing::FLAGS_gtest_death_test_style="threadsafe";ASSERT_EXIT({capped_reuse_case(40);std::exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }

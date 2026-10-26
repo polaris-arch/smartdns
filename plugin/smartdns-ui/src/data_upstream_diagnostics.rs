@@ -25,6 +25,10 @@ pub struct UpstreamDiagnostics {
     #[serde(default)]
     pub policy: Option<serde_json::Value>,
     #[serde(default)]
+    pub failures: Option<serde_json::Value>,
+    #[serde(default)]
+    pub runtime: Option<serde_json::Value>,
+    #[serde(default)]
     pub backends: Vec<crate::data_upstream_server::UpstreamBackendInfo>,
 }
 
@@ -52,7 +56,7 @@ impl UpstreamDiagnostics {
             version: 1, qps: raw.qps, burst: raw.burst, cooldown_ms: raw.cooldown_ms,
             failure_end: named(ENDS, &raw.failure_end)?, skip_end: named(ENDS, &raw.skip_end)?,
             skip_wait: named(WAITS, &raw.skip_wait)?, failure_last_event: named(&last, &raw.failure_last_event)?,
-            events: named(EVENTS, &raw.events)?, client_loop: serde_json::Value::Null, policy: None, backends: Vec::new(),
+            events: named(EVENTS, &raw.events)?, client_loop: serde_json::Value::Null, policy: None, failures: None, runtime: None, backends: Vec::new(),
         })
     }
 
@@ -66,6 +70,8 @@ impl UpstreamDiagnostics {
             return Err("service diagnostic snapshot unavailable".into());
         }
         let mut value = Self::from_snapshot(&base, &raw)?;
+        value.failures = crate::data_upstream_failures::fetch(&id);
+        value.runtime = crate::data_upstream_runtime::fetch(&id);
         value.backends = backends;
         let mut loop_raw: smartdns_c::dns_client_loop_diagnostics_v1 = unsafe { std::mem::zeroed() };
         if unsafe { smartdns_c::dns_client_get_loop_diagnostics_v1(&mut loop_raw) } == 0
@@ -94,13 +100,21 @@ impl UpstreamDiagnostics {
             let context_valid = unsafe { smartdns_c::dns_client_get_service_event_context_v1(id.as_ptr(), &mut context) } == 0
                 && context.version == 1 && context.struct_size as usize == std::mem::size_of_val(&context)
                 && context.event_count as usize <= context.events.len();
+            let mut sources: smartdns_c::dns_upstream_event_sources_v1 = unsafe { std::mem::zeroed() };
+            let sources_valid = unsafe { smartdns_c::dns_client_get_service_sources_v1(id.as_ptr(), &mut sources) } == 0
+                && sources.version == 1 && sources.struct_size as usize == std::mem::size_of_val(&sources)
+                && sources.event_count as usize <= sources.events.len();
             let events: Vec<_> = policy.events[..policy.event_count as usize].iter().map(|e| {
                 // A concurrent writer may advance the companion ring. Missing
                 // context stays absent; never attach a different event's name.
                 let c = if context_valid { context.events[..context.event_count as usize].iter()
                     .find(|c| c.sequence == e.sequence) } else { None };
+                let source = if sources_valid { sources.events[..sources.event_count as usize].iter()
+                    .find(|s| s.sequence == e.sequence) } else { None };
                 serde_json::json!({
                 "sequence": e.sequence, "query_id":e.query_id, "age_ms":e.age_ms, "ip":string(&e.ip), "family":e.family,
+                "origin_flags":source.map(|s|s.origin_flags),"queue_wait_ms":source.map(|s|s.queue_wait_ms),
+                "interface":source.map(|s|string(&s.interface)),"wan_generation":source.map(|s|s.wan_generation),
                 "port":e.port, "kind":e.kind, "phase":e.phase, "code":e.code, "system_error":e.system_error,
                 "elapsed_ms":e.elapsed_ms, "limit_ms":e.limit_ms, "tls_error":e.tls_error, "message":string(&e.message),
                 "timestamp_ms": c.filter(|c| c.unix_ms > 0).map(|c| c.unix_ms),

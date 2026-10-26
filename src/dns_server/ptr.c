@@ -192,6 +192,12 @@ int _dns_server_process_ptr_query(struct dns_request *request)
 		return 0;
 	}
 
+	/* Domain-scoped negative PTR fallback, without cloning the default group.
+	 * Static/local records above retain priority; other qtypes are untouched. */
+	if (_dns_server_get_rule_flags(request) & DOMAIN_FLAG_PTR_SOA) {
+		return _dns_server_reply_SOA(DNS_RC_NOERROR, request);
+	}
+
 	request->passthrough = 1;
 	return -1;
 }
