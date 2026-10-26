@@ -1,8 +1,6 @@
 /* Synthetic, offline reproduction against unmodified upstream production code.
  * No WAN, QPS, PTR policy, WebUI, cache history or private configuration. */
 #include "gtest/gtest.h"
-#include "dns_conf/domain_rule.h"
-#include "dns_conf/dns_conf_group.h"
 #include "include/utils.h"
 #include <cstdio>
 #include <iostream>
@@ -13,6 +11,8 @@
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
+#include "dns_conf/domain_rule.h"
+#include "dns_conf/dns_conf_group.h"
 extern "C" { extern struct dns_conf_group_info *dns_conf_current_group_info; }
 
 namespace {
