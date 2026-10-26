@@ -35,6 +35,15 @@ jobs:
             export UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'
           fi
           make -C test -j4
+          if [[ "$SANITIZERS" == 1 ]]; then
+            # Reproduce unrelated library leaks without any rule-loading workload.
+            set +e
+            timeout --kill-after=5s 60s ./test/test.bin --gtest_filter=LIBHTTP2.StreamClose > library-leak-reproduction.log 2>&1
+            library_result=$?
+            set -e
+            cat library-leak-reproduction.log
+            echo "ISOLATED_LIBRARY_RESULT=$library_result"
+          fi
           # The clean baseline intentionally fails new ownership regressions.
           # Print measurements first so they survive a baseline ASan abort.
           timeout --kill-after=10s 180s ./test/test.bin --gtest_filter='DomainRuleResourceReview.*' --gtest_output=xml:resource-results.xml
@@ -43,10 +52,12 @@ jobs:
         if: always()
         with:
           name: upstream-resource-${{ matrix.sanitizers }}-${{ github.sha }}
-          path: '*results.xml'
+          path: |
+            *results.xml
+            library-leak-reproduction.log
 
   matched-measurement:
-    if: github.ref_name == 'audit/upstream-domain-flags'
+    if: always() && github.ref_name == 'audit/upstream-domain-flags'
     needs: review
     runs-on: ubuntu-24.04
     timeout-minutes: 20
