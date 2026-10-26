@@ -477,6 +477,9 @@ cache-persist no
 
 			smartdns_reg_post_func(Server::StartPost, this);
 			dns_ping_cap_force_enable = 1;
+			// Config parsers and previous in-process instances also use getopt.
+			// Always parse -f again; skipping it can daemonize the test process.
+			optind = 0;
 			smartdns_test_main(args.size(), argv, fds[1], 1);
 			smartdns_reg_post_func(nullptr, nullptr);
 		});

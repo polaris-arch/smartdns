@@ -3,6 +3,7 @@
 extern "C" {
 #include "dns_conf/server.h"
 #include "dns_conf/dns_conf_group.h"
+#include "smartdns/util.h"
 extern struct dns_conf_group_info *dns_conf_current_group_info;
 int dns_conf_pool_normalize_for_test(void);
 int _config_upstream_wan_resolve(void);
@@ -88,7 +89,10 @@ TEST_F(UpstreamPoolConfig, AdaptiveRateOnlyAppliesToEncryptedNonBootstrapService
             std::vector<std::string> args{p.name, "192.0.2.1", "-adaptive-query-rate", "on"};
             if (bootstrap) args.emplace_back("-bootstrap-dns");
             std::vector<char *> argv; for (auto &s : args) argv.push_back(&s[0]); argv.push_back(nullptr);
-            EXPECT_EQ(p.parse(nullptr, args.size(), argv.data()), p.allowed && !bootstrap ? 0 : -1) << p.name << " bootstrap=" << bootstrap;
+            const bool quic = p.parse == _config_server_quic || p.parse == _config_server_http3;
+            const bool supported = !quic || dns_is_quic_supported();
+            EXPECT_EQ(p.parse(nullptr, args.size(), argv.data()), supported && p.allowed && !bootstrap ? 0 : -1)
+                << p.name << " bootstrap=" << bootstrap;
         }
     }
 }
