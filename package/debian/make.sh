@@ -48,6 +48,12 @@ build()
 
 
 	pkgver=$(echo ${VER}| sed 's/^1\.//g')
+	if [ -n "${POLARIS_REVISION:-}" ]; then
+		pkgver=$(python3 "$SMARTDNS_DIR/.github/scripts/prepare-release-assets.py" \
+			--debian-version --version "$VER" --revision "$POLARIS_REVISION") || return 1
+		ARCH=$(python3 "$SMARTDNS_DIR/.github/scripts/prepare-release-assets.py" \
+			--debian-architecture --architecture "${FILEARCH%%-*}") || return 1
+	fi
 	sed -i "s/Version:.*/Version: ${pkgver}/" $ROOT/DEBIAN/control
 	sed -i "s/Architecture:.*/Architecture: $ARCH/" $ROOT/DEBIAN/control
 	chmod 0755 $ROOT/DEBIAN/prerm

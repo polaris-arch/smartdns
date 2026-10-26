@@ -8,12 +8,23 @@ The workflow was compared with upstream commit
 
 ## Names and versions
 
-- Preserve the upstream build version `1.YYYY.MM.DD-HHMM`. It is independent
+- Preserve the filename/application build version `1.YYYY.MM.DD-HHMM`, generated
+  consistently in `Asia/Singapore`. It is independent
   of the human-selected release tag; do not use a tag such as `Release48.4`
   as the package version.
-- Preserve package formats, CPU/platform identifiers, package metadata,
-  dependencies, archive layout, installed executable names and service names.
-  `package/` is unchanged by Polaris distribution naming.
+- Debian package metadata uses `1:1.YYYY.MM.DD-HHMM+polaris.RUN.ATTEMPT`.
+  Epoch 1 sorts above every ordinary epoch-0 repository version, including a
+  later date or upstream release number. Same-minute workflow runs/retries sort
+  by numeric run number/attempt. Debian architectures are explicit (e.g. amd64),
+  rather than `all` for a package containing native code. Both fields are read
+  from every actual DEB before and after distribution renaming.
+- Package names, dependencies, archive layout, executable names and service
+  names retain upstream compatibility. APK/IPK keep native upstream versions:
+  a filename suffix cannot prevent feed upgrades. Use the platform's version
+  lock when mixing those packages with an official feed. Do not claim Debian's
+  epoch protection for APK or legacy IPK. Existing APT holds/preferences remain
+  a separate device policy; this release does not remove them. Explicit forced
+  downgrades or replacement outside the package manager are not version ordering.
 - Add `-polaris` only to each uploaded filename, before the entire extension:
   `smartdns.1.2026.08.05-0921.x86_64-linux-all-polaris.tar.gz`,
   `luci-app-smartdns.1.2026.08.05-0921.all-luci-all-polaris.ipk`,
@@ -37,7 +48,9 @@ build packages and retain an Actions artifact before publishing:
   normal stable tag at the exact workflow commit. Both manual and release-event
   paths validate its name and commit. A version is never guessed from whichever
   upstream release happens to be latest. The former custom `-polaris.N`
-  revision scheme is not used.
+  revision scheme is not used. Fork calendar tags such as
+  `Release2026.10.27-polaris` identify Polaris releases independently of upstream
+  release numbering; package timestamps still come from the actual build.
 - A published GitHub release also invokes the workflow. Its existing tag must
   pass the same check; its prerelease flag is preserved.
 - `target: x86_64` is an explicitly selected partial build (6 uploaded binaries/
@@ -51,7 +64,8 @@ Those need a separately reviewed prerelease path if requested.
 After successful native validation, the release checks require the exact
 nonempty asset set before renaming anything. Missing APKs, unexpected files and
 symlinks fail the workflow instead of silently publishing an incomplete set.
-The rename changes no package bytes. `SHA256SUMS` covers the final public names.
+The rename changes no package bytes; the Debian metadata policy is applied by
+the package builder beforehand. `SHA256SUMS` covers the final public names.
 Release runs are serialized. Nightly cleanup accepts only confirmed HTTP 404
 absence, stops on deletion/API errors, and only removes the `nightly` tag/release.
 No other tag, including `nightly-polaris`, is deleted or updated.

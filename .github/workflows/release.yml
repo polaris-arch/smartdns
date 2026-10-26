@@ -2,6 +2,7 @@ name: Build and Release Artifacts
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  TZ: Asia/Singapore
   BUILD_TARGET: ${{ inputs.target || 'all' }}
 
 on:
@@ -329,6 +330,7 @@ jobs:
         run: |
           # 1. Determine release version
           export RELEASE_VERSION="$(date +"1.%Y.%m.%d-%H%M")"
+          export POLARIS_REVISION="$GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT"
           
           echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
           echo "$RELEASE_VERSION" > release-evidence/package-version.txt
@@ -509,7 +511,10 @@ jobs:
           mv *.tar.gz release-assets/ 2>/dev/null || true
 
           # Enforce the upstream asset set, then suffix only public filenames.
-          # Package bytes, metadata, versions and installed paths are unchanged.
+          # Public names retain the timestamp; Debian metadata carries the fork epoch.
+          python3 .github/scripts/prepare-release-assets.py \
+            --verify-debian --directory release-assets --version "$RELEASE_VERSION" \
+            --revision "$POLARIS_REVISION" > release-evidence/debian-versions.json
           python3 .github/scripts/prepare-release-assets.py \
             --directory release-assets --version "$RELEASE_VERSION" --target "$BUILD_TARGET"
           
@@ -727,6 +732,14 @@ jobs:
           sums = ''.join(r['assets'][n]['sha256'] + '  ' + n + '\n' for n in sorted(expected))
           require(pathlib.Path('release-assets/SHA256SUMS').read_text() == sums, 'checksum manifest mismatch')
           require(pathlib.Path('release-evidence/package-version.txt').read_text().strip() == r['version'], 'package version mismatch')
+          revision = os.environ['GITHUB_RUN_NUMBER'] + '.' + os.environ['GITHUB_RUN_ATTEMPT']
+          expected_deb = mod.debian_version(r['version'], revision)
+          recorded_deb = json.loads(pathlib.Path('release-evidence/debian-versions.json').read_text())
+          actual_deb = mod.verify_debian(pathlib.Path('release-assets'), r['version'], revision)
+          # Producer records pre-suffix names; consumer checks actual public files again.
+          require({mod.distribution_name(n): v for n, v in recorded_deb.items()} == actual_deb,
+                  'Debian fork metadata differs from producer readback')
+          require(all(v == expected_deb for v in actual_deb.values()), 'Debian epoch missing')
           arches = ['arm', 'aarch64', 'x86_64', 'x86'] if r['target'] == 'all' else ['x86_64']
           for arch in arches:
               for suffix in ['toolchain.txt', 'plugin.elf.txt', 'plugin.version.txt', 'plugin.sha256', 'packaged-plugin.sha256']:
@@ -756,7 +769,9 @@ jobs:
           body: |
             Polaris SmartDNS, built from `${{ github.sha }}` on `${{ github.ref_name }}`.
             Native system/QUIC suites, ASan/UBSan and offline comparison must pass before packaging.
-            Distribution filenames add -polaris before their extension; package contents and identities remain upstream-compatible.
+            Distribution filenames add -polaris; installed names and paths remain upstream-compatible.
+            Debian Version uses epoch 1 plus polaris.run-number.attempt to outrank ordinary epoch-0 repository versions.
+            APK/IPK retain their native upstream version format; use package-manager version locks when mixing feeds.
           prerelease: ${{ github.event_name == 'release' && github.event.release.prerelease || false }}
           make_latest: ${{ !(github.event_name == 'release' && github.event.release.prerelease) }}
           files: release-assets/*
@@ -788,6 +803,8 @@ jobs:
             - **Build Time**: ${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
 
             These packages are automatically compiled and updated on every nightly build / manual run.
+            Debian packages use epoch 1 plus polaris.run-number.attempt; ordinary epoch-0 repository packages sort lower.
+            APK/IPK retain native version formats and require version locks when mixing feeds.
           prerelease: true
           make_latest: false
           files: release-assets/*

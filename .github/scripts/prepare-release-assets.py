@@ -2,8 +2,8 @@
 """Check upstream's release asset set and add a distribution-only suffix.
 
 The upstream timestamp version is deliberately independent of its ReleaseN tag.
-Only outer filenames change; package bytes and installed names are never edited.
-See docs/release-packaging.md for the upstream reference and release contract.
+Outer filenames retain the upstream timestamp. Debian metadata uses an explicit
+Polaris epoch/revision; see docs/release-packaging.md for that version contract.
 """
 
 import argparse
@@ -21,6 +21,36 @@ ARCHITECTURES = ("mips", "mipsel", "arm", "aarch64", "x86_64", "x86")
 EXTENSIONS = (".tar.gz", ".ipk", ".apk", ".deb")
 # Polaris changes the release display name, not the upstream nightly tag.
 NIGHTLY_TAG = "nightly"
+DEBIAN_ARCHITECTURES = dict(mips="mips", mipsel="mipsel", arm="armel",
+                            aarch64="arm64", x86_64="amd64", x86="i386")
+
+
+def debian_version(version, revision):
+    if not re.fullmatch(r"1\.[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9]{4}", version or ""):
+        raise ValueError("invalid upstream build timestamp")
+    if not re.fullmatch(r"[1-9][0-9]*\.[1-9][0-9]*", revision or ""):
+        raise ValueError("Polaris revision must be positive workflow run-number.attempt")
+    return f"1:{version}+polaris.{revision}"
+
+
+def verify_debian(directory, version, revision):
+    expected = debian_version(version, revision)
+    results = {}
+    for path in sorted(directory.glob("*.deb")):
+        actual = subprocess.check_output(["dpkg-deb", "-f", str(path), "Version"], text=True).strip()
+        if actual != expected:
+            raise ValueError(f"Debian version mismatch: {path.name}: {actual}")
+        match = re.fullmatch(r"smartdns\." + re.escape(version) +
+                             r"\.([a-z0-9_]+)-debian-all(?:-polaris)?\.deb", path.name)
+        if match is None or match[1] not in DEBIAN_ARCHITECTURES:
+            raise ValueError(f"unrecognized Debian asset architecture: {path.name}")
+        arch = subprocess.check_output(["dpkg-deb", "-f", str(path), "Architecture"], text=True).strip()
+        if arch != DEBIAN_ARCHITECTURES[match[1]]:
+            raise ValueError(f"Debian architecture mismatch: {path.name}: {arch}")
+        results[path.name] = actual
+    if not results:
+        raise ValueError("no Debian packages to verify")
+    return results
 
 
 def gh_api(endpoint, method="GET", missing_ok=False, runner=subprocess.run):
@@ -175,6 +205,35 @@ def prepare(directory, version, target):
 
 class ContractTests(unittest.TestCase):
     version = "1.2026.08.05-0921"
+
+    def test_debian_epoch_and_fork_update_order(self):
+        version = debian_version(self.version, "12.1")
+        for official in ("2026.10.27", "1.2026.10.26-2205-memory-ptr", "9999.12.31-9999"):
+            subprocess.run(["dpkg", "--compare-versions", version, "gt", official], check=True)
+        for newer in ("12.2", "13.1"):
+            subprocess.run(["dpkg", "--compare-versions", debian_version(self.version, newer), "gt", version], check=True)
+        subprocess.run(["dpkg", "--compare-versions", debian_version("1.2026.08.06-0001", "1.1"), "gt", version], check=True)
+        for revision in ("", "0.1", "01.1", "1.0", "-1", "1.1\n", "1;id"):
+            with self.assertRaises(ValueError):
+                debian_version(self.version, revision)
+
+    def test_debian_metadata_readback_rejects_unchanged_official_version(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(ValueError):
+                verify_debian(root, self.version, "12.1")
+            (root / f"smartdns.{self.version}.x86_64-debian-all.deb").touch()
+            with patch("subprocess.check_output", return_value=self.version + "\n"):
+                with self.assertRaises(ValueError):
+                    verify_debian(root, self.version, "12.1")
+            def field(args, **kwargs):
+                return (debian_version(self.version, "12.1") if args[-1] == "Version" else "amd64") + "\n"
+            with patch("subprocess.check_output", side_effect=field):
+                self.assertEqual(len(verify_debian(root, self.version, "12.1")), 1)
+            with patch("subprocess.check_output", side_effect=[debian_version(self.version, "12.1"), "all"]):
+                with self.assertRaises(ValueError):
+                    verify_debian(root, self.version, "12.1")
 
     def test_upstream_counts_and_architectures(self):
         names = expected_assets(self.version, "all")
@@ -397,13 +456,24 @@ def main():
     parser.add_argument("--commit")
     parser.add_argument("--directory", type=Path)
     parser.add_argument("--version")
+    parser.add_argument("--debian-version", action="store_true")
+    parser.add_argument("--debian-architecture", action="store_true")
+    parser.add_argument("--architecture", choices=ARCHITECTURES)
+    parser.add_argument("--verify-debian", action="store_true")
+    parser.add_argument("--revision")
     parser.add_argument("--target", choices=("all", "x86_64"), default="all")
     args = parser.parse_args()
     if args.self_test:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(ContractTests)
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
     try:
-        if args.check_tag is not None:
+        if args.debian_architecture and args.architecture:
+            print(DEBIAN_ARCHITECTURES[args.architecture])
+        elif args.debian_version:
+            print(debian_version(args.version, args.revision))
+        elif args.verify_debian and args.directory:
+            print(json.dumps(verify_debian(args.directory, args.version, args.revision), sort_keys=True))
+        elif args.check_tag is not None:
             check_tag(args.check_tag)
         elif args.clean_nightly and args.repository:
             clean_nightly(args.repository)
