@@ -44,3 +44,41 @@ jobs:
         with:
           name: upstream-resource-${{ matrix.sanitizers }}-${{ github.sha }}
           path: '*results.xml'
+
+  matched-measurement:
+    if: github.ref_name == 'audit/upstream-domain-flags'
+    needs: review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libgtest-dev libssl-dev zlib1g-dev
+          git fetch --no-tags https://github.com/pymumu/smartdns.git dfc9ef4bd947891178924c06070fbccc3ea370ba
+      - name: Official candidate official on the same runner
+        run: |
+          set -euo pipefail
+          mkdir -p measurements
+          cat /proc/cpuinfo > measurements/cpuinfo.txt
+          cc --version > measurements/compiler.txt
+          openssl version > measurements/openssl.txt
+          candidate=$GITHUB_SHA
+          baseline=dfc9ef4bd947891178924c06070fbccc3ea370ba
+          for arm in official-first candidate official-last; do
+            revision=$baseline
+            if [[ "$arm" == candidate ]]; then revision=$candidate; fi
+            git restore --source="$revision" -- src
+            git diff --exit-code "$revision" -- src
+            git ls-tree "$revision" src > "measurements/$arm-source.txt"
+            make -C test clean > "measurements/$arm-build.log" 2>&1
+            make -C test -j4 >> "measurements/$arm-build.log" 2>&1
+            timeout --kill-after=5s 30s ./test/test.bin --gtest_filter=DomainRuleResourceReview.AIndependentOfficialAllocationMeasurements > "measurements/$arm.log" 2>&1
+            grep RESOURCE_MEASURE "measurements/$arm.log"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: matched-measurement-${{ github.sha }}
+          path: measurements/
