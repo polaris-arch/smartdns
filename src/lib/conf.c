@@ -520,6 +520,7 @@ static int load_conf_file(const char *file, const struct config_item *items, con
 	int current_line_wrap = 0;
 	int is_func_found = 0;
 	const char *last_file = NULL;
+	int last_lineno = 0;
 
 	if (handler == NULL) {
 		handler = load_conf_printf;
@@ -635,20 +636,21 @@ static int load_conf_file(const char *file, const struct config_item *items, con
 			conf_getopt_reset();
 			/* call item function */
 			last_file = current_conf_file;
+			last_lineno = current_conf_lineno;
 			current_conf_file = file;
 			current_conf_lineno = line_no;
 			call_ret = items[i].item_func(items[i].item, items[i].data, argc, argv);
 			ret = handler(key, value, file, line_no, call_ret);
+			/* The filename may belong to a caller's stack or a finished thread.
+			 * Restore the outer directive even on handler failure and when NULL. */
+			current_conf_file = last_file;
+			current_conf_lineno = last_lineno;
 			if (ret != 0) {
 				conf_getopt_reset();
 				goto errout;
 			}
 
 			conf_getopt_reset();
-			if (last_file) {
-				current_conf_file = last_file;
-			}
-
 			last_item_index = i;
 			is_func_found = 1;
 			break;

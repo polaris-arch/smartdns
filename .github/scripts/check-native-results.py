@@ -6,6 +6,9 @@ import xml.etree.ElementTree as ET
 
 # Explicit names: deleting/renaming a required fixture must update this reviewed gate.
 COMMON = set("""
+LibConf.CompletedThreadDoesNotLeaveBorrowedFilename
+LibConf.CallbackAndHandlerFailuresRestoreEmptyContext
+LibConf.NestedIncludeRestoresOuterFilenameAndLineOnSuccessAndFailure
 UpstreamCompleted.LateSrvPoolKeepsCompletionWithoutRetryOrEndpointPenalty
 UpstreamCompleted.LateSrvOrdinaryKeepsCompletionWithoutRetry
 UpstreamCompleted.LateUsableAddressStillUsesNativeProcessing
