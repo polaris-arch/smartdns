@@ -1,6 +1,6 @@
 /* Configuration context ownership, including nested callbacks and failure paths. */
 #include "gtest/gtest.h"
-#include "utils.h"
+#include "include/utils.h"
 extern "C" {
 #include "smartdns/lib/conf.h"
 }
