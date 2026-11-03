@@ -28,6 +28,7 @@ struct dns_service_wan {
     char interface[DNS_SERVER_IFNAME_LEN], source4[DNS_UPSTREAM_IP_TEXT_MAX], source6[DNS_UPSTREAM_IP_TEXT_MAX];
     unsigned index, race_family, address_cursor;
     uint64_t generation, winner;
+    char egress_session[65];
     unsigned long race_due, family_retry_at[2];
     struct dns_upstream_policy *policy;
     struct { char ip[DNS_UPSTREAM_IP_TEXT_MAX]; unsigned long valid_until; } candidates[2];
@@ -68,6 +69,7 @@ struct dns_upstream_service {
     struct dns_upstream_pool_config config;
     struct dns_upstream_policy *policy;
     unsigned wan_count;
+    int egress_contract; /* explicit upstream WAN policy, not a lane-count inference */
     struct dns_service_wan wans[DNS_UPSTREAM_WANS_MAX];
     struct dns_upstream_discovery *discovery;
     struct dns_server_info *members[DNS_UPSTREAM_BACKENDS_MAX * 2];
@@ -136,6 +138,8 @@ void _dns_client_loop_diagnostic_wake(void);
 void _dns_client_loop_diagnostic_period(void);
 
 #ifdef TEST
+struct dns_upstream_service *_dns_service_find_test(const char *,int,dns_server_type_t,
+    const struct client_dns_server_flags *);
 void _dns_service_snapshot_test(struct dns_upstream_service *s, struct dns_upstream_service_snapshot_v1 *out);
 #endif
 #ifdef __cplusplus

@@ -77,3 +77,7 @@ Run the build-free contract checks with:
 ```sh
 python3 .github/scripts/prepare-release-assets.py --self-test
 ```
+
+System package archives use numeric UID/GID 0 for installed files, directories, and control scripts. Debian builds normalize ownership independently of the CI account; release validation rejects a DEB whose control or filesystem archive contains another owner. Linux and LuCI archives use the same root ownership convention as the OpenWrt and Optware packages.
+
+APKv3 builds use private package directories and normalize a helper-owned snapshot with real root privileges (root or noninteractive sudo). The helper rejects invalid or linked input/output paths, leaves the original staging tree untouched, extracts the completed package as root into a private verification directory, and rejects any extracted file or directory whose numeric UID/GID is not 0. The private snapshot and verification files are removed on exit. This also covers statically linked apk-tools, where LD_PRELOAD fakeroot does not apply.

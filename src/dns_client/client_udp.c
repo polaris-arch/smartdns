@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 
 #include "smartdns/util.h"
+#include "egress_contract.h"
 
 #include "client_socket.h"
 #include "client_udp.h"
@@ -48,24 +49,9 @@ static int _dns_client_create_socket_udp_proxy(struct dns_server_info *server_in
 		goto errout;
 	}
 
-	if (server_info->so_mark >= 0) {
-		unsigned int so_mark = server_info->so_mark;
-		if (setsockopt(fd, SOL_SOCKET, SO_MARK, &so_mark, sizeof(so_mark)) != 0) {
-			tlog(TLOG_DEBUG, "set socket mark failed, %s", strerror(errno));
-		}
-	}
 
-	if (server_info->flags.ifname[0] != '\0') {
-		struct ifreq ifr;
-		memset(&ifr, 0, sizeof(struct ifreq));
-		safe_strncpy(ifr.ifr_name, server_info->flags.ifname, sizeof(ifr.ifr_name));
-		ioctl(fd, SIOCGIFINDEX, &ifr);
-		if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(struct ifreq)) < 0) {
-			tlog(TLOG_ERROR, "bind socket to device %s failed, %s\n", ifr.ifr_name, strerror(errno));
-			goto errout;
-		}
-	}
 
+	if (_dns_socket_prepare(server_info, fd)) goto errout;
 	set_fd_nonblock(fd, 1);
 	set_sock_keepalive(fd, 30, 3, 5);
 	if (dns_conf.dns_socket_buff_size > 0) {
@@ -121,21 +107,13 @@ int _dns_client_create_socket_udp(struct dns_server_info *server_info)
 		goto errout;
 	}
 
+	if (_dns_socket_prepare(server_info, fd)) goto errout;
+
 	if (set_fd_nonblock(fd, 1) != 0) {
 		tlog(TLOG_ERROR, "set socket non block failed, %s", strerror(errno));
 		goto errout;
 	}
 
-	if (server_info->flags.ifname[0] != '\0') {
-		struct ifreq ifr;
-		memset(&ifr, 0, sizeof(struct ifreq));
-		safe_strncpy(ifr.ifr_name, server_info->flags.ifname, sizeof(ifr.ifr_name));
-		ioctl(fd, SIOCGIFINDEX, &ifr);
-		if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(struct ifreq)) < 0) {
-			tlog(TLOG_ERROR, "bind socket to device %s failed, %s\n", ifr.ifr_name, strerror(errno));
-			goto errout;
-		}
-	}
 
 	server_info->fd = fd;
 	server_info->status = DNS_SERVER_STATUS_CONNECTING;
@@ -156,12 +134,6 @@ int _dns_client_create_socket_udp(struct dns_server_info *server_info)
 		return -1;
 	}
 
-	if (server_info->so_mark >= 0) {
-		unsigned int so_mark = server_info->so_mark;
-		if (setsockopt(fd, SOL_SOCKET, SO_MARK, &so_mark, sizeof(so_mark)) != 0) {
-			tlog(TLOG_DEBUG, "set socket mark failed, %s", strerror(errno));
-		}
-	}
 
 	setsockopt(server_info->fd, IPPROTO_IP, IP_RECVTTL, &on, sizeof(on));
 	setsockopt(server_info->fd, SOL_IP, IP_TTL, &val, sizeof(val));
@@ -198,6 +170,7 @@ errout:
 static int _dns_client_process_send_udp_buffer(struct dns_server_info *server_info, struct epoll_event *event,
                                               unsigned long now)
 {
+    if(!_dns_egress_io_allowed(server_info))return -1;
     int send_len = 0;
     if (server_info->send_buff.len <= 0 || server_info->status != DNS_SERVER_STATUS_CONNECTED) return 0;
     while (send_len < server_info->send_buff.len) {
@@ -361,6 +334,7 @@ errout:
 
 static int _dns_client_send_udp_locked(struct dns_server_info *server_info, void *packet, int len)
 {
+    if(!_dns_egress_io_allowed(server_info))return -1;
 	int send_len = 0;
 	const struct sockaddr *addr = &server_info->addr;
 	socklen_t addrlen = server_info->ai_addrlen;

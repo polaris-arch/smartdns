@@ -1,13 +1,9 @@
 /* Bounded production state-machine tests. No public peers or performance loops. */
 #include "gtest/gtest.h"
-extern "C" {
-#include "dns_client/upstream_service.h"
-#include "dns_client/upstream_policy.h"
-#include "dns_client/client_socket.h"
-#include "dns_client/query.h"
-#include "smartdns/util.h"
-}
 #include <arpa/inet.h>
+#include <fstream>
+#include <openssl/ssl.h>
+#include <net/if.h>
 #include <cstring>
 #include <memory>
 #include <thread>
@@ -20,6 +16,17 @@ extern "C" {
 #include <sys/eventfd.h>
 #include <cerrno>
 #include <unistd.h>
+
+extern "C" {
+#include "dns_client/upstream_service.h"
+#include "dns_client/upstream_discovery.h"
+#include "dns_client/upstream_policy.h"
+#include "dns_client/egress_contract.h"
+#include "smartdns/dns_conf.h"
+#include "dns_client/client_socket.h"
+#include "dns_client/query.h"
+#include "smartdns/util.h"
+}
 
 namespace {
 struct ServiceState {
@@ -39,6 +46,7 @@ struct ServiceState {
         s.flags.max_query_rate = rate; s.flags.query_burst = burst;
         s.flags.adaptive_query_rate = adaptive;
         s.wan_count = wans;
+        s.egress_contract=wans>0;
         if (wans) {
             strcpy(s.id, "wan-fixture");
             s.extra_turns = static_cast<dns_service_turn *>(calloc(wans - 1, sizeof(dns_service_turn)));
@@ -747,4 +755,52 @@ TEST(UpstreamServiceState, TransportFailureWaitUsesFixedConfiguredNodeCooldownWi
         }
         EXPECT_EQ(failed->service_failures, 9U);
     }
+}
+
+TEST(UpstreamServiceState, EgressRevocationBlocksFirstWireAndAlreadyStartedContinuation) {
+    struct ContractScope {
+        std::string old,boot,path;
+        ContractScope(){old=dns_conf.upstream_egress_contract;std::ifstream in("/proc/sys/kernel/random/boot_id");in>>boot;
+            char file[]="/tmp/smartdns-wire-XXXXXX";int fd=mkstemp(file);EXPECT_GE(fd,0);close(fd);path=file;strcpy(dns_conf.upstream_egress_contract,path.c_str());}
+        void write(bool ready){std::ofstream out(path);out<<"smartdns-egress-v1 4000 "<<_dns_egress_now()+10000<<" "<<boot<<"\n";
+            if(ready)out<<"lo "<<if_nametoindex("lo")<<" "<<std::string(64,'a')<<" 3\n";out.close();_dns_egress_invalidate();}
+        ~ContractScope(){strcpy(dns_conf.upstream_egress_contract,old.c_str());unlink(path.c_str());_dns_egress_invalidate();}
+    } contract;
+    for(bool partial:{false,true}) {
+        contract.write(true);ServiceState service(1,0,"",0,0,100,1);ServiceQuery query(service);
+        auto *ep=&service.endpoints[0];strcpy(ep->flags.ifname,"lo");strcpy(service.s.wans[0].interface,"lo");
+        query.q.budget=dns_query_budget_new(2,1000);int fd=socket(AF_INET,SOCK_DGRAM,0);ASSERT_GE(fd,0);
+        ASSERT_EQ(_dns_socket_prepare(ep,fd),0);ep->fd=fd;ASSERT_EQ(Pick(service,query),ep);
+        auto gen=_dns_attempt_generation(&query.q,ep);
+        if(partial){ASSERT_EQ(_dns_attempt_wire_begin(&query.q,ep,gen),DNS_ADMIT_OK);_dns_attempt_mark_sent(&query.q,ep,gen);}
+        contract.write(false);EXPECT_EQ(_dns_attempt_wire_begin(&query.q,ep,gen),DNS_ADMIT_DONE);
+        EXPECT_EQ(ep->egress_revoked,1);close(fd);ep->fd=-1;
+    }
+}
+
+namespace {
+std::string prepare_revoke_path;
+void revoke_during_prepare(){unlink(prepare_revoke_path.c_str());_dns_egress_invalidate();}
+TEST(UpstreamServiceState, LeaseRevokedDuringRealConnectionTickIsNotProviderFailure) {
+    struct Scope {
+        std::string saved,boot,path;
+        Scope(){saved=dns_conf.upstream_egress_contract;std::ifstream in("/proc/sys/kernel/random/boot_id");in>>boot;
+            char temp[]="/tmp/egress-prepare-XXXXXX";int fd=mkstemp(temp);EXPECT_GE(fd,0);if(fd>=0)close(fd);path=temp;
+            strcpy(dns_conf.upstream_egress_contract,path.c_str());std::ofstream out(path);
+            out<<"smartdns-egress-v1 4000 "<<(_dns_egress_now()+10000)<<" "<<boot<<"\nlo "<<if_nametoindex("lo")<<" "<<std::string(64,'a')<<" 3\n";out.close();_dns_egress_invalidate();}
+        ~Scope(){_dns_egress_before_bind=nullptr;strcpy(dns_conf.upstream_egress_contract,saved.c_str());unlink(path.c_str());_dns_egress_invalidate();}
+    } scope;
+    std::unique_ptr<SSL_CTX,decltype(&SSL_CTX_free)> tls(SSL_CTX_new(TLS_client_method()),SSL_CTX_free);
+    ASSERT_NE(tls.get(),nullptr);
+    ServiceState state(1,0,"",0,0,100,1);dns_discovery_snapshot desired{};state.s.desired=&desired;
+    state.s.stats.in_flight=1;state.s.flags.set_mark=-1;state.s.config.keepalive_disabled=1;
+    auto *ep=&state.endpoints[0];strcpy(ep->flags.ifname,"lo");strcpy(state.s.wans[0].interface,"lo");
+    ep->ssl_ctx=tls.get();
+    prepare_revoke_path=scope.path;_dns_egress_before_bind=revoke_during_prepare;
+    _dns_service_connection_tick(&state.s,get_tick_count());_dns_egress_before_bind=nullptr;
+    EXPECT_EQ(ep->fd,-1);EXPECT_EQ(ep->egress_revoked,1);EXPECT_EQ(ep->service_failures,0U);
+    EXPECT_EQ(ep->service_retry_at,0U);EXPECT_EQ(state.s.detail.kind_counts[DNS_DETAIL_TRANSPORT_ERROR],0U);
+    EXPECT_EQ(_dns_policy_endpoint_cooldown(ep,get_tick_count()),0U);
+    state.s.stats.in_flight=0;state.s.desired=nullptr;
+}
 }

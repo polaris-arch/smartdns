@@ -421,11 +421,14 @@ static int _dns_client_server_add_ext(const char *server_ip, const char *server_
 	server_info->port = port;
     server_info->service = service;
     if (service) {
+        pthread_mutex_lock(&service->lock);
         for (unsigned i = 0; i < service->wan_count; i++) if (!strcmp(flags->ifname, service->wans[i].interface)) {
             server_info->service_wan = i;
             server_info->service_wan_generation = __atomic_load_n(&service->wans[i].generation, __ATOMIC_ACQUIRE);
+            safe_strncpy(server_info->egress_session, service->wans[i].egress_session, sizeof(server_info->egress_session));
             break;
         }
+        pthread_mutex_unlock(&service->lock);
     }
     _dns_service_get(service);
 	server_info->ai_family = gai->ai_family;

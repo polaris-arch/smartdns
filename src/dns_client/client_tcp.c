@@ -25,6 +25,7 @@
 #include "upstream_policy.h"
 #include "smartdns/lib/stringutil.h"
 #include "smartdns/util.h"
+#include "egress_contract.h"
 
 #include "client_https.h"
 #include "client_socket.h"
@@ -65,28 +66,14 @@ int _dns_client_create_socket_tcp(struct dns_server_info *server_info)
 		goto errout;
 	}
 
-	if (server_info->flags.ifname[0] != '\0') {
-		struct ifreq ifr;
-		memset(&ifr, 0, sizeof(struct ifreq));
-		safe_strncpy(ifr.ifr_name, server_info->flags.ifname, sizeof(ifr.ifr_name));
-		ioctl(fd, SIOCGIFINDEX, &ifr);
-		if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(struct ifreq)) < 0) {
-			tlog(TLOG_ERROR, "bind socket to device %s failed, %s\n", ifr.ifr_name, strerror(errno));
-			goto errout;
-		}
-	}
+
+	if (_dns_socket_prepare(server_info, fd)) goto errout;
 
 	if (set_fd_nonblock(fd, 1) != 0) {
 		tlog(TLOG_ERROR, "set socket non block failed, %s", strerror(errno));
 		goto errout;
 	}
 
-	if (server_info->so_mark >= 0) {
-		unsigned int so_mark = server_info->so_mark;
-		if (setsockopt(fd, SOL_SOCKET, SO_MARK, &so_mark, sizeof(so_mark)) != 0) {
-			tlog(TLOG_DEBUG, "set socket mark failed, %s", strerror(errno));
-		}
-	}
 
 	/* enable tcp fast open */
 	if (setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &yes, sizeof(yes)) != 0) {
@@ -329,6 +316,7 @@ static void _dns_client_sent_stream_detach(struct dns_conn_stream *stream)
 
 int _dns_client_process_stream_writes(struct dns_server_info *server)
 {
+    if(!_dns_egress_io_allowed(server))return -1;
     if (server->status != DNS_SERVER_STATUS_CONNECTED ||
         (server->type == DNS_SERVER_HTTPS && !strncmp(server->alpn_selected, "h2", 2))) return 0;
     int ret = 0;
@@ -549,6 +537,7 @@ errout:
 
 int _dns_client_send_tcp(struct dns_server_info *server_info, void *packet, unsigned short len)
 {
+    if(!_dns_egress_io_allowed(server_info))return -1;
 	int send_len = 0;
 	unsigned char inpacket_data[DNS_IN_PACKSIZE];
 	unsigned char *inpacket = inpacket_data;

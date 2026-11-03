@@ -1,3 +1,4 @@
+#include "egress_contract.h"
 #include "upstream_service.h"
 /* HTTP/3 connection control. Static-only QPACK; no additional QUIC connection. */
 #include "client_http3_control.h"
@@ -176,6 +177,7 @@ static int h3_control_poll(struct dns_server_info *s)
         c->accepts = c->bytes = c->transitions = 0;
     }
     if (!c->local) {
+        if(!_dns_egress_io_allowed(s))return -1;
         c->local = SSL_new_stream(s->ssl, SSL_STREAM_FLAG_UNI);
         if (!c->local) return 1;
     }
@@ -188,6 +190,7 @@ static int h3_control_poll(struct dns_server_info *s)
     static const unsigned char settings[] = {0, 4, 4, 1, 0, 7, 0};
     if (c->sent < sizeof(settings)) {
         size_t written = 0;
+        if(!_dns_egress_io_allowed(s))return -1;
         int ok = SSL_write_ex(c->local, settings + c->sent, sizeof(settings) - c->sent, &written);
         if (!ok) {
             int err = SSL_get_error(c->local, ok);
@@ -207,6 +210,7 @@ static int h3_control_poll(struct dns_server_info *s)
             if (SSL_get_accept_stream_queue_len(s->ssl)) return h3_fail(c, 0x107);
             break;
         }
+        if(!_dns_egress_io_allowed(s))return -1;
         SSL *ssl = SSL_accept_stream(s->ssl, SSL_ACCEPT_STREAM_NO_BLOCK);
         if (!ssl) break;
         if ((SSL_get_stream_id(ssl) & 3) != 3) { SSL_free(ssl); return h3_fail(c, 0x103); }
@@ -223,6 +227,7 @@ static int h3_control_poll(struct dns_server_info *s)
         if (p->used == sizeof(p->data)) return h3_fail(c, 0x107);
         size_t received = 0, room = sizeof(p->data) - p->used;
         if (room > 16384 - c->bytes) room = 16384 - c->bytes;
+        if(!_dns_egress_io_allowed(s))return -1;
         int ok = SSL_read_ex(p->ssl, p->data + p->used, room, &received);
         if (!ok) {
             int err = SSL_get_error(p->ssl, ok);
@@ -242,12 +247,14 @@ static int h3_control_poll(struct dns_server_info *s)
 }
 int _dns_http3_keepalive(struct dns_server_info *s)
 {
+    if(!_dns_egress_io_allowed(s))return -1;
     struct dns_http3_control *c = s->http3_control;
     if (!c || !c->local || c->sent != 7) return 0;
     if (c->fatal || c->goaway) return -1;
     static const unsigned char grease[] = {0x21, 0}; /* RFC 9114 7.2.8 */
     c->keepalive_pending = 1;
     size_t written = 0;
+    if(!_dns_egress_io_allowed(s))return -1;
     int ok = SSL_write_ex(c->local, grease + c->keepalive_offset,
         sizeof(grease) - c->keepalive_offset, &written);
     if (!ok) {
@@ -263,6 +270,7 @@ int _dns_http3_keepalive(struct dns_server_info *s)
 }
 int _dns_http3_control_poll(struct dns_server_info *s)
 {
+    if(!_dns_egress_io_allowed(s))return -1;
     pthread_mutex_lock(&s->lock);
     int was_draining = s->http3_control && s->http3_control->goaway;
     int ret = h3_control_poll(s);
@@ -297,6 +305,7 @@ int _dns_http3_is_draining(struct dns_server_info *s)
 }
 int _dns_http3_control_shutdown(struct dns_server_info *s)
 {
+    if(!_dns_egress_io_allowed(s))return 1;
     struct dns_http3_control *c = s->http3_control;
     if (!c) return 0;
     if (c->transport_fatal) return 1;
@@ -306,6 +315,7 @@ int _dns_http3_control_shutdown(struct dns_server_info *s)
     SSL_SHUTDOWN_EX_ARGS args = {0};
     args.quic_error_code = c->fatal;
     args.quic_reason = "HTTP/3 connection protocol error";
+    if(!_dns_egress_io_allowed(s))return 1;
     SSL_shutdown_ex(s->ssl, SSL_SHUTDOWN_FLAG_NO_BLOCK | SSL_SHUTDOWN_FLAG_NO_STREAM_FLUSH, &args, sizeof(args));
     return 1;
 }

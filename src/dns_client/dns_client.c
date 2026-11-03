@@ -29,6 +29,7 @@
 #include "client_mdns.h"
 #include "client_quic.h"
 #include "client_socket.h"
+#include "egress_contract.h"
 #include "client_tcp.h"
 #include "client_tls.h"
 #include "client_udp.h"
@@ -234,6 +235,9 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 static int _dns_client_process(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now)
 {
     pthread_mutex_lock(&server_info->lock);
+    if (!_dns_egress_io_allowed(server_info)) {
+        pthread_mutex_unlock(&server_info->lock); _dns_client_close_socket(server_info); return -1;
+    }
     server_info->http3_control_epoch++;
     int has_proxy = server_info->proxy != NULL;
     pthread_mutex_unlock(&server_info->lock);
@@ -762,6 +766,9 @@ static void _dns_client_period_run(unsigned int msec)
     pthread_mutex_lock(&client.server_list_lock);
     struct dns_server_info *server;
     list_for_each_entry(server, &client.dns_server_list, list) {
+        if (server->fd >= 0 && !_dns_egress_io_allowed(server)) {
+            server->service_normal_close = 1; _dns_client_close_socket(server); continue;
+        }
         if (server->status != DNS_SERVER_STATUS_CONNECTED) continue;
         /* Datagram transports own no conn_streams or H3 control state. Query
          * expiry/cancellation was handled above; do not prune an empty list. */

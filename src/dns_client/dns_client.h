@@ -145,6 +145,8 @@ struct dns_server_info {
 	struct dns_upstream_policy *policy;
     unsigned service_wan;
     uint64_t service_wan_generation;
+    char egress_session[65];
+    int egress_revoked;
 	unsigned int active_attempts;
 	uint64_t rr_member_id;
 	int policy_connection_held;

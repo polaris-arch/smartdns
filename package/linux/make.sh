@@ -63,7 +63,7 @@ build()
 		exit 1
 	fi
 	cd $PKG_ROOT
-	tar  zcf $OUTPUTDIR/smartdns.$VER.$FILEARCH.tar.gz smartdns
+	tar  zcf $OUTPUTDIR/smartdns.$VER.$FILEARCH.tar.gz --owner=0 --group=0 smartdns
 	if [ $? -ne 0 ]; then
 		echo "create package failed"
 		rm -fr $PKG_ROOT

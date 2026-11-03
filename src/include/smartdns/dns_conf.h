@@ -763,6 +763,7 @@ struct dns_config {
 	struct dns_servers servers[DNS_MAX_SERVERS];
 	int server_num;
     int upstream_multi_wan;
+    char upstream_egress_contract[DNS_MAX_PATH];
     unsigned int upstream_wan_count;
     char upstream_wan_interfaces[DNS_UPSTREAM_WANS_MAX][DNS_SERVER_IFNAME_LEN];
 

@@ -41,8 +41,7 @@ showhelp()
 
 build()
 {
-	ROOT=/tmp/smartdns-openwrt
-	rm -fr $ROOT
+	ROOT=$(mktemp -d /tmp/smartdns-openwrt.XXXXXXXX) || return 1
 
 	mkdir -p $ROOT
 	cp $CURR_DIR/* $ROOT/ -af
@@ -116,7 +115,7 @@ build()
 		APK_VER="`echo $VER | sed 's/[-]/-r/'`"
 		ARCH="`echo $ARCH | sed 's/all/noarch/g'`"
 		echo "Building apk package for arch: $ARCH to $OUTPUTDIR/smartdns.$VER.$FILEARCH.apk..."
-		apk mkpkg \
+		/bin/sh "$SMARTDNS_DIR/package/apk-root.sh" "$ROOT/root/" "$OUTPUTDIR/smartdns.$VER.$FILEARCH.apk" "$(command -v apk)" \
 			--info "name:smartdns" \
 			--info "version:$APK_VER" \
 			--info "description:A smartdns Server" \
@@ -126,7 +125,6 @@ build()
 			--info "depends:libc libpthread" \
 			--script "post-install:$ROOT/control/postinst" \
 			--script "pre-deinstall:$ROOT/control/prerm" \
-			--files "$ROOT/root/" \
 			--output "$OUTPUTDIR/smartdns.$VER.$FILEARCH.apk"
 		if [ $? -ne 0 ]; then
 			echo "build apk package failed."

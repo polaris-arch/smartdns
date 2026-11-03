@@ -19,6 +19,7 @@
 
 #include "smartdns/http_parse.h"
 #include "smartdns/util.h"
+#include "egress_contract.h"
 
 #include "client_http3.h"
 #include "upstream_policy.h"
@@ -57,6 +58,7 @@ static int _dns_client_quic_bio_recvmmsg(BIO *bio, BIO_MSG *msg, size_t stride, 
 
 	*msgs_processed = 0;
 	for (size_t i = 0; i < num_msg; i++) {
+        if(!_dns_egress_io_allowed(server_info))return 0;
 		len = proxy_conn_recvfrom(server_info->proxy, msg[i].data, msg[i].data_len, 0, (struct sockaddr *)&from,
 								  &from_len);
 		if (len < 0) {
@@ -106,6 +108,7 @@ static int _dns_client_quic_bio_sendmmsg(BIO *bio, BIO_MSG *msg, size_t stride, 
 	addr = &server_info->addr;
 	addrlen = server_info->ai_addrlen;
 	for (size_t i = 0; i < num_msg; i++) {
+        if(!_dns_egress_io_allowed(server_info))return 0;
 		len = proxy_conn_sendto(server_info->proxy, msg[i].data, msg[i].data_len, 0, addr, addrlen);
 		if (len < 0) {
 			if (*msgs_processed == 0) {
@@ -253,18 +256,14 @@ int _dns_client_create_socket_quic(struct dns_server_info *server_info, const ch
 		goto errout;
 	}
 
+	if (_dns_socket_prepare(server_info, fd)) goto errout;
+
 	ssl = SSL_new(server_info->ssl_ctx);
 	if (ssl == NULL) {
 		tlog(TLOG_ERROR, "new ssl failed, %s", server_info->ip);
 		goto errout;
 	}
 
-	if (server_info->so_mark >= 0) {
-		unsigned int so_mark = server_info->so_mark;
-		if (setsockopt(fd, SOL_SOCKET, SO_MARK, &so_mark, sizeof(so_mark)) != 0) {
-			tlog(TLOG_DEBUG, "set socket mark failed, %s", strerror(errno));
-		}
-	}
 
 	if (proxy) {
 		ret = proxy_conn_connect(proxy);
@@ -499,6 +498,9 @@ static int _dns_client_process_quic_poll(struct dns_server_info *server_info)
 		pthread_mutex_lock(&server_info->lock);
 		list_for_each_entry_safe(conn_stream, tmp, &server_info->conn_stream_list, server_list)
 		{
+            if(!_dns_egress_io_allowed(server_info)) {
+                pthread_mutex_unlock(&server_info->lock);goto errout;
+            }
 			if (conn_stream->quic_stream == NULL) {
 				continue;
 			}
@@ -516,11 +518,15 @@ static int _dns_client_process_quic_poll(struct dns_server_info *server_info)
 			_dns_client_conn_stream_get(conn_stream);
 			list_del_init(&conn_stream->server_list);
 			list_add_tail(&conn_stream->server_list, &processed_list);
+#ifdef TEST
+            if(_dns_quic_lifecycle_test_hook)_dns_quic_lifecycle_test_hook(server_info,1);
+#endif
 		}
 		pthread_mutex_unlock(&server_info->lock);
 
         if (poll_item_count <= 0) break;
 
+        if(!_dns_egress_io_allowed(server_info))goto errout;
 		ret = SSL_poll(poll_items, poll_item_count, sizeof(SSL_POLL_ITEM), &nz_timeout, SSL_POLL_FLAG_NO_HANDLE_EVENTS, &poll_retcount);
 		if (ret <= 0) {
 			tlog(TLOG_DEBUG, "SSL_poll failed, %d", ret);
@@ -563,7 +569,7 @@ out:
 	if (list_empty(&processed_list)) {
 		pthread_mutex_unlock(&server_info->lock);
 		_dns_client_process_guard_leave(server_info);
-		return 0;
+		return poll_ret;
 	}
 
 	list_for_each_entry_safe(conn_stream, tmp, &processed_list, server_list)
@@ -578,6 +584,10 @@ out:
 	return poll_ret;
 }
 
+#ifdef TEST
+void (*_dns_quic_lifecycle_test_hook)(struct dns_server_info *,unsigned);
+int _dns_client_quic_poll_test(struct dns_server_info *server){return _dns_client_process_quic_poll(server);}
+#endif
 static void _dns_client_quic_consume_send_buffer(struct dns_conn_stream *conn_stream, int send_len)
 {
 	if (send_len <= 0 || conn_stream->send_buff.len <= 0) {
@@ -619,6 +629,10 @@ static int _dns_client_quic_handle_send_result(struct dns_conn_stream *conn_stre
 static int _dns_client_quic_flush_stream(struct dns_server_info *server_info, struct dns_conn_stream *conn_stream,
 										 int *epoll_events)
 {
+#ifdef TEST
+    if(_dns_quic_lifecycle_test_hook)_dns_quic_lifecycle_test_hook(server_info,2);
+#endif
+    if(!_dns_egress_io_allowed(server_info))return -1;
 	if (conn_stream->send_buff.len <= 0) {
 		return 0;
 	}
@@ -634,6 +648,10 @@ static int _dns_client_quic_flush_stream(struct dns_server_info *server_info, st
         if (control > 0) return 0;
     }
 	if (conn_stream->quic_stream == NULL) {
+        if(!_dns_egress_io_allowed(server_info))return -1;
+#ifdef TEST
+        if(_dns_quic_lifecycle_test_hook)_dns_quic_lifecycle_test_hook(server_info,3);
+#endif
 		conn_stream->quic_stream = SSL_new_stream(server_info->ssl, 0);
         if (conn_stream->quic_stream == NULL) return 0; /* stream credit, not connectivity */
 
@@ -658,7 +676,7 @@ static int _dns_client_quic_flush_stream(struct dns_server_info *server_info, st
 	}
 
 	if (send_len < 0 && send_errno == EAGAIN) {
-		if (!_ssl_do_handevent(server_info) && !server_info->service_quic_close_valid) return -1;
+		if ((_ssl_do_handevent(server_info) <= 0 && !server_info->service_quic_close_valid) || server_info->egress_revoked) return -1;
 	}
 
 	return 0;
@@ -712,6 +730,7 @@ int _dns_client_quic_buffered(struct dns_server_info *s)
 
 int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now)
 {
+    if(!_dns_egress_io_allowed(server_info)){_dns_client_close_socket(server_info);return -1;}
     if (server_info->type == DNS_SERVER_HTTP3 && _dns_http3_control_poll(server_info) < 0) {
         _dns_client_close_socket(server_info);
         return -1;
@@ -719,7 +738,7 @@ int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_e
 	/* An ICMP/socket error can be reported without EPOLLIN. Let QUIC consume
 	 * the network event instead of leaving a level-triggered error pending. */
 	if (event->events & (EPOLLIN | EPOLLERR)) {
-		if (!_ssl_do_handevent(server_info) && !server_info->service_quic_close_valid) {
+		if ((_ssl_do_handevent(server_info) <= 0 && !server_info->service_quic_close_valid) || server_info->egress_revoked) {
             _dns_client_close_socket(server_info); return -1;
         }
 

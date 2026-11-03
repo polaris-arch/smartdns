@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import tarfile
 from types import SimpleNamespace
 import unittest
 
@@ -33,6 +34,27 @@ def debian_version(version, revision):
     return f"1:{version}+polaris.{revision}"
 
 
+def verify_debian_ownership(path):
+    # Archive numeric IDs are installed by dpkg, irrespective of the runner name.
+    for kind in ("--ctrl-tarfile", "--fsys-tarfile"):
+        invalid = None
+        with subprocess.Popen(["dpkg-deb", kind, str(path)], stdout=subprocess.PIPE) as child:
+            try:
+                with tarfile.open(fileobj=child.stdout, mode="r|") as archive:
+                    for entry in archive:
+                        if (entry.uid, entry.gid) != (0, 0) and invalid is None:
+                            invalid = entry.name
+                # Consume tar padding before waiting for the producer.
+                while child.stdout.read(65536):
+                    pass
+            finally:
+                child.stdout.close()
+            if child.wait() != 0:
+                raise ValueError(f"cannot inspect Debian ownership: {path.name}")
+        if invalid is not None:
+            raise ValueError(f"Debian archive must use root ownership: {path.name}: {invalid}")
+
+
 def verify_debian(directory, version, revision):
     expected = debian_version(version, revision)
     results = {}
@@ -47,6 +69,7 @@ def verify_debian(directory, version, revision):
         arch = subprocess.check_output(["dpkg-deb", "-f", str(path), "Architecture"], text=True).strip()
         if arch != DEBIAN_ARCHITECTURES[match[1]]:
             raise ValueError(f"Debian architecture mismatch: {path.name}: {arch}")
+        verify_debian_ownership(path)
         results[path.name] = actual
     if not results:
         raise ValueError("no Debian packages to verify")
@@ -229,11 +252,79 @@ class ContractTests(unittest.TestCase):
                     verify_debian(root, self.version, "12.1")
             def field(args, **kwargs):
                 return (debian_version(self.version, "12.1") if args[-1] == "Version" else "amd64") + "\n"
-            with patch("subprocess.check_output", side_effect=field):
+            with patch("subprocess.check_output", side_effect=field), patch(__name__ + ".verify_debian_ownership") as ownership:
                 self.assertEqual(len(verify_debian(root, self.version, "12.1")), 1)
+                ownership.assert_called_once()
             with patch("subprocess.check_output", side_effect=[debian_version(self.version, "12.1"), "all"]):
                 with self.assertRaises(ValueError):
                     verify_debian(root, self.version, "12.1")
+
+    def test_actual_debian_archive_ownership_and_failure_cleanup(self):
+        import gzip
+        import io
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            def make(control_owner=(0, 0), data_owner=(0, 0), malformed=False):
+                (root / "debian-binary").write_bytes(b"2.0\n")
+                for kind, owner, name in [("control", control_owner, "control"),
+                                           ("data", data_owner, "usr/sbin/smartdns")]:
+                    stream = io.BytesIO()
+                    with tarfile.open(fileobj=stream, mode="w") as archive:
+                        entry = tarfile.TarInfo(name)
+                        entry.uid, entry.gid = owner
+                        entry.mode = 0o644
+                        payload = b"Package: ownership-fixture\nVersion: 1\nArchitecture: all\n"
+                        entry.size = len(payload)
+                        archive.addfile(entry, io.BytesIO(payload))
+                    raw = b"x" * 1024 if malformed and kind == "control" else stream.getvalue()
+                    (root / (kind + ".tar.gz")).write_bytes(gzip.compress(raw))
+                path = root / "fixture.deb"
+                path.unlink(missing_ok=True)
+                subprocess.run(["ar", "qc", str(path), "debian-binary", "control.tar.gz", "data.tar.gz"],
+                               cwd=root, check=True, capture_output=True)
+                return path
+            verify_debian_ownership(make())
+            for owners in [((1001, 0), (0, 0)), ((0, 1001), (0, 0)),
+                           ((0, 0), (1001, 0)), ((0, 0), (0, 1001))]:
+                with self.assertRaisesRegex(ValueError, "root ownership"):
+                    verify_debian_ownership(make(*owners))
+            real_popen = subprocess.Popen
+            children = []
+            def producer(*args, **kwargs):
+                child = real_popen(*args, **kwargs)
+                children.append(child)
+                return child
+            for path in [make(malformed=True), root / "invalid.deb"]:
+                children.clear()
+                if path.name == "invalid.deb":
+                    path.write_bytes(b"not a Debian archive")
+                with patch("subprocess.Popen", side_effect=producer):
+                    with self.assertRaises((ValueError, tarfile.TarError)):
+                        verify_debian_ownership(path)
+                self.assertTrue(children)
+                self.assertTrue(all(child.returncode is not None for child in children))
+
+    def test_apk_helper_rejects_unsafe_paths_before_privilege(self):
+        helper = Path(__file__).resolve().parents[2] / "package/apk-root.sh"
+        with tempfile.TemporaryDirectory(prefix="smartdns-openwrt.", dir="/tmp") as tmp:
+            root = Path(tmp)
+            stage = root / "root"
+            stage.mkdir()
+            plain = root / "plain"
+            plain.write_text("fixture")
+            link = root / "linked-stage"
+            link.symlink_to(stage, target_is_directory=True)
+            output = root / "smartdns.fixture.apk"
+            for source in [plain, link]:
+                result = subprocess.run(["/bin/sh", str(helper), str(source), str(output), "/bin/false"],
+                                        capture_output=True)
+                self.assertEqual(result.returncode, 2)
+            output.symlink_to(plain)
+            result = subprocess.run(["/bin/sh", str(helper), str(stage), str(output), "/bin/false"],
+                                    capture_output=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(plain.read_text(), "fixture")
 
     def test_upstream_counts_and_architectures(self):
         names = expected_assets(self.version, "all")

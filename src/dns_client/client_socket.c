@@ -20,6 +20,7 @@
  */
 
 #include "client_socket.h"
+#include "egress_contract.h"
 #include "smartdns/util.h"
 #include "client_http3.h"
 #include "client_https.h"
@@ -220,9 +221,10 @@ again:
     server_info->http2_policy_blocked = 0;
 	server_status = server_info->status;
 	server_info->status = DNS_SERVER_STATUS_DISCONNECTED;
+    if (!server_info->service) server_info->egress_session[0] = 0;
 
 	if (server_info->ssl) {
-        int protocol_shutdown = _dns_http3_control_shutdown(server_info);
+        int protocol_shutdown = server_info->egress_revoked ? 1 : _dns_http3_control_shutdown(server_info);
         _dns_http3_control_free(server_info);
 		/* Shutdown ssl */
 		if (server_status == DNS_SERVER_STATUS_CONNECTED && !protocol_shutdown) {
@@ -237,7 +239,7 @@ again:
 			{
 				if (conn_stream->quic_stream) {
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
-					SSL_stream_reset(conn_stream->quic_stream, NULL, 0);
+					if(_dns_egress_io_allowed(server_info)) SSL_stream_reset(conn_stream->quic_stream, NULL, 0);
 #endif
 					SSL_free(conn_stream->quic_stream);
 					conn_stream->quic_stream = NULL;
@@ -396,6 +398,7 @@ void _dns_client_process_guard_leave(struct dns_server_info *server_info)
 
 int _dns_client_socket_send(struct dns_server_info *server_info)
 {
+    if(!_dns_egress_io_allowed(server_info))return -1;
 	if (server_info->type == DNS_SERVER_UDP) {
 		return -1;
 	} else if (server_info->type == DNS_SERVER_TCP) {

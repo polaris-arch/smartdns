@@ -38,6 +38,11 @@ int _dns_client_send_quic_data(struct dns_query_struct *query, struct dns_server
 int _dns_client_quic_buffered(struct dns_server_info *server_info);
 
 int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now);
+#ifdef TEST
+/* Deterministic lifecycle barriers, compiled only in the native test binary. */
+extern void (*_dns_quic_lifecycle_test_hook)(struct dns_server_info *,unsigned);
+int _dns_client_quic_poll_test(struct dns_server_info *);
+#endif
 #ifdef __cplusplus
 }
 #endif /*__cplusplus */

@@ -73,11 +73,11 @@ build()
 
 	cd $ROOT/control
 	chmod +x *
-	tar zcf ../control.tar.gz ./
+	tar zcf ../control.tar.gz --owner=0 --group=0 ./
 	cd $ROOT
 
-	tar zcf $ROOT/data.tar.gz -C root .
-	tar zcf $OUTPUTDIR/luci-app-smartdns.$VER.$FILEARCH.ipk ./control.tar.gz ./data.tar.gz ./debian-binary
+	tar zcf $ROOT/data.tar.gz --owner=0 --group=0 -C root .
+	tar zcf $OUTPUTDIR/luci-app-smartdns.$VER.$FILEARCH.ipk --owner=0 --group=0 ./control.tar.gz ./data.tar.gz ./debian-binary
 
 	rm -fr $ROOT/
 }

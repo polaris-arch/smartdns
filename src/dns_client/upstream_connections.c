@@ -1,5 +1,6 @@
 /* Bounded connection warmup, family staggering and protocol keepalive. */
 #include "upstream_service.h"
+#include "egress_contract.h"
 #include "upstream_policy.h"
 #include "client_socket.h"
 #include "client_http3_control.h"
@@ -32,6 +33,10 @@ static void connection_maintain(struct dns_upstream_service *s, struct dns_serve
     /* Keep transport objects alive while H2 takes its mutex without ep->lock. */
     _dns_client_process_guard_enter(ep);
     pthread_mutex_lock(&ep->lock);
+    if (ep->fd >= 0 && !_dns_egress_io_allowed(ep)) {
+        ep->service_normal_close = 1;
+        _dns_client_close_socket(ep); goto out;
+    }
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
     if (ep->ssl && (ep->type == DNS_SERVER_HTTP3 || ep->type == DNS_SERVER_QUIC)) {
         struct timeval timeout = {0}; int infinite = 1;
@@ -86,6 +91,7 @@ static void connection_maintain(struct dns_upstream_service *s, struct dns_serve
             _dns_service_endpoint_failure(ep); _dns_client_close_socket(ep); goto out;
         } else next_due(s, now, deadline);
     }
+
     if ((ep->service_draining || ep->service_rotation) && !ep->active_attempts && ep->process_depth == 1 && list_empty(&ep->conn_stream_list)) {
         ep->service_normal_close = 1;
         ep->service_draining = ep->service_rotation = 0;
@@ -209,7 +215,7 @@ void _dns_service_connection_tick(struct dns_upstream_service *s, unsigned long 
             }
             if (_dns_client_create_socket(ep)) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) next_due(s, now, now + 100);
-                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                if (!ep->egress_revoked && errno != EAGAIN && errno != EWOULDBLOCK) {
                     ep->service_system_error = errno;
                     _dns_service_detail(NULL, ep, DNS_DETAIL_TRANSPORT_ERROR, DNS_PHASE_CONNECT, errno, 0, 0);
                     _dns_service_endpoint_failure(ep);

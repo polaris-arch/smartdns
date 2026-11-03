@@ -1,6 +1,7 @@
 /* Transport-family policy, cached kernel routes and bounded diagnostic evidence. */
 #define _GNU_SOURCE
 #include "upstream_observer.h"
+#include "egress_contract.h"
 #include "upstream_policy.h"
 #include "upstream_service.h"
 #include "upstream_discovery.h"
@@ -35,12 +36,16 @@ static void route_monitor(void)
 }
 void _dns_paths_network_tick(void)
 {
+    static uint64_t egress_epoch;
+    uint64_t current = _dns_egress_epoch();
+    if (current != egress_epoch) { egress_epoch = current; route_epoch++; }
     if (route_events < 0) return;
     char data[16384];
     for (unsigned i = 0; i < 64; i++) {
         ssize_t n = recv(route_events, data, sizeof(data), MSG_DONTWAIT);
         if (n < 0) { if (errno == ENOBUFS) route_epoch++; break; }
         if (!n) break;
+        _dns_egress_invalidate();
         route_epoch++;
     }
 }
@@ -72,8 +77,11 @@ static void path_route(struct dns_upstream_service *service, struct dns_upstream
     unsigned char destination[16];
     if (inet_pton(family, out->ip, destination) != 1) { out->state = DNS_PATH_NO_ROUTE; return; }
     route_attribute(&request.header, sizeof(request), RTA_DST, destination, family == AF_INET ? 4 : 16);
-    unsigned mark = (unsigned)service->flags.set_mark, uid = geteuid();
-    if (service->flags.set_mark >= 0) route_attribute(&request.header, sizeof(request), RTA_MARK, &mark, sizeof(mark));
+    unsigned mark = 0, uid = geteuid(); char lease[65];
+    mark = service->flags.set_mark < 0 ? 0 : (unsigned)service->flags.set_mark;
+    int contracted = service->egress_contract ? _dns_egress_lease(interface, family, service->flags.set_mark, &mark, lease) : 0;
+    if (contracted < 0) { out->state = DNS_PATH_BINDING_ERROR; out->system_error = errno; return; }
+    if (contracted || service->flags.set_mark >= 0) route_attribute(&request.header, sizeof(request), RTA_MARK, &mark, sizeof(mark));
     route_attribute(&request.header, sizeof(request), RTA_UID, &uid, sizeof(uid));
     unsigned char protocol = service->type == DNS_SERVER_UDP || service->type == DNS_SERVER_QUIC ||
         service->type == DNS_SERVER_HTTP3 ? IPPROTO_UDP : IPPROTO_TCP;
@@ -117,6 +125,9 @@ static void path_route(struct dns_upstream_service *service, struct dns_upstream
                 inet_ntop(family, RTA_DATA(a), out->source, sizeof(out->source));
         }
         if (index) if_indextoname(index, out->interface);
+        if (interface[0] && strcmp(interface, out->interface)) {
+            out->state = DNS_PATH_BINDING_ERROR; out->system_error = ENETUNREACH; continue;
+        }
         out->state = DNS_PATH_ELIGIBLE;
     }
 }
@@ -151,6 +162,9 @@ static void paths_refresh_wans(struct dns_upstream_service *s)
             if (index != w->index) w->source4[0] = w->source6[0] = 0;
             w->index = index;
         }
+        unsigned contract_mark;
+        w->egress_session[0]=0;
+        if(s->egress_contract)_dns_egress_lease(w->interface, AF_UNSPEC, s->flags.set_mark, &contract_mark, w->egress_session);
         char local_source[2][DNS_UPSTREAM_IP_TEXT_MAX] = {{0}};
         memset(w->candidates, 0, sizeof(w->candidates));
         int up = !w->interface[0];
@@ -206,13 +220,14 @@ static void paths_refresh_wans(struct dns_upstream_service *s)
     pthread_mutex_lock(&s->lock);
     for (unsigned i = 0; i < s->wan_count; i++) {
         struct dns_service_wan *old = s->wans + i, *fresh = next + i;
-        if (!old->generation || old->index != fresh->index || strcmp(old->source4, fresh->source4) || strcmp(old->source6, fresh->source6)) {
+        if (!old->generation || old->index != fresh->index || strcmp(old->source4, fresh->source4) || strcmp(old->source6, fresh->source6) || strcmp(old->egress_session, fresh->egress_session)) {
             __atomic_add_fetch(&old->generation, 1, __ATOMIC_ACQ_REL); __atomic_store_n(&old->winner, 0, __ATOMIC_RELEASE);
             _dns_policy_wan_network_changed(old->policy, now);
             old->race_due = 0;
             __atomic_store_n(&old->family_retry_at[0], 0, __ATOMIC_RELEASE);
             __atomic_store_n(&old->family_retry_at[1], 0, __ATOMIC_RELEASE);
         }
+        memcpy(old->egress_session, fresh->egress_session, sizeof(old->egress_session));
         old->index = fresh->index;
         memcpy(old->source4, fresh->source4, sizeof(old->source4)); memcpy(old->source6, fresh->source6, sizeof(old->source6));
         memcpy(old->candidates, fresh->candidates, sizeof(old->candidates));
@@ -381,7 +396,10 @@ static void service_detail(struct dns_query_struct *query, struct dns_server_inf
 }
 void _dns_service_detail(struct dns_query_struct *query, struct dns_server_info *endpoint,
     unsigned kind, unsigned phase, int code, unsigned elapsed, unsigned limit)
-{ service_detail(query, endpoint, kind, phase, code, elapsed, limit, NULL); }
+{
+    if(endpoint->egress_revoked && (kind==DNS_DETAIL_TRANSPORT_ERROR || kind==DNS_DETAIL_CONNECT_TIMEOUT)) return;
+    service_detail(query, endpoint, kind, phase, code, elapsed, limit, NULL);
+}
 void _dns_service_detail_dns(struct dns_query_struct *query, struct dns_server_info *endpoint,
     unsigned kind, unsigned phase, int code, struct dns_packet *packet)
 { service_detail(query, endpoint, kind, phase, code, 0, 0, packet); }

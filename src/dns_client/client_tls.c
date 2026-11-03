@@ -29,6 +29,7 @@
 
 #include "smartdns/lib/stringutil.h"
 #include "smartdns/util.h"
+#include "egress_contract.h"
 
 #include <net/if.h>
 #include <netinet/ip.h>
@@ -124,11 +125,17 @@ static void tls_io_finish_locked(struct dns_server_info *server, SSL *ssl, int r
     server->service_normal_close = eof && !server->active_attempts;
     tls_quic_close_locked(server);
 }
+static int tls_egress_allowed(struct dns_server_info *server,struct tls_io_result *result)
+{
+    if(_dns_egress_io_allowed(server))return 1;
+    memset(result,0,sizeof(*result));result->error=SSL_ERROR_SYSCALL;result->system_error=ENETDOWN;return 0;
+}
 static ssize_t _ssl_read_ext(struct dns_server_info *server, SSL *ssl, void *buff, int num,
     struct tls_io_result *result)
 {
     if (!server || !buff || !ssl) { errno = EINVAL; return -1; }
     pthread_mutex_lock(&server->lock);
+    if(!tls_egress_allowed(server,result)){pthread_mutex_unlock(&server->lock);return -1;}
     ERR_clear_error(); errno = 0;
     int ret = SSL_read(ssl, buff, num);
     tls_io_finish_locked(server, ssl, ret, DNS_TLS_OP_READ, result);
@@ -143,6 +150,7 @@ static ssize_t _ssl_write_ext2(struct dns_server_info *server, SSL *ssl, const v
     if (!server || !buff || !ssl) { errno = EINVAL; return -1; }
     size_t written = 0;
     pthread_mutex_lock(&server->lock);
+    if(!tls_egress_allowed(server,result)){pthread_mutex_unlock(&server->lock);return -1;}
     ERR_clear_error(); errno = 0;
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
     int ret = SSL_write_ex2(ssl, buff, num, flags, &written);
@@ -161,6 +169,7 @@ int _ssl_shutdown(struct dns_server_info *server)
 {
     if (!server) return -1;
     pthread_mutex_lock(&server->lock);
+    if(!_dns_egress_io_allowed(server)){pthread_mutex_unlock(&server->lock);return -1;}
     /* Fatal SSL/SYSCALL errors require immediate release, not more TLS IO. */
     if (!server->ssl || (server->service_error_phase == DNS_PHASE_TLS &&
         (server->service_error_code == SSL_ERROR_SSL || server->service_error_code == SSL_ERROR_SYSCALL ||
@@ -178,6 +187,7 @@ static int _ssl_do_handshake(struct dns_server_info *server, struct tls_io_resul
 {
     if (!server) { errno = EINVAL; return -1; }
     pthread_mutex_lock(&server->lock);
+    if(!tls_egress_allowed(server,result)){pthread_mutex_unlock(&server->lock);return -1;}
     if (!server->ssl) { pthread_mutex_unlock(&server->lock); errno = EINVAL; return -1; }
     ERR_clear_error(); errno = 0;
     int ret = SSL_do_handshake(server->ssl);
@@ -190,6 +200,7 @@ int _ssl_do_handevent(struct dns_server_info *server)
 {
     if (!server) return 0;
     pthread_mutex_lock(&server->lock);
+    if(!_dns_egress_io_allowed(server)){pthread_mutex_unlock(&server->lock);return -1;}
     if (!server->ssl) { pthread_mutex_unlock(&server->lock); return 0; }
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
     ERR_clear_error(); errno = 0;
@@ -483,16 +494,8 @@ int _dns_client_create_socket_tls(struct dns_server_info *server_info, const cha
 		goto errout;
 	}
 
-	if (server_info->flags.ifname[0] != '\0') {
-		struct ifreq ifr;
-		memset(&ifr, 0, sizeof(struct ifreq));
-		safe_strncpy(ifr.ifr_name, server_info->flags.ifname, sizeof(ifr.ifr_name));
-		ioctl(fd, SIOCGIFINDEX, &ifr);
-		if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(struct ifreq)) < 0) {
-			tlog(TLOG_ERROR, "bind socket to device %s failed, %s\n", ifr.ifr_name, strerror(errno));
-			goto errout;
-		}
-	}
+
+	if (_dns_socket_prepare(server_info, fd)) goto errout;
 
 	ssl = SSL_new(server_info->ssl_ctx);
 	if (ssl == NULL) {
@@ -505,12 +508,6 @@ int _dns_client_create_socket_tls(struct dns_server_info *server_info, const cha
 		goto errout;
 	}
 
-	if (server_info->so_mark >= 0) {
-		unsigned int so_mark = server_info->so_mark;
-		if (setsockopt(fd, SOL_SOCKET, SO_MARK, &so_mark, sizeof(so_mark)) != 0) {
-			tlog(TLOG_DEBUG, "set socket mark failed, %s", strerror(errno));
-		}
-	}
 
 	if (setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &yes, sizeof(yes)) != 0) {
 		tlog(TLOG_DEBUG, "enable TCP fast open failed.");
@@ -1135,6 +1132,7 @@ errout:
 
 int _dns_client_process_tls(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now)
 {
+    if(!_dns_egress_io_allowed(server_info))return -1;
 	int ret = -1;
 	struct epoll_event fd_event;
 	int ssl_ret = 0;

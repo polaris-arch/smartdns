@@ -87,7 +87,7 @@ build()
 	fi
 	chmod +x $ROOT/usr/sbin/smartdns 2>/dev/null
 
-	dpkg -b $ROOT $OUTPUTDIR/smartdns.$VER.$FILEARCH.deb
+	dpkg-deb --root-owner-group -b "$ROOT" "$OUTPUTDIR/smartdns.$VER.$FILEARCH.deb"
 
 	rm -fr $ROOT/
 }

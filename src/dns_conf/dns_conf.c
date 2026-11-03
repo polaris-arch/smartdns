@@ -171,6 +171,7 @@ static int _config_server_name(void *data, int argc, char *argv[])
 }
 
 static struct config_item _config_item[] = {
+    CONF_STRING("upstream-egress-contract", dns_conf.upstream_egress_contract, DNS_MAX_PATH),
     CONF_YESNO("upstream-multi-wan", &dns_conf.upstream_multi_wan),
     CONF_CUSTOM("upstream-wan-interfaces", _config_upstream_wan_interfaces, NULL),
 	CONF_CUSTOM("any-response-mode", _config_any_mode, NULL),

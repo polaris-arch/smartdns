@@ -126,7 +126,7 @@ static void _show_version(void)
 	char str_ver[256] = {0};
 	_smartdns_get_version(str_ver, sizeof(str_ver));
 	printf("smartdns %s\n", str_ver);
-    printf("features: smartdns-upstream-service-pool-v1 smartdns-upstream-path-policy-v1 smartdns-upstream-fixed-cooldown-v1 smartdns-network-interfaces-v1 smartdns-upstream-wan-admission-v1 smartdns-any-address-v1\n");
+    printf("features: smartdns-egress-contract-v1 smartdns-upstream-service-pool-v1 smartdns-upstream-path-policy-v1 smartdns-upstream-fixed-cooldown-v1 smartdns-network-interfaces-v1 smartdns-upstream-wan-admission-v1 smartdns-any-address-v1\n");
 }
 
 static void _network_json_text(const char *text)

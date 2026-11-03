@@ -127,6 +127,16 @@ static struct dns_upstream_service *service_find(const char *host, int port,
             !memcmp(&s->flags, flags, sizeof(*flags))) return s;
     return NULL;
 }
+#ifdef TEST
+struct dns_upstream_service *_dns_service_find_test(const char *host,int port,dns_server_type_t type,
+    const struct client_dns_server_flags *flags)
+{
+    pthread_mutex_lock(&registry_lock);
+    struct dns_upstream_service *s=service_find(host,port,type,flags);
+    if(s)_dns_service_get(s);
+    pthread_mutex_unlock(&registry_lock);return s;
+}
+#endif
 static int address_is_local(int family, const unsigned char *address)
 {
     if (family == AF_INET && address[0] == 127) return 1;
@@ -364,6 +374,7 @@ int dns_client_add_service(const char *host, int port, dns_server_type_t type,
     INIT_LIST_HEAD(&s->list); INIT_LIST_HEAD(&s->timer); INIT_LIST_HEAD(&s->waiters);
     normalize_host(s->host, host, sizeof(s->host));
     s->port = port; s->type = type; s->flags = *flags; s->config = *pool;
+    s->egress_contract = flags->upstream_wan_count > 0;
     s->wan_count = flags->upstream_wan_count ? flags->upstream_wan_count : 1;
     if (s->wan_count > 1) {
         s->extra_turns = calloc(s->wan_count - 1, sizeof(*s->extra_turns));
@@ -992,6 +1003,7 @@ void _dns_service_connection_release(struct dns_server_info *ep)
 }
 void _dns_service_endpoint_failure(struct dns_server_info *ep)
 {
+    if(ep->egress_revoked)return;
     if (!ep->service) return;
     if (ep->service->wan_count) {
         struct dns_service_wan *w = ep->service->wans + ep->service_wan;

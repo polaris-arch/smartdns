@@ -3,6 +3,7 @@
 #include "upstream_policy.h"
 #include "upstream_rate.h"
 #include "upstream_service.h"
+#include "egress_contract.h"
 #include "group.h"
 #include "client_socket.h"
 #include "client_http3_control.h"
@@ -368,6 +369,7 @@ int _dns_attempt_begin(struct dns_query_struct *q, struct dns_server_info *s)
     pthread_mutex_lock(&s->lock);
     pthread_mutex_lock(&q->lock);
     struct dns_query_attempt *a = find_attempt(q, s);
+    if (s->fd >= 0 && !_dns_egress_socket_current(s)) goto out;
     /* Selection can race idle-slot rotation. Recheck readiness while holding the
      * endpoint lock, before reserving an attempt that would pin a closed socket. */
     if (s->service && s->type != DNS_SERVER_UDP &&
@@ -456,6 +458,7 @@ int _dns_attempt_wire_begin(struct dns_query_struct *q, struct dns_server_info *
     unsigned long now = get_tick_count();
     pthread_mutex_lock(&s->lock);
     pthread_mutex_lock(&q->lock);
+    if (!_dns_egress_io_allowed(s)) { ret = DNS_ADMIT_DONE; goto out; }
     struct dns_query_attempt *a = find_attempt(q, s);
     if (!a || !a->active || a->generation != generation || q->terminal) { ret = DNS_ADMIT_DONE; goto out; }
     /* Cancellation/deadline also gates continuation; spent send capacity alone

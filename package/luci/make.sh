@@ -45,8 +45,7 @@ clean_tool()
 build()
 {
 
-	ROOT=/tmp/luci-app-smartdns
-	rm -fr $ROOT
+	ROOT=$(mktemp -d /tmp/luci-app-smartdns.XXXXXXXX) || return 1
 
 	mkdir -p $ROOT
 	cp $CURR_DIR/* $ROOT/ -af
@@ -74,17 +73,17 @@ build()
 
 	cd $ROOT/control
 	chmod +x *
-	tar zcf ../control.tar.gz ./
+	tar zcf ../control.tar.gz --owner=0 --group=0 ./
 	cd $ROOT
 
-	tar zcf $ROOT/data.tar.gz -C root .
-	tar zcf $OUTPUTDIR/luci-app-smartdns.$VER.$FILEARCH.ipk ./control.tar.gz ./data.tar.gz ./debian-binary
+	tar zcf $ROOT/data.tar.gz --owner=0 --group=0 -C root .
+	tar zcf $OUTPUTDIR/luci-app-smartdns.$VER.$FILEARCH.ipk --owner=0 --group=0 ./control.tar.gz ./data.tar.gz ./debian-binary
 
 	which apk >/dev/null 2>&1
 	if [ $? -eq 0 ]; then
 		APK_VER="`echo $VER | sed 's/[-]/-r/'`"
 		ARCH="`echo $ARCH | sed 's/all/noarch/g'`"
-		apk mkpkg \
+		/bin/sh "$SMARTDNS_DIR/package/apk-root.sh" "$ROOT/root/" "$OUTPUTDIR/luci-app-smartdns.$VER.$FILEARCH.apk" "$(command -v apk)" \
 			--info "name:luci-app-smartdns" \
 			--info "version:$APK_VER" \
 			--info "description:smartdns luci" \
@@ -94,7 +93,6 @@ build()
 			--info "depends:libc smartdns" \
 			--script "post-install:$ROOT/control/postinst" \
 			--script "pre-deinstall:$ROOT/control/prerm" \
-			--files "$ROOT/root/" \
 			--output "$OUTPUTDIR/luci-app-smartdns.$VER.$FILEARCH.apk"
 		if [ $? -ne 0 ]; then
 			echo "build apk package failed."

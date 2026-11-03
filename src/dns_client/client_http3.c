@@ -1,3 +1,4 @@
+#include "egress_contract.h"
 /*************************************************************************
  *
  * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
@@ -90,6 +91,7 @@ errout:
 #if defined(OSSL_QUIC1_VERSION) && !defined (OPENSSL_NO_QUIC)
 int _dns_client_process_recv_http3(struct dns_server_info *server_info, struct dns_conn_stream *conn_stream)
 {
+    if(!_dns_egress_io_allowed(server_info))return -1;
 	int ret = 0;
 	struct http_head *http_head = NULL;
 	uint8_t *pkg_data = NULL;
@@ -183,7 +185,7 @@ out:
 	http_head_destroy(http_head);
 	return ret;
 errout:
-    if (!_dns_http3_error(server_info) && conn_stream->quic_stream) {
+    if (_dns_egress_io_allowed(server_info) && !_dns_http3_error(server_info) && conn_stream->quic_stream) {
         SSL_STREAM_RESET_ARGS reset = {0};
         reset.quic_error_code = 0x10e; /* H3_MESSAGE_ERROR is stream-local */
         SSL_stream_reset(conn_stream->quic_stream, &reset, sizeof(reset));
