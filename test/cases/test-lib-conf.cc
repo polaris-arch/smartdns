@@ -114,3 +114,37 @@ TEST(LibConf, NestedIncludeRestoresOuterFilenameAndLineOnSuccessAndFailure)
 		expect_outside_context();
 	}
 }
+
+#include <cstring>
+static int LibConfAnyItem(const char *item, void *data, int argc, char *argv[])
+{
+	return 0;
+}
+
+static int LibConfNoError(const char *key, const char *value, const char *file, int lineno, int ret)
+{
+	return 0;
+}
+
+/* Outside a directive, never retain a caller-owned filename across loads. */
+TEST(LibConf, LoadDoesNotKeepPreviousFile)
+{
+	static struct config_item items[] = {{"item", LibConfAnyItem, nullptr}, {nullptr, nullptr, nullptr}};
+	smartdns::TempFile first;
+	smartdns::TempFile second;
+	ASSERT_TRUE(first.Write("item a\n"));
+	ASSERT_TRUE(second.Write("item b\n"));
+
+	char first_path[256];
+	strncpy(first_path, first.GetPath().c_str(), sizeof(first_path) - 1);
+	first_path[sizeof(first_path) - 1] = '\0';
+	ASSERT_EQ(load_conf(first_path, items, LibConfNoError), 0);
+	EXPECT_EQ(conf_get_conf_file(), nullptr);
+
+	/* the first load's file name buffer is reused for something else */
+	memset(first_path, 'x', sizeof(first_path) - 1);
+
+	std::string second_path = second.GetPath();
+	ASSERT_EQ(load_conf(second_path.c_str(), items, LibConfNoError), 0);
+	EXPECT_EQ(conf_get_conf_file(), nullptr);
+}

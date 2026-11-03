@@ -29,6 +29,8 @@ static void quic_deadline(struct dns_upstream_service *s, struct dns_server_info
 }
 static void connection_maintain(struct dns_upstream_service *s, struct dns_server_info *ep, unsigned long now)
 {
+    /* Keep transport objects alive while H2 takes its mutex without ep->lock. */
+    _dns_client_process_guard_enter(ep);
     pthread_mutex_lock(&ep->lock);
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
     if (ep->ssl && (ep->type == DNS_SERVER_HTTP3 || ep->type == DNS_SERVER_QUIC)) {
@@ -49,7 +51,7 @@ static void connection_maintain(struct dns_upstream_service *s, struct dns_serve
                         _dns_service_detail(NULL, ep, DNS_DETAIL_TRANSPORT_ERROR, ep->service_error_phase, ep->service_error_code, 0, 0);
                         _dns_service_endpoint_failure(ep);
                     }
-                    _dns_client_close_socket(ep);
+                    _dns_client_close_socket(ep); goto out;
                 }
                 if (ep->ssl && SSL_get_event_timeout(ep->ssl, &timeout, &infinite) && !infinite)
                     delay = timeout.tv_sec * 1000UL + (timeout.tv_usec + 999) / 1000;
@@ -62,8 +64,10 @@ static void connection_maintain(struct dns_upstream_service *s, struct dns_serve
         int ready = 1;
         if (ep->type == DNS_SERVER_HTTPS && !strncmp(ep->alpn_selected, "h2", 2)) {
             struct epoll_event event = {.events = EPOLLOUT};
+            pthread_mutex_unlock(&ep->lock);
             ready = _dns_client_process_http2(ep, &event, now) < 0 ? -1 :
                 http2_ctx_handshake_ready(ep->http2_ctx);
+            pthread_mutex_lock(&ep->lock);
         } else if (ep->type == DNS_SERVER_HTTP3) {
             int control = _dns_http3_control_poll(ep); ready = control < 0 ? -1 : control == 0;
         }
@@ -71,7 +75,7 @@ static void connection_maintain(struct dns_upstream_service *s, struct dns_serve
             __atomic_store_n(&ep->service_protocol_ready, 1, __ATOMIC_RELEASE);
             _dns_service_endpoint_ready(ep);
         } else if (!ready) next_due(s, now, now + 50);
-        else if (ready < 0) { _dns_service_endpoint_failure(ep); _dns_client_close_socket(ep); }
+        else if (ready < 0) { _dns_service_endpoint_failure(ep); _dns_client_close_socket(ep); goto out; }
     }
     if ((ep->status == DNS_SERVER_STATUS_CONNECTING ||
         (ep->status == DNS_SERVER_STATUS_CONNECTED && !ep->service_protocol_ready)) && ep->service_connect_tick) {
@@ -79,11 +83,13 @@ static void connection_maintain(struct dns_upstream_service *s, struct dns_serve
         if (now >= deadline) {
             _dns_service_detail(NULL, ep, DNS_DETAIL_CONNECT_TIMEOUT, DNS_PHASE_CONNECT, ETIMEDOUT,
                 now - ep->service_connect_tick, s->config.connect_timeout_ms);
-            _dns_service_endpoint_failure(ep); _dns_client_close_socket(ep);
+            _dns_service_endpoint_failure(ep); _dns_client_close_socket(ep); goto out;
         } else next_due(s, now, deadline);
     }
-    if ((ep->service_draining || ep->service_rotation) && !ep->active_attempts && !ep->process_depth && list_empty(&ep->conn_stream_list)) {
-        ep->service_normal_close = 1; _dns_client_close_socket(ep); ep->service_draining = ep->service_rotation = 0;
+    if ((ep->service_draining || ep->service_rotation) && !ep->active_attempts && ep->process_depth == 1 && list_empty(&ep->conn_stream_list)) {
+        ep->service_normal_close = 1;
+        ep->service_draining = ep->service_rotation = 0;
+        _dns_client_close_socket(ep); goto out;
     }
     if (ep->status != DNS_SERVER_STATUS_CONNECTED || ep->service_draining || s->config.keepalive_disabled ||
         (ep->type != DNS_SERVER_HTTPS && ep->type != DNS_SERVER_HTTP3) ||
@@ -102,14 +108,18 @@ static void connection_maintain(struct dns_upstream_service *s, struct dns_serve
     if (!interval) interval = 1;
     ep->service_keepalive_interval_ms = interval;
     if (ep->service_ping_tick && ep->http2_ctx) {
-        if (http2_ctx_ping_acked(ep->http2_ctx, ep->service_ping_cookie)) {
+        struct http2_ctx *ctx = ep->http2_ctx;
+        uint64_t cookie = ep->service_ping_cookie;
+        pthread_mutex_unlock(&ep->lock);
+        int acked = http2_ctx_ping_acked(ctx, cookie);
+        pthread_mutex_lock(&ep->lock);
+        if (acked) {
             _dns_service_detail(NULL, ep, DNS_DETAIL_KEEPALIVE_ACK, DNS_PHASE_HTTP2, 0,
                 now - ep->service_ping_tick, 5000); ep->service_ping_tick = 0;
         } else if (now - ep->service_ping_tick >= 5000) {
             _dns_service_detail(NULL, ep, DNS_DETAIL_KEEPALIVE_TIMEOUT, DNS_PHASE_HTTP2, ETIMEDOUT,
                 now - ep->service_ping_tick, 5000);
-            ep->service_ping_tick = 0; _dns_service_endpoint_failure(ep); _dns_client_close_socket(ep);
-            goto out;
+            ep->service_ping_tick = 0; _dns_service_endpoint_failure(ep); _dns_client_close_socket(ep); goto out;
         } else next_due(s, now, ep->service_ping_tick + 5000);
     }
     /* Active application traffic already maintains liveness. A keepalive is a
@@ -121,15 +131,19 @@ static void connection_maintain(struct dns_upstream_service *s, struct dns_serve
         if (ep->type == DNS_SERVER_HTTPS && ep->http2_ctx) {
             uint64_t cookie = ++ep->service_ping_cookie;
             if (!cookie) cookie = ++ep->service_ping_cookie;
-            if (http2_ctx_ping(ep->http2_ctx, cookie) >= 0) {
+            struct http2_ctx *ctx = ep->http2_ctx;
+            pthread_mutex_unlock(&ep->lock);
+            int ping_result = http2_ctx_ping(ctx, cookie);
+            int want_write = http2_ctx_want_write(ctx);
+            pthread_mutex_lock(&ep->lock);
+            if (ping_result >= 0) {
                 ep->service_ping_tick = now; sent = 1; next_due(s, now, now + 5000);
-                if (http2_ctx_want_write(ep->http2_ctx)) {
+                if (want_write) {
                     struct epoll_event event = {.events = EPOLLIN | EPOLLOUT, .data.ptr = ep};
                     if (epoll_ctl(client.epoll_fd, EPOLL_CTL_MOD, ep->fd, &event)) {
                         ep->service_system_error = errno;
                         _dns_service_detail(NULL, ep, DNS_DETAIL_TRANSPORT_ERROR, DNS_PHASE_SOCKET, errno, 0, 0);
-                        _dns_service_endpoint_failure(ep); _dns_client_close_socket(ep);
-                        goto out;
+                        _dns_service_endpoint_failure(ep); _dns_client_close_socket(ep); goto out;
                     }
                 }
             }
@@ -141,8 +155,7 @@ static void connection_maintain(struct dns_upstream_service *s, struct dns_serve
         } else if (!sent) next_due(s, now, now + 100);
         else if (ep->type == DNS_SERVER_HTTP3) {
             _dns_service_detail(NULL, ep, DNS_DETAIL_TRANSPORT_ERROR, DNS_PHASE_HTTP3, ep->service_error_code, 0, 0);
-            _dns_service_endpoint_failure(ep); _dns_client_close_socket(ep);
-            goto out;
+            _dns_service_endpoint_failure(ep); _dns_client_close_socket(ep); goto out;
         } else ep->service_keepalive_tick = now; /* HTTP/1 has no protocol PING. */
     }
     /* Recent DNS traffic postpones the ping too. Using only the last ping
@@ -157,6 +170,7 @@ out:
 #endif
     quic_deadline(s, ep, now); /* writes/control processing may create a new pacing deadline */
     pthread_mutex_unlock(&ep->lock);
+    _dns_client_process_guard_leave(ep);
 }
 void _dns_service_connection_tick(struct dns_upstream_service *s, unsigned long now)
 {

@@ -235,7 +235,9 @@ static void service_reconcile(struct dns_upstream_service *s, unsigned long now)
         struct dns_server_info *ep = retire[i];
         pthread_mutex_lock(&ep->lock);
         int done = !ep->active_attempts || now >= ep->service_drain_until;
+        pthread_mutex_unlock(&ep->lock);
         if (done) _dns_client_close_socket(ep);
+        pthread_mutex_lock(&ep->lock);
         done = done && ep->fd < 0 && !ep->process_depth;
         pthread_mutex_unlock(&ep->lock);
         if (done) {
@@ -937,12 +939,17 @@ void _dns_service_prepare_connection(struct dns_server_info *target)
      * the physical cap. Rotate one slot at a time, never one TLS handshake per query. */
     for (unsigned i = 0; i < count && __atomic_load_n(&s->connections, __ATOMIC_ACQUIRE) >= cap; i++) {
         struct dns_server_info *ep = candidates[i]; pthread_mutex_lock(&ep->lock);
-        if ((!ep->service_connect_tick || now - ep->service_connect_tick >= 1000) &&
+        int close_idle = (!ep->service_connect_tick || now - ep->service_connect_tick >= 1000) &&
             ep->service_connection_held && !ep->active_attempts && !ep->process_depth &&
             ep->status != DNS_SERVER_STATUS_CONNECTING && !ep->send_buff.len &&
-            !ep->http2_write_owner && !ep->ssl_want_write && list_empty(&ep->conn_stream_list))
-            _dns_client_close_socket(ep);
+            !ep->http2_write_owner && !ep->ssl_want_write && list_empty(&ep->conn_stream_list);
+        /* Withdraw admission before dropping the lock for H2 teardown. */
+        if (close_idle) __atomic_store_n(&ep->service_rotation, 1, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&ep->lock);
+        if (close_idle) {
+            _dns_client_close_socket(ep);
+            __atomic_store_n(&ep->service_rotation, 0, __ATOMIC_RELEASE);
+        }
     }
     if (!rotating && __atomic_load_n(&s->connections, __ATOMIC_ACQUIRE) >= cap) {
         for (unsigned i = 0; i < count; i++) {

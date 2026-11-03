@@ -3,6 +3,7 @@
 #include "dns_conf/domain_rule.h"
 #include "dns_conf/dns_conf_group.h"
 #include <string>
+#include <cstddef>
 #include <getopt.h>
 
 extern "C" { extern struct dns_conf_group_info *dns_conf_current_group_info; }
@@ -128,4 +129,11 @@ TEST_F(DomainRuleSharing, LocalPtrPolicyRequiresAnExplicitBooleanAndRejectsWitho
 	ASSERT_EQ(parse("no"), 0);
 	EXPECT_EQ(flags("boolean.test")->flags & DOMAIN_FLAG_PTR_SOA, 0U);
 	EXPECT_NE(flags("boolean.test")->is_flag_set & DOMAIN_FLAG_PTR_SOA, 0U);
+}
+
+/* The reference count must fit the padding after capacity: every leaf, shared or not, pays for the header. */
+TEST(DomainRuleLayout, HeaderStaysPointerAligned)
+{
+	EXPECT_LE(offsetof(struct dns_domain_rule, rules), sizeof(void *) > 4 ? sizeof(void *) : 8);
+	EXPECT_EQ(sizeof(atomic32_t), 4U);
 }

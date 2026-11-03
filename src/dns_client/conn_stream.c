@@ -103,6 +103,7 @@ void _dns_client_conn_server_streams_free(struct dns_server_info *server_info, s
 {
 	struct dns_conn_stream *stream = NULL;
 	struct dns_conn_stream *tmp = NULL;
+	LIST_HEAD(free_list);
 
 	pthread_mutex_lock(&server_info->lock);
 	list_for_each_entry_safe(stream, tmp, &server_info->conn_stream_list, server_list)
@@ -112,7 +113,7 @@ void _dns_client_conn_server_streams_free(struct dns_server_info *server_info, s
 			continue;
 		}
 
-		list_del_init(&stream->server_list);
+		list_move_tail(&stream->server_list, &free_list);
 		stream->server_info = NULL;
 		if (stream->quic_stream) {
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
@@ -121,7 +122,13 @@ void _dns_client_conn_server_streams_free(struct dns_server_info *server_info, s
 			SSL_free(stream->quic_stream);
 			stream->quic_stream = NULL;
 		}
+	}
+	pthread_mutex_unlock(&server_info->lock);
 
+	/* http2 stream close takes the http2 context mutex, never under server_info->lock */
+	list_for_each_entry_safe(stream, tmp, &free_list, server_list)
+	{
+		list_del_init(&stream->server_list);
 		if (stream->http2_stream) {
 			http2_stream_abort(stream->http2_stream);
 			stream->http2_stream = NULL;
@@ -129,13 +136,13 @@ void _dns_client_conn_server_streams_free(struct dns_server_info *server_info, s
 
 		_dns_client_conn_stream_put(stream);
 	}
-	pthread_mutex_unlock(&server_info->lock);
 }
 /* Query destruction leaves transport owners as tombstones. Reclaim canceled
  * multiplexed work promptly; an H1 sent tombstone requires connection close. */
 int _dns_client_conn_prune(struct dns_server_info *server)
 {
     int close_h1 = 0;
+    LIST_HEAD(free_list);
     pthread_mutex_lock(&server->lock);
     struct dns_conn_stream *stream, *tmp;
     list_for_each_entry_safe(stream, tmp, &server->conn_stream_list, server_list) {
@@ -145,10 +152,14 @@ int _dns_client_conn_prune(struct dns_server_info *server)
              (server->type == DNS_SERVER_HTTPS && strncmp(server->alpn_selected, "h2", 2))))) {
             close_h1 = 1; continue;
         }
-        list_del_init(&stream->server_list);
+        list_move_tail(&stream->server_list, &free_list);
         stream->server_info = NULL;
-        _dns_client_conn_stream_put(stream);
     }
     pthread_mutex_unlock(&server->lock);
+    /* Releasing the last owner may abort an H2 stream and take ctx->mutex. */
+    list_for_each_entry_safe(stream, tmp, &free_list, server_list) {
+        list_del_init(&stream->server_list);
+        _dns_client_conn_stream_put(stream);
+    }
     return close_h1;
 }

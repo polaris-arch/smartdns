@@ -37,6 +37,7 @@ ip -j route show > ci-results/fixture-routes-v4.json
 ip -j -6 route show > ci-results/fixture-routes-v6.json
 command -v dig
 command -v dnsperf
+command -v nft
 curl --version | grep -q HTTP2
 # Both compile-time headers and linked runtime must match the intended capability.
 cat > /tmp/native-ssl-capability.c <<'C'

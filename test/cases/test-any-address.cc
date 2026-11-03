@@ -580,7 +580,8 @@ TEST(AnyAddress, FixedFamiliesAndConcurrencyIgnoreLegacyAggregateSelection)
 	expect_workload(upstream, 1, 1);
 }
 
-TEST(AnyAddress, NormalSpeedSelectionPreservesBothFamiliesAndPolicyTtls)
+namespace {
+void expect_speed_selection_ttls(bool expired_enabled)
 {
 	AddressUpstream upstream;
 	upstream.ipv4.add_slower_address = upstream.ipv6.add_slower_address = true;
@@ -595,14 +596,25 @@ TEST(AnyAddress, NormalSpeedSelectionPreservesBothFamiliesAndPolicyTtls)
 	server.MockPing(PING_TYPE_ICMP, kSlowIPv6, 60, 1000);
 	ASSERT_TRUE(server.Start(config("speed-check-mode ping\nresponse-mode first-ping\n"
 		"dualstack-ip-selection yes\nrr-ttl 60\nserve-expired-reply-ttl 17\n"
-		"any-aggregate-timeout-ms 950\n")));
-	/* Global serve-expired no does not set the bind/domain no_serve_expired
-	 * request flag. The native speed-check reply policy therefore selects
-	 * the explicitly configured 17-second reply TTL, not rr-ttl 60.
-	 * Merging may conservatively age the earlier child by one second. */
+		"any-aggregate-timeout-ms 950\n" + std::string(expired_enabled ? "serve-expired yes\n" : "serve-expired no\n"))));
+	/* Fresh answers use the ordinary TTL with serve-expired disabled; when
+	 * enabled, native speed selection retains the configured short reply TTL.
+	 * Aggregation may conservatively age the earlier child by one second. */
+	int ttl = expired_enabled ? 17 : 60;
 	EXPECT_TRUE(response_is(query(), DNS_RC_NOERROR, {address_rr(DNS_T_A), address_rr(DNS_T_AAAA)},
-		0, kQueryId, DNS_T_ANY, kDomain, 16, 17));
+		0, kQueryId, DNS_T_ANY, kDomain, ttl - 1, ttl));
 	expect_workload(upstream, 1, 1);
+}
+} // namespace
+
+TEST(AnyAddress, NormalSpeedSelectionPreservesBothFamiliesAndPolicyTtls)
+{
+	expect_speed_selection_ttls(false);
+}
+
+TEST(AnyAddress, ExpiredEnabledKeepsNativeShortReplyPolicyForBothFamilies)
+{
+	expect_speed_selection_ttls(true);
 }
 
 TEST(AnyAddress, DoAndCdFailClosedWithoutAnyProbe)

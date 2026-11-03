@@ -108,9 +108,8 @@ int _dns_proxy_handshake(struct dns_server_info *server_info, struct epoll_event
 errout:
 	server_info->recv_buff.len = 0;
 	server_info->send_buff.len = 0;
-	if (server_info->proxy) {
-		_dns_client_close_socket(server_info);
-	}
+	int close_proxy = server_info->proxy != NULL;
 	pthread_mutex_unlock(&server_info->lock);
+	if (close_proxy) _dns_client_close_socket(server_info);
 	return -1;
 }
