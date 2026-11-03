@@ -521,7 +521,7 @@ static int hpack_decode_string(const uint8_t *data, int data_len, char **str)
 	}
 	offset += ret;
 
-	if (len > (uint64_t)(data_len - offset) || len > SIZE_MAX - 1) {
+	if (offset > data_len || len > (uint64_t)(data_len - offset) || len > SIZE_MAX - 1) {
 		return -1;
 	}
 

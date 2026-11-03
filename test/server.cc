@@ -396,6 +396,7 @@ bool Server::Start(const std::string &conf, enum CONF_TYPE type)
 		return fail_start("fixture already running");
 	}
 	startup_.Reset();
+	wait_status_ = -1;
 
 	fds[0] = 0;
 	fds[1] = 0;
@@ -467,7 +468,13 @@ cache-persist no
 		posix_spawn_file_actions_destroy(&actions);
 		if (error != 0) { errno = error; return fail_start("spawn fixture child"); }
 	} else if (mode_ == CREATE_MODE_THREAD) {
-		thread_ = std::thread([&]() {
+		int notify_fd = dup(fds[1]);
+		if (notify_fd < 0) return fail_start("duplicate readiness descriptor");
+		sigaction(SIGINT, nullptr, &saved_sigint_);
+		sigaction(SIGTERM, nullptr, &saved_sigterm_);
+		sigaction(SIGPIPE, nullptr, &saved_sigpipe_);
+		signals_saved_ = true;
+		thread_ = std::thread([this, notify_fd]() {
 			std::vector<std::string> args = {"smartdns", "-f", "-x", "-c", conf_file_, "-p", "-", "-S"};
 			char *argv[args.size() + 1];
 			for (size_t i = 0; i < args.size(); i++) {
@@ -480,7 +487,8 @@ cache-persist no
 			// Config parsers and previous in-process instances also use getopt.
 			// Always parse -f again; skipping it can daemonize the test process.
 			optind = 0;
-			smartdns_test_main(args.size(), argv, fds[1], 1);
+			smartdns_test_main(args.size(), argv, notify_fd, 1);
+			close(notify_fd);
 			smartdns_reg_post_func(nullptr, nullptr);
 		});
 	} else {
@@ -541,6 +549,13 @@ void Server::Stop(bool graceful)
 		thread_.join();
 	}
 
+	if (signals_saved_) {
+		sigaction(SIGINT, &saved_sigint_, nullptr);
+		sigaction(SIGTERM, &saved_sigterm_, nullptr);
+		sigaction(SIGPIPE, &saved_sigpipe_, nullptr);
+		signals_saved_ = false;
+	}
+
 	if (pid_ > 0) {
 		if (graceful) {
 			kill(pid_, SIGTERM);
@@ -551,10 +566,13 @@ void Server::Stop(bool graceful)
 
 	if (pid_ > 0) {
 		int status = 0;
-		if (waitpid(pid_, &status, 0) == pid_ &&
-			((WIFEXITED(status) && WEXITSTATUS(status) != 0) ||
-			 (WIFSIGNALED(status) && WTERMSIG(status) != SIGTERM && WTERMSIG(status) != SIGKILL))) {
-			std::cerr << "Server child terminated unexpectedly: pid=" << pid_ << " wait_status=" << status << std::endl;
+		pid_t waited;
+		do { waited = waitpid(pid_, &status, 0); } while (waited < 0 && errno == EINTR);
+		if (waited == pid_) {
+			wait_status_ = status;
+			if ((WIFEXITED(status) && WEXITSTATUS(status) != 0) ||
+				(WIFSIGNALED(status) && WTERMSIG(status) != SIGTERM && WTERMSIG(status) != SIGKILL))
+				std::cerr << "Server child terminated unexpectedly: pid=" << pid_ << " wait_status=" << status << std::endl;
 		}
 	}
 
@@ -572,10 +590,16 @@ bool Server::IsRunning()
 	int status = 0;
 	pid_t waited = waitpid(pid_, &status, WNOHANG);
 	if (waited == 0) return true;
+	if (waited == pid_) wait_status_ = status;
 	std::cerr << "Server is not running: pid=" << pid_ << " wait_result=" << waited
 		<< " wait_status=" << status << " errno=" << errno << std::endl;
 	if (waited == pid_ || (waited < 0 && errno == ECHILD)) pid_ = 0;
 	return false;
+}
+
+int Server::GetWaitStatus()
+{
+	return wait_status_;
 }
 
 Server::~Server()

@@ -27,6 +27,7 @@
 #include <functional>
 #include <string>
 #include <sys/socket.h>
+#include <signal.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -59,12 +60,16 @@ class Server
 	bool Start(const std::string &conf, enum CONF_TYPE type = CONF_TYPE_STRING);
 	void Stop(bool graceful = true);
 	bool IsRunning();
+	int GetWaitStatus();
 	// Private test.bin subprocess entry, before GoogleTest initialization.
 	static int RunFixtureChild(int argc, char **argv);
 
   private:
 	static void StartPost(void *arg);
 	pid_t pid_;
+	int wait_status_{-1};
+	struct sigaction saved_sigint_ {}, saved_sigterm_ {}, saved_sigpipe_ {};
+	bool signals_saved_{false};
 	std::thread thread_;
 	int fd_;
 	std::string conf_file_;
