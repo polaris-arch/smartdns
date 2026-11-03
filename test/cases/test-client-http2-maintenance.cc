@@ -6,7 +6,6 @@ extern "C" {
 #include "smartdns/http2.h"
 #include "smartdns/util.h"
 }
-#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <thread>
@@ -25,7 +24,8 @@ protected:
         // Server SETTINGS and its ACK of the client's SETTINGS.
         static const uint8_t input[] = {0,0,0,4,0,0,0,0,0, 0,0,0,4,1,0,0,0,0};
         if (self->input_offset == sizeof(input)) { errno = EAGAIN; return -1; }
-        size_t count = std::min(static_cast<size_t>(size), sizeof(input) - self->input_offset);
+        size_t count = sizeof(input) - self->input_offset;
+        if (static_cast<size_t>(size) < count) count = size;
         memcpy(data, input + self->input_offset, count); self->input_offset += count;
         return count;
     }
