@@ -966,7 +966,6 @@ int dns_client_init(void)
 	}
 
 	memset(&client, 0, sizeof(client));
-	pthread_attr_init(&attr);
 	atomic_set(&client.dns_server_num, 0);
 	atomic_set(&client.dns_server_prohibit_num, 0);
 	atomic_set(&client.run_period, 0);
@@ -1000,9 +999,23 @@ int dns_client_init(void)
 	atomic_set(&client.run, 1);
 
 	/* start work task */
-	ret = pthread_create(&client.tid, &attr, _dns_client_work, NULL);
+	ret = pthread_attr_init(&attr);
+	if (ret == 0) {
+		size_t stack_size = 0;
+		ret = pthread_attr_getstacksize(&attr, &stack_size);
+		/* Discovery callbacks can synchronously reconcile WANs, verify an
+		 * egress lease and send bootstrap queries. musl's default 128 KiB is
+		 * too small for this bounded call chain; preserve larger defaults. */
+		if (ret == 0 && stack_size < 512 * 1024) {
+			ret = pthread_attr_setstacksize(&attr, 512 * 1024);
+		}
+		if (ret == 0) {
+			ret = pthread_create(&client.tid, &attr, _dns_client_work, NULL);
+		}
+		pthread_attr_destroy(&attr);
+	}
 	if (ret != 0) {
-		tlog(TLOG_ERROR, "create client work thread failed, %s\n", strerror(errno));
+		tlog(TLOG_ERROR, "create client work thread failed, %s\n", strerror(ret));
 		goto errout;
 	}
 

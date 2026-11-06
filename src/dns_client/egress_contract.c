@@ -22,6 +22,10 @@ static struct egress_record records[127];
 static unsigned count;
 static uint64_t epoch = 1, next_read, deadline;
 static char last_path[DNS_MAX_PATH];
+/* All refreshes hold lock, including reads from transport callbacks. Keep the
+ * bounded parsing workspace off those nested client-thread stacks. */
+static struct egress_record fresh[127];
+static char bytes[32769];
 
 #ifdef TEST
 uint64_t (*_dns_egress_test_now)(void);
@@ -44,13 +48,12 @@ static void refresh_locked(void)
     if (!strcmp(last_path, path) && now < next_read && (!count || now < deadline)) return;
     next_read = now + 250;
     safe_strncpy(last_path, path, sizeof(last_path));
-    struct egress_record fresh[127] = {0};
+    memset(fresh, 0, sizeof(fresh));
     unsigned n = 0;
     if (!path[0]) goto publish;
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) goto publish;
     struct stat st;
-    char bytes[32769];
     ssize_t size = -1;
     if (!fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_uid == 0 && !(st.st_mode & 022) &&
         st.st_size > 0 && st.st_size < (off_t)sizeof(bytes))

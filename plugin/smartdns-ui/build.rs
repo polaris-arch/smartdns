@@ -81,16 +81,13 @@ fn link_smartdns_lib() {
 
     let ignored_macros = IgnoreMacros(vec!["IPPORT_RESERVED".into()].into_iter().collect());
 
-    let mut bindings_builder =
-        bindgen::Builder::default()
-            .header(format!("{}/smartdns/smartdns.h", smartdns_inc_dir))
-            .header(format!("{}/smartdns/upstream_service.h", smartdns_inc_dir))
-            // No SmartDNS ABI uses this libc type. Its long-double fields do not
-            // have a portable Rust representation (rust-bindgen#1823 on i686).
-            // Preserve the C size/alignment as opaque storage; keep all layout
-            // assertions, including max_align_t's own, enabled.
-            .opaque_type("max_align_t")
-            .layout_tests(true);
+    let mut bindings_builder = bindgen::Builder::default()
+        .header(format!("{}/smartdns/smartdns.h", smartdns_inc_dir))
+        .header(format!("{}/smartdns/upstream_service.h", smartdns_inc_dir))
+        // Upstream excludes this unused libc type: its long-double fields have
+        // no portable Rust layout on i686. Keep assertions for actual APIs.
+        .blocklist_type("max_align_t")
+        .layout_tests(true);
     if let Some(sysroot) = sysroot {
         bindings_builder = bindings_builder.clang_arg(format!("--sysroot={}", sysroot));
     }

@@ -6,6 +6,8 @@ import xml.etree.ElementTree as ET
 
 # Explicit names: deleting/renaming a required fixture must update this reviewed gate.
 COMMON = set("""
+EgressContract.LeaseParsingFitsSmallStackBelowNestedDiscoveryFrames
+UpstreamServiceDiscovery.WanBootstrapRefreshPreservesEndpointStateAndWorkerStack
 EgressContract.UnchangedRenewalAndOneWanReplacementPreserveOtherWanGenerationAndSocket
 EgressContract.MdnsAndLanBindingAreNotImplicitContractAdopters
 EgressContract.RevokedQuicEventsAndTlsShutdownDoNotTouchTransportObjects

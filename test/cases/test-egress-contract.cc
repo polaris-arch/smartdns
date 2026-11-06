@@ -69,6 +69,38 @@ TEST_F(EgressContract, ExpiryRevocationBootPermissionAndMalformedInputFailClosed
     write(""); EXPECT_EQ(lease(), -1);
     unlink(path.c_str()); _dns_egress_invalidate(); EXPECT_EQ(lease(), -1);
 }
+TEST_F(EgressContract, LeaseParsingFitsSmallStackBelowNestedDiscoveryFrames) {
+    write(row());
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT({
+        int result = -1;
+        pthread_attr_t attr;
+        ASSERT_EQ(pthread_attr_init(&attr), 0);
+        ASSERT_EQ(pthread_attr_setstacksize(&attr, 128 * 1024), 0);
+        pthread_t thread;
+        int created = pthread_create(&thread, &attr, [](void *opaque) -> void * {
+            // Live discovery/receive/reconcile frames consumed >100 KiB before
+            // lease parsing. Reserve that budget while testing the leaf parser.
+            volatile unsigned char outer_frames[96 * 1024];
+            for (size_t i = 0; i < sizeof(outer_frames); i += 4096) outer_frames[i] = 0x5a;
+            outer_frames[sizeof(outer_frames) - 1] = 0x5a;
+            unsigned mark = 0; char session[65];
+            int good = 1;
+            for (unsigned i = 0; i < 8; i++) {
+                _dns_egress_invalidate();
+                good &= _dns_egress_lease("lo", i % 2 ? AF_INET6 : AF_INET, -1, &mark, session) == 1;
+                good &= mark == DNS_EGRESS_MARK && strlen(session) == 64;
+            }
+            good &= outer_frames[0] == 0x5a && outer_frames[sizeof(outer_frames) - 1] == 0x5a;
+            *static_cast<int *>(opaque) = good;
+            return nullptr;
+        }, &result);
+        pthread_attr_destroy(&attr);
+        ASSERT_EQ(created, 0); ASSERT_EQ(pthread_join(thread, nullptr), 0);
+        EXPECT_EQ(result, 1);
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }, ::testing::ExitedWithCode(0), "");
+}
 uint64_t wide_now;
 uint64_t wide_clock(){return wide_now;}
 TEST_F(EgressContract, LeaseClockRemainsWideBeyond32BitMillisecondRollover) {

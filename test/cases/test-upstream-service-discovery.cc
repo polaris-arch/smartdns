@@ -9,11 +9,18 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <fstream>
+#include <net/if.h>
 #include <poll.h>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
+extern "C" {
+#include "dns_client/dns_client.h"
+#include "dns_client/egress_contract.h"
+#include "dns_client/server_info.h"
+}
 
 namespace {
 constexpr const char *authority = "resolver.discovery.example";
@@ -101,6 +108,58 @@ bool packet_has_ecs(dns_packet *packet)
         dns_opt_ecs ecs{}; if (!dns_get_OPT_ECS(rr, &ecs)) return true;
     }
     return false;
+}
+
+void wan_bootstrap_stack_case()
+{
+    struct Lease {
+        char path[64] = "/tmp/smartdns-discovery-stack-XXXXXX";
+        ~Lease() { unlink(path); }
+    } lease;
+    int fd = mkstemp(lease.path); ASSERT_GE(fd, 0); close(fd);
+    std::string boot; { std::ifstream in("/proc/sys/kernel/random/boot_id"); in >> boot; }
+    { std::ofstream out(lease.path);
+      out << "smartdns-egress-v1 4000 " << (_dns_egress_now() + 30000) << " " << boot << "\nlo "
+          << if_nametoindex("lo") << " " << std::string(64, 'a') << " 3\n"; }
+    smartdns::MockServer bootstrap, upstream;
+    std::atomic<unsigned> bootstrap_seen{0};
+    ASSERT_TRUE(bootstrap.Start("udp://127.0.0.1:62674", [&](smartdns::ServerRequestContext *r) {
+        bootstrap_seen++;
+        return bootstrap_reply(r, {"127.0.0.2"}, 1);
+    }));
+    ASSERT_TRUE(upstream.Start("udp://127.0.0.2:62874", [](smartdns::ServerRequestContext *r) {
+        smartdns::MockServer::AddIP(r, r->domain.c_str(), "192.0.2.74");
+        return smartdns::SERVER_REQUEST_OK;
+    }));
+    auto conf = config(62774, 62674, 62874);
+    auto pos = conf.find("-upstream-ip-pool"); ASSERT_NE(pos, std::string::npos);
+    conf.insert(pos + strlen("-upstream-ip-pool"), " -upstream-wan lo");
+    conf += std::string("upstream-egress-contract ") + lease.path + "\n";
+    smartdns::Server resolver(smartdns::Server::CREATE_MODE_THREAD); ASSERT_TRUE(resolver.Start(conf));
+    pthread_attr_t attr; ASSERT_EQ(pthread_getattr_np(client.tid, &attr), 0);
+    size_t stack_size = 0; int got = pthread_attr_getstacksize(&attr, &stack_size);
+    pthread_attr_destroy(&attr); ASSERT_EQ(got, 0); EXPECT_GE(stack_size, 512U * 1024);
+    dns_upstream_service_snapshot_v1 snapshot{};
+    ASSERT_TRUE(await_pool(snapshot, [](const auto &v) { return v.endpoint_count == 1; }));
+    auto initial_queries = bootstrap_seen.load();
+    for (unsigned i = 0; i < 12; i++) {
+        ASSERT_TRUE(query_udp("stack-budget.example", 62774));
+        dns_server_info *endpoints[32];
+        int count = dns_client_get_server_info_lists(endpoints, 32); unsigned checked = 0;
+        for (int j = 0; j < count; j++) {
+            auto *ep = endpoints[j];
+            pthread_mutex_lock(&ep->lock);
+            if (!ep->service && ep->port == 62674) {
+                EXPECT_EQ(ep->ai_family, AF_INET);
+                EXPECT_EQ(ep->conn_stream_list.next, &ep->conn_stream_list);
+                EXPECT_EQ(ep->conn_stream_list.prev, &ep->conn_stream_list); checked++;
+            }
+            pthread_mutex_unlock(&ep->lock); dns_client_server_info_release(ep);
+        }
+        EXPECT_EQ(checked, 1U);
+        poll(nullptr, 0, 300);
+    }
+    ASSERT_TRUE(read_pool(snapshot)); EXPECT_GT(bootstrap_seen.load(), initial_queries);
 }
 
 void bootstrap_ecs_isolation_case()
@@ -432,6 +491,7 @@ TEST(UpstreamServiceDiscovery, Name) { \
     ASSERT_EXIT({ Action; _exit(::testing::Test::HasFailure() ? 1 : 0); }, ::testing::ExitedWithCode(0), ""); \
 }
 DISCOVERY_RUNTIME_CASE(CanonicalCapIgnoresRrOrderAndWithdraws, canonical_cap_case(false))
+DISCOVERY_RUNTIME_CASE(WanBootstrapRefreshPreservesEndpointStateAndWorkerStack, wan_bootstrap_stack_case())
 DISCOVERY_RUNTIME_CASE(CanonicalCapIgnoresReverseRrOrderAndWithdraws, canonical_cap_case(true))
 DISCOVERY_RUNTIME_CASE(WildcardListenerActualSocketRejectsSelf, listener_variant_case(0))
 DISCOVERY_RUNTIME_CASE(LocalhostListenerActualSocketRejectsSelf, listener_variant_case(1))
