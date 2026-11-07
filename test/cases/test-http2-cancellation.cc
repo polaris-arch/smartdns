@@ -151,3 +151,15 @@ TEST_F(Http2Cancellation, ReceivedResetDoesNotGenerateAnotherReset) {
     Release(stream,true);
     EXPECT_EQ(Frames(3),0U);
 }
+TEST_F(Http2Cancellation, CompletedResponseSurvivesFollowingNoErrorReset) {
+    auto *stream=Request(); ASSERT_NE(stream,nullptr);
+    unsigned id=http2_stream_get_id(stream);
+    Frame(1,4,id,{0x88});
+    Frame(0,1,id,{1,2,3});
+    Frame(3,0,id,{0,0,0,0});
+    http2_ctx_poll(ctx,nullptr,0,nullptr);
+    EXPECT_EQ(http2_stream_is_reset(stream),0);
+    EXPECT_EQ(http2_stream_is_end(stream),1);
+    uint8_t body[3]; EXPECT_EQ(http2_stream_read_body(stream,body,sizeof(body)),3);
+    EXPECT_EQ(body[0],1); EXPECT_EQ(body[2],3);
+}

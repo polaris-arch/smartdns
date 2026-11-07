@@ -1779,7 +1779,9 @@ static int _http2_process_frames(struct http2_ctx *ctx)
 			{
 				struct http2_stream *rst_stream = _http2_find_stream(ctx, stream_id);
 				if (rst_stream) {
-					__atomic_store_n(&rst_stream->reset_received, 1, __ATOMIC_RELEASE);
+                    /* A reset cannot invalidate a response already completed by END_STREAM. */
+                    if (!rst_stream->end_stream_received)
+                        __atomic_store_n(&rst_stream->reset_received, 1, __ATOMIC_RELEASE);
 					rst_stream->state = HTTP2_STREAM_CLOSED;
 				}
 			}
