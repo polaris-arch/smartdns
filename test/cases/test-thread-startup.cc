@@ -27,7 +27,7 @@ TEST(ThreadStartup, LoggerReportsPthreadErrorInsteadOfUnrelatedErrno)
     testing::internal::CaptureStderr();
     used_default_attributes = false;
     fail_thread_start = true;
-    int result = tlog_init("/dev/null", 1024, 1, 4096, TLOG_NOCOMPRESS);
+    int result = tlog_init("/dev/null", 1024, 1, 0, TLOG_NOCOMPRESS);
     fail_thread_start = false;
     std::string output = testing::internal::GetCapturedStderr();
     EXPECT_EQ(result, -1);

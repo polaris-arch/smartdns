@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{"topic": "ui-statistics", "sha": "d72ab946acdaaf84cba96d5296a77334bdfc1f35", "filter": "data_stats::regression_tests", "kind": "ui"}, {"topic": "config-context", "sha": "1b950ce74dc8fc0aa5fd6eea082194c00396a9bb", "filter": "LibConf.*", "kind": "native"}, {"topic": "cache-checkpoint", "sha": "39d93ec4ed0edee999df22aa59548dd62abe443c", "filter": "CacheCheckpoint.*", "kind": "native"}, {"topic": "ping-startup", "sha": "ee5df3c1722cf9f08e646411c979c3e91449a3c0", "filter": "Ping.*", "kind": "native"}, {"topic": "hpack-state", "sha": "fc74bf93ad792d4f4c10d1b873b1a2b16d69bb6c", "filter": "HeaderCompression.*:LIBHTTP2.SettingsHeaderTableSizeEvictsResponseEncoderEntries:LIBHTTP2.OversizedDecoderTableClosesTheConnectionWithCompressionError:LIBHTTP2.SettingsMaxHeaderListSizeLimitsResponseHeaders", "kind": "native"}, {"topic": "qpack-decoding", "sha": "4c33dec29f944e7068d74f7c3aa6fd77147a64bf", "filter": "HeaderCompression.*", "kind": "native"}, {"topic": "thread-startup", "sha": "d09f9e1cc95ecb5818a22b9764f584b0eab2168f", "filter": "ThreadStartup.*", "kind": "native"}]
+        include: [{"topic": "hpack-state", "sha": "a206a526c89d82d6561a53348a9b1bd06c8b1211", "filter": "HeaderCompression.*:LIBHTTP2.SettingsHeaderTableSizeEvictsResponseEncoderEntries:LIBHTTP2.OversizedDecoderTableClosesTheConnectionWithCompressionError:LIBHTTP2.SettingsMaxHeaderListSizeLimitsResponseHeaders", "kind": "native"}, {"topic": "thread-startup", "sha": "27f9777917d4b27af2f61c50e2bceb92e8be1579", "filter": "ThreadStartup.*", "kind": "native"}]
     env:
       TOPIC: ${{ matrix.topic }}
       CANDIDATE: ${{ matrix.sha }}
@@ -79,6 +79,7 @@ jobs:
             if [ "$TOPIC" = hpack-state ]; then
               mv "$RUNNER_TEMP/test-hpack-state.cc" test/cases/test-hpack-state.cc
             fi
+            make -C test clean > "$RUNNER_TEMP/evidence/clean.log" 2>&1
             make -C test -j4 > "$RUNNER_TEMP/evidence/candidate-build.log" 2>&1
             if [ "$TOPIC" = hpack-state ]; then FILTER='HeaderCompression.*:LIBHTTP2.*'; fi
             sudo timeout 300 ./test/test.bin --gtest_filter="$FILTER" --gtest_output="xml:$RUNNER_TEMP/evidence/candidate.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/candidate.log"

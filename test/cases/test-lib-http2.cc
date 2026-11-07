@@ -532,6 +532,8 @@ TEST_F(LIBHTTP2, OversizedDecoderTableClosesTheConnectionWithCompressionError)
 	ssize_t length = read(server_sock,drain,sizeof(drain));
 	ASSERT_GE(length,17);
 	EXPECT_EQ(drain[3],7); // GOAWAY, not a stream-local RST_STREAM
+	// A client has not processed any peer-initiated stream.
+	EXPECT_EQ(drain[9],0); EXPECT_EQ(drain[10],0); EXPECT_EQ(drain[11],0); EXPECT_EQ(drain[12],0);
 	EXPECT_EQ(drain[13],0); EXPECT_EQ(drain[14],0); EXPECT_EQ(drain[15],0); EXPECT_EQ(drain[16],9);
 	http2_stream_close(stream);
 	http2_ctx_close(ctx);
