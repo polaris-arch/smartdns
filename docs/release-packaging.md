@@ -4,7 +4,7 @@ The upstream reference is [`pymumu/smartdns`](https://github.com/pymumu/smartdns
 [release workflow](https://github.com/pymumu/smartdns/blob/master/.github/workflows/release.yml)
 and [Release48.4 assets](https://github.com/pymumu/smartdns/releases/expanded_assets/Release48.4).
 The workflow was compared with upstream commit
-`dfc9ef4bd947891178924c06070fbccc3ea370ba`.
+`65832a19c248f8a0f8714304d819e1da408b3835` (2026-11-07).
 
 ## Names and versions
 
@@ -36,10 +36,31 @@ The workflow was compared with upstream commit
 
 ## CI and publication
 
+Upstream's ordinary native and WebUI jobs remain the baseline: build and test,
+with publishing reserved for the release workflow. Polaris additionally retains
+both non-QUIC and QUIC native profiles, complete release ASan/UBSan suites,
+critical-case execution checks, locked source inputs and package identity checks.
+The historical offline comparison remains a release gate because its real
+HTTP/1.1 sustained-429 recovery case is not replaced by the HTTP/2 tests.
+The explicit WebUI `full_validation`/OpenWrt SDK workflow is unchanged; it is
+not part of ordinary push or release validation. A changed SDK source still
+requires a matching source archive pin and its separate SDK acceptance.
+
+Release packaging builds the architecture-independent static pages once instead
+of invoking npm for each of the 14 UI packaging calls. All 18 full-distribution
+UI packages must contain that exact static file inventory and bytes; the C/Rust
+builds and per-architecture plugin checks still run independently. A job-local
+manifest binds the pages to source/patch/lock inputs and the run/attempt/commit.
+`SMARTDNS_WEBUI_MANIFEST` is an explicit same-job reuse input, not a persistent
+cache. A changed input, missing/extra output, symlink or foreign run fails closed.
+Without it, `package/build-pkg.sh` still builds fresh pinned pages as before.
+
 Ordinary C/C++ CI builds and tests; it does not publish packages. Run
 **Build and Release Artifacts** (`release.yml`) to run the full validation gate,
 build packages and retain an Actions artifact before publishing:
 
+- `build_only: true`: run all checks and retain packages/evidence in Actions
+  without publishing or changing a tag or Release.
 - `target: all` (default), `release_tag: ''`: refresh the prerelease with display
   name **`nightly-polaris`**, keeping the upstream tag name **`nightly`** and
   pinning it to the exact built commit. No `nightly-polaris` tag is created or

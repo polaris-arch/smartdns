@@ -15,7 +15,7 @@ on:
         default: false
         type: boolean
   push:
-    branches: [ master, polaris-main, dots/upstream-backpressure-any-20261019 ]
+    branches: [ master, polaris-main ]
   pull_request:
     branches: [ master, polaris-main ]
 
@@ -39,7 +39,8 @@ jobs:
     - uses: actions/checkout@v4
       with:
         persist-credentials: false
-    - name: Check result-gate and measurement source fixtures
+    - name: Check result-gate and packaging fixtures
+      if: matrix.profile == 'system'
       run: |
         python3 .github/scripts/check-native-results.py --self-test
         python3 .github/scripts/benchmark-native-offline.py --self-test

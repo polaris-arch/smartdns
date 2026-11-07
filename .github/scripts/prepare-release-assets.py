@@ -9,6 +9,7 @@ Polaris epoch/revision; see docs/release-packaging.md for that version contract.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -201,6 +202,45 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def webui_files(directory):
+    """Exact static payload, shared by this run's architecture-independent pages."""
+    if directory.is_symlink() or not directory.is_dir() or directory.resolve() != directory.absolute():
+        raise ValueError("WebUI output must be a real directory")
+    files = {}
+    for path in sorted(directory.rglob('*')):
+        if path.is_symlink() or not (path.is_dir() or path.is_file()):
+            raise ValueError(f"invalid WebUI entry: {path}")
+        if path.is_file():
+            files[path.relative_to(directory).as_posix()] = dict(size=path.stat().st_size, sha256=sha256(path))
+    for name in ('index.html', 'dashboard/upstream-servers.html'):
+        if name not in files or files[name]['size'] == 0:
+            raise ValueError(f"missing WebUI page: {name}")
+    return files
+
+
+def webui_snapshot(source, root):
+    identity = {key: os.environ[key] for key in ('GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT')}
+    if not all(identity.values()):
+        raise ValueError("same-run WebUI identity required")
+    inputs = [root / 'package/webui' / name for name in
+              ('source.conf', 'prepare-source.sh', 'preimage.sha256', 'postimage.sha256',
+               'service-pool.patch', 'build.sh')]
+    inputs.append(source / 'package-lock.json')
+    if any(p.is_symlink() or not p.is_file() for p in inputs) or source.resolve() != source.absolute():
+        raise ValueError("invalid WebUI build inputs")
+    return dict(identity=identity, inputs={p.name: sha256(p) for p in inputs},
+                files=webui_files(source / 'out'))
+
+
+def verify_webui(source, manifest, root):
+    if manifest.is_symlink() or not manifest.is_file() or manifest.resolve() != manifest.absolute():
+        raise ValueError("same-run WebUI manifest missing")
+    actual = webui_snapshot(source, root)
+    if actual != json.loads(manifest.read_text()):
+        raise ValueError("WebUI source/run/output differs from this run's build")
+    print(f"Verified same-run WebUI payload: {len(actual['files'])} files.")
+
+
 def prepare(directory, version, target):
     expected = expected_assets(version, target)
     actual = {path.name for path in directory.iterdir()}
@@ -228,6 +268,60 @@ def prepare(directory, version, target):
 
 class ContractTests(unittest.TestCase):
     version = "1.2026.08.05-0921"
+
+    def test_same_run_webui_rejects_foreign_inputs_and_changed_inventory(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            'GITHUB_SHA': 'a' * 40, 'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1',
+        }):
+            root = Path(tmp)
+            inputs = root / 'package/webui'
+            inputs.mkdir(parents=True)
+            for name in ('source.conf', 'prepare-source.sh', 'preimage.sha256',
+                         'postimage.sha256', 'service-pool.patch', 'build.sh'):
+                (inputs / name).write_text('original')
+            source = root / 'source'
+            (source / 'out/dashboard').mkdir(parents=True)
+            (source / 'package-lock.json').write_text('locked')
+            (source / 'out/index.html').write_text('index')
+            (source / 'out/dashboard/upstream-servers.html').write_text('servers')
+            manifest = root / 'manifest.json'
+            with self.assertRaises(ValueError):
+                verify_webui(source, manifest, root)
+            manifest.write_text(json.dumps(webui_snapshot(source, root)))
+            verify_webui(source, manifest, root)
+            alias = root / 'alias'
+            alias.symlink_to(source, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                verify_webui(alias, manifest, root)
+            extra_link = source / 'out/linked-directory'
+            extra_link.symlink_to(source / 'out/dashboard', target_is_directory=True)
+            with self.assertRaises(ValueError):
+                verify_webui(source, manifest, root)
+            extra_link.unlink()
+            for key in ('GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'):
+                with self.subTest(identity=key), patch.dict(os.environ, {key: 'other'}):
+                    with self.assertRaises(ValueError):
+                        verify_webui(source, manifest, root)
+            for path in [inputs / 'service-pool.patch', source / 'package-lock.json',
+                         source / 'out/index.html']:
+                old = path.read_bytes()
+                path.write_text('changed')
+                with self.subTest(changed=str(path)), self.assertRaises(ValueError):
+                    verify_webui(source, manifest, root)
+                path.write_bytes(old)
+            extra = source / 'out/extra.html'
+            extra.write_text('extra')
+            with self.assertRaises(ValueError):
+                verify_webui(source, manifest, root)
+            extra.unlink()
+            page = source / 'out/index.html'
+            page.unlink()
+            with self.assertRaises(ValueError):
+                verify_webui(source, manifest, root)
+            page.symlink_to(source / 'out/dashboard/upstream-servers.html')
+            with self.assertRaises(ValueError):
+                verify_webui(source, manifest, root)
 
     def test_debian_epoch_and_fork_update_order(self):
         version = debian_version(self.version, "12.1")
@@ -540,6 +634,9 @@ class ContractTests(unittest.TestCase):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--record-webui", type=Path)
+    parser.add_argument("--verify-webui", type=Path)
+    parser.add_argument("--webui-manifest", type=Path)
     parser.add_argument("--check-tag")
     parser.add_argument("--clean-nightly", action="store_true")
     parser.add_argument("--verify-tag")
@@ -558,7 +655,13 @@ def main():
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(ContractTests)
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
     try:
-        if args.debian_architecture and args.architecture:
+        if args.record_webui and args.webui_manifest:
+            with args.webui_manifest.open('x') as out:
+                json.dump(webui_snapshot(args.record_webui, Path(__file__).resolve().parents[2]), out, indent=2)
+                out.write('\n')
+        elif args.verify_webui and args.webui_manifest:
+            verify_webui(args.verify_webui, args.webui_manifest, Path(__file__).resolve().parents[2])
+        elif args.debian_architecture and args.architecture:
             print(DEBIAN_ARCHITECTURES[args.architecture])
         elif args.debian_version:
             print(debian_version(args.version, args.revision))

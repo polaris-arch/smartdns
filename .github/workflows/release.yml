@@ -39,44 +39,6 @@ jobs:
     with:
       release_validation: true
 
-  check_updates:
-    permissions:
-      contents: read
-    name: Check for updates (Schedule only)
-    runs-on: ubuntu-latest
-    outputs:
-      should_run: ${{ steps.decision.outputs.should_run }}
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Make decision
-        id: decision
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            # Fetch the nightly tag from origin
-            git fetch origin refs/tags/nightly:refs/tags/nightly || true
-            if git rev-parse refs/tags/nightly >/dev/null 2>&1; then
-              NIGHTLY_SHA=$(git rev-parse refs/tags/nightly)
-              CURRENT_SHA=$(git rev-parse HEAD)
-              if [ "$NIGHTLY_SHA" = "$CURRENT_SHA" ]; then
-                echo "Current commit ($CURRENT_SHA) is the same as the existing nightly tag. Skipping scheduled build."
-                echo "should_run=false" >> $GITHUB_OUTPUT
-              else
-                echo "New commits detected since the last nightly tag. Running scheduled build."
-                echo "should_run=true" >> $GITHUB_OUTPUT
-              fi
-            else
-              echo "No existing nightly tag found. Running build."
-              echo "should_run=true" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "Not a scheduled run (event: ${{ github.event_name }}). Running build."
-            echo "should_run=true" >> $GITHUB_OUTPUT
-          fi
-
   build-release:
     name: Build Cross-Compiled Artifacts
     permissions:
@@ -90,8 +52,7 @@ jobs:
       tree: ${{ steps.identity.outputs.tree }}
       attempt: ${{ steps.identity.outputs.attempt }}
       version: ${{ steps.packages.outputs.version }}
-    needs: [check_updates, validate]
-    if: needs.check_updates.outputs.should_run == 'true'
+    needs: [validate]
     runs-on: ubuntu-22.04
 
     steps:
@@ -485,6 +446,13 @@ jobs:
           EOF
 
           chmod +x build-static.sh
+          # Static pages do not depend on the target C/Rust architecture.
+          # Build clean pinned inputs once, then fail closed on any changed byte.
+          sh package/webui/build.sh "$PWD/package/target"
+          export SMARTDNS_WEBUI_MANIFEST="$PWD/release-evidence/frontend-build.json"
+          python3 .github/scripts/prepare-release-assets.py \
+            --record-webui "$PWD/package/target/smartdns-webui" \
+            --webui-manifest "$SMARTDNS_WEBUI_MANIFEST"
           ./build-static.sh
           sha256sum -c release-evidence/lock.before
           sha256sum plugin/smartdns-ui/Cargo.lock > release-evidence/lock.after
@@ -527,14 +495,34 @@ jobs:
           VERSION: ${{ steps.packages.outputs.version }}
         run: |
           python3 - <<'PYPACKAGES'
-          import hashlib, io, json, os, pathlib, struct, subprocess, tarfile, tempfile
+          import hashlib, importlib.util, io, json, os, pathlib, struct, subprocess, tarfile, tempfile
           evidence = pathlib.Path('release-evidence')
+          spec = importlib.util.spec_from_file_location('release_assets', '.github/scripts/prepare-release-assets.py')
+          assets = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(assets)
           # ELF class/machine are an output check, not a Rust target mapping.
           machines = {'arm': (1, 40), 'aarch64': (2, 183), 'x86_64': (2, 62), 'x86': (1, 3)}
           arches = list(machines) if os.environ['BUILD_TARGET'] == 'all' else ['x86_64']
           records = {}
-          def plugin_from_tar(data):
+          pages = json.loads((evidence / 'frontend-build.json').read_text())['files']
+          def pages_from_tar(archive, package_root):
+              result = {}
+              prefix = package_root + 'usr/share/smartdns/wwwroot/'
+              for member in archive.getmembers():
+                  path = member.name.removeprefix('./')
+                  if not path.startswith(prefix):
+                      continue
+                  name = path[len(prefix):]
+                  if member.isdir():
+                      continue
+                  assert member.isfile() and name not in result, 'invalid packaged WebUI entry'
+                  data = archive.extractfile(member).read()
+                  result[name] = dict(size=len(data), sha256=hashlib.sha256(data).hexdigest())
+              assert result == pages, 'packaged static WebUI differs from the single build'
+              return result
+          def plugin_from_tar(data, package_root):
               with tarfile.open(fileobj=io.BytesIO(data), mode='r:*') as tar:
+                  pages_from_tar(tar, package_root)
                   matches = [m for m in tar.getmembers() if m.isfile() and m.name.endswith('/smartdns_ui.so')]
                   assert len(matches) == 1, 'missing/duplicate packaged plugin'
                   return tar.extractfile(matches[0]).read()
@@ -547,23 +535,25 @@ jobs:
                   if p.suffix == '.ipk':
                       with tarfile.open(p, 'r:gz') as outer:
                           member, = [m for m in outer.getmembers() if m.name.lstrip('./') == 'data.tar.gz']
-                          data = plugin_from_tar(outer.extractfile(member).read())
+                          data = plugin_from_tar(outer.extractfile(member).read(), 'opt/' if '-optware-' in p.name else '')
                   elif p.suffix == '.deb':
-                      data = plugin_from_tar(subprocess.check_output(['dpkg-deb', '--fsys-tarfile', str(p)]))
+                      data = plugin_from_tar(subprocess.check_output(['dpkg-deb', '--fsys-tarfile', str(p)]), '')
                   elif p.suffix == '.apk':
                       with tempfile.TemporaryDirectory() as tmp:
                           subprocess.run(['apk', 'extract', '--allow-untrusted', '--destination', tmp, str(p.resolve())], check=True)
                           plugin, = pathlib.Path(tmp).rglob('smartdns_ui.so')
                           assert not plugin.is_symlink()
                           data = plugin.read_bytes()
+                          wwwroot, = pathlib.Path(tmp).rglob('wwwroot')
+                          assert assets.webui_files(wwwroot) == pages, 'APK WebUI payload mismatch'
                   else:
-                      data = plugin_from_tar(p.read_bytes())
+                      data = plugin_from_tar(p.read_bytes(), 'smartdns/')
                   assert hashlib.sha256(data).hexdigest() == expected, 'packaged plugin mismatch: ' + p.name
                   assert data[:4] == b'\x7fELF' and data[5] == 1, 'expected little-endian ELF'
                   assert (data[4], struct.unpack('<H', data[18:20])[0]) == machines[arch], 'wrong ELF architecture'
                   version = (evidence / 'git-describe.txt').read_text().strip()
                   assert version.encode() in data, 'actual plugin lacks source version'
-                  records[p.name] = dict(plugin_sha256=expected, elf_class=data[4], elf_machine=machines[arch][1], git_describe=version)
+                  records[p.name] = dict(plugin_sha256=expected, elf_class=data[4], elf_machine=machines[arch][1], git_describe=version, webui_files=len(pages))
           expected_count = 18 if os.environ['BUILD_TARGET'] == 'all' else 4
           assert len(records) == expected_count, 'UI package evidence count mismatch'
           (evidence / 'packaged-plugins.json').write_text(json.dumps(records, sort_keys=True, indent=2) + '\n')
