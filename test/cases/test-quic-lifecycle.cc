@@ -146,14 +146,15 @@ protected:
         size_t n=0;
         return SSL_write_ex(s,data.data(),data.size(),&n)==1 && n==data.size();
     }
-    dns_conn_stream *Request() {
+    dns_conn_stream *Request(bool uni=false) {
         auto *r=_dns_client_conn_stream_new();
         if (!r) return nullptr;
         requests.push_back(r); r->server_info=&endpoint; r->query=&query;
 #ifndef UPSTREAM_BASELINE
         r->query_id=query.sid;
-#endif r->type=endpoint.type;
-        r->quic_stream=SSL_new_stream(endpoint.ssl,0);
+#endif
+        r->type=endpoint.type;
+        r->quic_stream=SSL_new_stream(endpoint.ssl,uni?SSL_STREAM_FLAG_UNI:0);
         if (!r->quic_stream) return nullptr;
         SSL_set_ex_data(r->quic_stream,0,r);
         list_add_tail(&r->server_list,&endpoint.conn_stream_list); _dns_client_conn_stream_get(r);
@@ -223,6 +224,23 @@ TEST_F(QuicLifecycle, ResetIsProcessedWithoutKernelReadability) {
 #ifndef UPSTREAM_BASELINE
     EXPECT_EQ(_dns_client_quic_timeout(&endpoint,1000),0);
 #endif
+    Service();
+    EXPECT_TRUE(list_empty(&r->server_list));
+    EXPECT_NE(endpoint.ssl,nullptr);
+}
+TEST_F(QuicLifecycle, StopSendingAloneRetiresTheWriteSide) {
+    Connect(false); ASSERT_TRUE(endpoint.ssl && peer);
+    // A write-only stream isolates EW: the peer cannot also send RESET_STREAM.
+    auto *r=Request(true); ASSERT_TRUE(r && r->quic_stream);
+    SSL *remote=AcceptRequest(); ASSERT_NE(remote,nullptr);
+    peer_streams.erase(std::remove(peer_streams.begin(),peer_streams.end(),remote),peer_streams.end());
+    SSL_free(remote); // abandon the unread receive-only side: STOP_SENDING
+    ASSERT_TRUE(Until([&] { return SSL_get_stream_write_state(r->quic_stream)==SSL_STREAM_STATE_RESET_REMOTE; }));
+    SSL_POLL_ITEM item{}; item.desc=SSL_as_poll_descriptor(r->quic_stream);
+    item.events=SSL_POLL_EVENT_ER|SSL_POLL_EVENT_EW; const timeval zero{}; size_t ready=0;
+    ASSERT_EQ(SSL_poll(&item,1,sizeof(item),&zero,SSL_POLL_FLAG_NO_HANDLE_EVENTS,&ready),1);
+    EXPECT_TRUE(item.revents&SSL_POLL_EVENT_EW);
+    EXPECT_FALSE(item.revents&SSL_POLL_EVENT_ER);
     Service();
     EXPECT_TRUE(list_empty(&r->server_list));
     EXPECT_NE(endpoint.ssl,nullptr);

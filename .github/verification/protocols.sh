@@ -26,7 +26,7 @@ if profile=='http2':
     filename='test-http2-cancellation.cc'
 else:
     s=(r/'test/cases/test-quic-lifecycle.cc').read_text()
-    keep={'LocalControlStartsWithSettingsAndRemainsOpen','ResetIsProcessedWithoutKernelReadability','HardReadErrorRetiresTheStream','CompleteDoqPayloadWaitsForNormalFin'}
+    keep={'LocalControlStartsWithSettingsAndRemainsOpen','ResetIsProcessedWithoutKernelReadability','HardReadErrorRetiresTheStream','CompleteDoqPayloadWaitsForNormalFin','StopSendingAloneRetiresTheWriteSide'}
     (b/'src/dns_client/client_http3_control.h').write_text((r/'src/dns_client/client_http3_control.h').read_text())
     s='#define UPSTREAM_BASELINE\n'+s
     with (b/'test/Makefile').open('a') as f:f.write('\nLDFLAGS += -Wl,--wrap=_dns_client_socket_ssl_recv_ext,--wrap=_dns_client_recv\n')
@@ -68,7 +68,7 @@ r=E.parse(sys.argv[1]).getroot()
 assert int(r.attrib['failures'])==0
 if sys.argv[2]!='http2':
     suite=r.find("testsuite[@name='QuicLifecycle']")
-    assert suite is not None and int(suite.attrib['tests'])==9 and int(suite.attrib['skipped'])==0
+    assert suite is not None and int(suite.attrib['tests'])==10 and int(suite.attrib['skipped'])==0
 print('Candidate:',r.attrib)
 PY
 git diff --exit-code -- src test
