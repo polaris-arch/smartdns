@@ -56,6 +56,7 @@ LDFLAGS += -lssl -lcrypto -lpthread -ldl -lgtest -lstdc++ -lm -rdynamic
 LDFLAGS += -Wl,--wrap=time,--wrap=fork,--wrap=waitpid,--wrap=kill,--wrap=close,--wrap=dns_cache_save,--wrap=_exit
 LDFLAGS += $(ZLIB_LDFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
+LDFLAGS += -Wl,--wrap=pthread_create,--wrap=_dns_client_socket_ssl_send_ext
 
 .PHONY: all clean test $(SMARTDNS_TEST_LIB)
 
@@ -73,5 +74,3 @@ $(SMARTDNS_TEST_LIB):
 clean:
 	$(RM) $(OBJS) $(BIN)
 	$(MAKE) -C $(SMARTDNS_SRC_DIR) clean
-
-LDFLAGS += -Wl,--wrap=pthread_create,--wrap=_dns_client_socket_ssl_send_ext
