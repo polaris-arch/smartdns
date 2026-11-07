@@ -165,3 +165,17 @@ TEST_F(Http2Cancellation, CompletedResponseSurvivesFollowingNoErrorReset) {
     EXPECT_EQ(body[0],1); EXPECT_EQ(body[2],3);
     EXPECT_EQ(http2_stream_is_end(stream),1);
 }
+TEST_F(Http2Cancellation, CompletedServerRequestStillHonorsPeerCancellation) {
+    http2_ctx_close(ctx); ctx=http2_ctx_server_new("server.test",Read,Write,this,nullptr);
+    ASSERT_NE(ctx,nullptr); input.clear(); output.clear();
+    const char preface[]="PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    input.insert(input.end(),preface,preface+sizeof(preface)-1);
+    Frame(4,0,0,{});
+    Frame(1,5,1,{0x82,0x84,0x87,0x01,9,'l','o','c','a','l','h','o','s','t'});
+    ASSERT_EQ(http2_ctx_handshake(ctx),1);
+    auto *stream=http2_ctx_accept_stream(ctx); ASSERT_NE(stream,nullptr); owned.push_back(stream);
+    EXPECT_EQ(http2_stream_is_remote_end(stream),1);
+    EXPECT_EQ(http2_stream_is_reset(stream),0);
+    Frame(3,0,1,{0,0,0,8}); http2_ctx_poll(ctx,nullptr,0,nullptr);
+    EXPECT_EQ(http2_stream_is_reset(stream),1);
+}
