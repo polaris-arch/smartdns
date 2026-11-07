@@ -9,11 +9,11 @@ PKG_NAME:=smartdns
 PKG_VERSION:=1.2025.46.2
 PKG_RELEASE:=4
 
-PKG_SOURCE_VERSION:=75899b2bfc03521487e0eed975f86b8cafc9cd25
+PKG_SOURCE_VERSION:=a3adbeda1f89dea7ad2c8f6fb874e8df04f9f1ee
 PKG_SOURCE:=smartdns-$(PKG_SOURCE_VERSION).tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/polaris-arch/smartdns/tar.gz
 PKG_SOURCE_URL_FILE:=$(PKG_SOURCE_VERSION)
-PKG_HASH:=63da049ccf9662a05e070c812f7b1da4821246edd0087a22791038bcad160b23
+PKG_HASH:=add6c6c553fd5fa89ed0834c43283d36374c587283584d9052e4378888982cf3
 PKG_BUILD_DIR:=$(BUILD_DIR)/smartdns-$(PKG_SOURCE_VERSION)
 
 # Must match package/webui/source.conf; preparation verifies this archive again.
