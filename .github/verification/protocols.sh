@@ -53,10 +53,27 @@ assert int(r.attrib['failures'])>0 and int(r.attrib['tests'])>0
 print('Baseline functional failures:',r.attrib['failures'])
 PY
 fi
+if [ "$PROFILE" = http2 ]; then
+  previous=/tmp/previous-http2
+  git worktree add --detach "$previous" 6e69f21a0d037566b1cebfdd34e878b5cb2869b7
+  cp "$root/test/cases/test-http2-cancellation.cc" "$previous/test/cases/test-http2-cancellation.cc"
+  make -C "$previous/test" -j4 > "$proof/previous-build.log" 2>&1
+  set +e
+  timeout 60 "$previous/test/test.bin" --gtest_filter=Http2Cancellation.CompletedServerRequestStillHonorsPeerCancellation --gtest_output="xml:$proof/previous.xml" > "$proof/previous.log" 2>&1
+  previous_result=$?
+  set -e
+  test "$previous_result" -eq 1
+  python3 - "$proof/previous.xml" <<'PYPREVIOUS'
+import sys,xml.etree.ElementTree as E
+r=E.parse(sys.argv[1]).getroot()
+assert int(r.attrib['tests'])==1 and int(r.attrib['failures'])==1
+print('Previous complete-request cancellation regression reproduced.')
+PYPREVIOUS
+fi
 if [ "$PROFILE" = sanitizers ]; then
   make -C test -j4 CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' CXXFLAGS='-O1 -g -DTEST -I./ -I../src -I../src/include -fsanitize=address,undefined -fno-omit-frame-pointer' EXTRA_LDFLAGS='-fsanitize=address,undefined' > "$proof/candidate-build.log" 2>&1
   export ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
-  filter='Http2Cancellation.*:Http3Control.*:Http3RequestFraming.*:QuicLifecycle.*:HeaderCompression.*'
+  filter='Http2Cancellation.*:Http3Control.*:Http3RequestFraming.*:QuicLifecycle.*:HeaderCompression.*:Cache.PersistedLifetimeAndCountersAreValidatedBeforeUse'
 else
   make -C test -j4 > "$proof/candidate-build.log" 2>&1
   filter='*'
@@ -67,7 +84,7 @@ python3 - "$proof/candidate.xml" "$PROFILE" <<'PY'
 import sys,xml.etree.ElementTree as E
 r=E.parse(sys.argv[1]).getroot()
 assert int(r.attrib['failures'])==0
-if sys.argv[2]!='http2':
+if sys.argv[2] in ('sanitizers','integration','quic-http3'):
     suite=r.find("testsuite[@name='QuicLifecycle']")
     assert suite is not None and int(suite.attrib['tests'])==10 and int(suite.attrib['skipped'])==0
 print('Candidate:',r.attrib)
