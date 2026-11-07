@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{"profile": "http2", "sha": "b57a2e45c3804629d11bdec3f8f510bf48c62e1c", "sdk": "native"}]
+        include: [{"profile": "quic-http3", "sha": "af6f2a6dcf725cd40157e37a08c535cc9e3cdaf5", "sdk": "3.5"}]
     env:
       PROFILE: ${{ matrix.profile }}
       CANDIDATE: ${{ matrix.sha }}
