@@ -235,7 +235,11 @@ TEST_F(QuicLifecycle, StopSendingAloneRetiresTheWriteSide) {
     SSL *remote=AcceptRequest(); ASSERT_NE(remote,nullptr);
     peer_streams.erase(std::remove(peer_streams.begin(),peer_streams.end(),remote),peer_streams.end());
     SSL_free(remote); // abandon the unread receive-only side: STOP_SENDING
-    ASSERT_TRUE(Until([&] { return SSL_get_stream_write_state(r->quic_stream)==SSL_STREAM_STATE_RESET_REMOTE; }));
+    ASSERT_TRUE(Until([&] {
+        SSL_POLL_ITEM pending{}; pending.desc=SSL_as_poll_descriptor(r->quic_stream);
+        pending.events=SSL_POLL_EVENT_EW; const timeval zero{}; size_t ready=0;
+        return SSL_poll(&pending,1,sizeof(pending),&zero,SSL_POLL_FLAG_NO_HANDLE_EVENTS,&ready)==1 && ready;
+    }));
     SSL_POLL_ITEM item{}; item.desc=SSL_as_poll_descriptor(r->quic_stream);
     item.events=SSL_POLL_EVENT_ER|SSL_POLL_EVENT_EW; const timeval zero{}; size_t ready=0;
     ASSERT_EQ(SSL_poll(&item,1,sizeof(item),&zero,SSL_POLL_FLAG_NO_HANDLE_EVENTS,&ready),1);

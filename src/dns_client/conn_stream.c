@@ -130,7 +130,13 @@ void _dns_client_conn_stream_cancel(struct dns_conn_stream *stream)
 	struct dns_server_info *server = stream->server_info;
 	struct http2_stream *http2 = NULL;
 	int put_server = 0;
-	if (server) pthread_mutex_lock(&server->lock);
+    /* A detached stream is already being closed by its current owner. */
+    if (!server) return;
+    pthread_mutex_lock(&server->lock);
+    if (stream->server_info != server) {
+        pthread_mutex_unlock(&server->lock);
+        return;
+    }
 	if (!list_empty(&stream->server_list)) {
 		list_del_init(&stream->server_list);
 		stream->server_info = NULL;
@@ -139,7 +145,7 @@ void _dns_client_conn_stream_cancel(struct dns_conn_stream *stream)
 	http2 = stream->http2_stream;
 	stream->http2_stream = NULL;
 	stream->send_buff.len = 0;
-	if (server) pthread_mutex_unlock(&server->lock);
+	pthread_mutex_unlock(&server->lock);
 	if (http2) http2_stream_abort(http2);
 	if (put_server) _dns_client_conn_stream_put(stream);
 }
