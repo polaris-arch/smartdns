@@ -139,6 +139,7 @@ struct dns_server_info {
 
 	/* HTTP/2 context - connection level, shared across requests */
 	struct http2_ctx *http2_ctx;
+	struct dns_http3_control *http3_control;
 	char alpn_selected[32];
 
 	dns_server_security_status security_status;
