@@ -73,3 +73,5 @@ $(SMARTDNS_TEST_LIB):
 clean:
 	$(RM) $(OBJS) $(BIN)
 	$(MAKE) -C $(SMARTDNS_SRC_DIR) clean
+
+LDFLAGS += -Wl,--wrap=pthread_create,--wrap=_dns_client_socket_ssl_send_ext

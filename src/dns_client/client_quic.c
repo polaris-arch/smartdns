@@ -422,7 +422,7 @@ static int _dns_client_process_quic_stream_read(struct dns_server_info *server_i
                 if (msg_len < 12 || msg_len >= DNS_IN_PACKSIZE || wire_id != 0 ||
                     conn_stream->recv_buff.len != msg_len + 2) stream_ret = -1;
                 else {
-                    unsigned short qid = htons(conn_stream->query->sid);
+                    unsigned short qid = htons(conn_stream->query_id);
                     memcpy(data + 2, &qid, 2);
                     stream_ret = _dns_client_recv(server_info, data + 2, msg_len,
                                                   &server_info->addr, server_info->ai_addrlen);
@@ -607,20 +607,20 @@ static int _dns_client_quic_handle_send_result(struct dns_conn_stream *conn_stre
 {
 	if (send_len < 0) {
 		if (errno == EAGAIN) {
-			*epoll_events = EPOLLIN | EPOLLOUT;
+			*epoll_events = EPOLLIN;
 			return 0;
 		}
 		return -1;
 	}
 
 	if (send_len == 0) {
-		*epoll_events = EPOLLIN | EPOLLOUT;
+		*epoll_events = EPOLLIN;
 		return 0;
 	}
 
 	_dns_client_quic_consume_send_buffer(conn_stream, send_len);
 	if (conn_stream->send_buff.len > 0) {
-		*epoll_events = EPOLLIN | EPOLLOUT;
+		*epoll_events = EPOLLIN;
 	}
 
 	return 0;
@@ -737,7 +737,7 @@ int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_e
     }
 	/* An ICMP/socket error can be reported without EPOLLIN. Let QUIC consume
 	 * the network event instead of leaving a level-triggered error pending. */
-	if (event->events & (EPOLLIN | EPOLLERR)) {
+	if (event->events & (EPOLLIN | EPOLLERR | EPOLLOUT)) {
 		if ((_ssl_do_handevent(server_info) <= 0 && !server_info->service_quic_close_valid) || server_info->egress_revoked) {
             _dns_client_close_socket(server_info); return -1;
         }
@@ -753,7 +753,7 @@ int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_e
         }
 	}
 
-	if (event->events & EPOLLOUT) {
+	{ /* SDK input and timer turns can restore stream credit without UDP EPOLLOUT. */
 		int epoll_events = EPOLLIN;
 		struct dns_conn_stream *conn_stream = NULL, *next = NULL;
 		 pthread_mutex_lock(&server_info->lock);
@@ -775,6 +775,9 @@ int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_e
 		}
 		pthread_mutex_unlock(&server_info->lock);
 
+        pthread_mutex_lock(&server_info->lock);
+        if (server_info->ssl && SSL_net_write_desired(server_info->ssl)) epoll_events |= EPOLLOUT;
+        pthread_mutex_unlock(&server_info->lock);
 		if (server_info->fd > 0) {
 			/* clear epollout event */
 			struct epoll_event mod_event;
@@ -828,6 +831,7 @@ static int _dns_client_quic_pending_data(struct dns_conn_stream *stream, struct 
 	if (list_empty(&stream->query_list)) {
 		pthread_mutex_lock(&query->lock);
 		stream->query = query;
+		stream->query_id = query->sid;
 		list_add_tail(&stream->query_list, &query->conn_stream_list);
 		pthread_mutex_unlock(&query->lock);
 		_dns_client_conn_stream_get(stream);

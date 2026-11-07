@@ -119,7 +119,7 @@ static int h3_parse(struct dns_http3_control *c, struct h3_peer_stream *p)
                     shift += 7;
                 }
             }
-            if (id & 3) return h3_fail(c, 0x202);
+            if ((id & 3) || id > (UINT64_C(1) << 62) - 1) return h3_fail(c, 0x202);
             h3_consume(p, n);
             c->transitions++;
         }

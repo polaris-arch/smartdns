@@ -308,6 +308,7 @@ struct dns_conn_stream {
 	int send_formatted, send_offset, write_attempted;
 	int http3_started;
 	unsigned int attempt_generation;
+	unsigned short query_id; /* DoQ identity is independent of a canceled query lifetime. */
 	SSL *quic_stream;
 	struct http2_stream *http2_stream;
 	dns_server_type_t type;

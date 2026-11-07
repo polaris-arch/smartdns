@@ -64,6 +64,15 @@ TEST(Http3Control, GoogleZeroCapacityIsIdempotentAndDoesNotAllowDynamicInstructi
         EXPECT_EQ(_dns_http3_error(&c.server), 0x201U);
     }
 }
+TEST(Http3Control, DecoderCancellationUsesOnlyQuicStreamIdentifiers) {
+    auto cancellation = [](uint64_t id) {
+        std::vector<unsigned char> bytes={3,0x7f}; id-=63;
+        while (id>=128) { bytes.push_back((id&127)|128); id>>=7; }
+        bytes.push_back(id); return bytes;
+    };
+    { Control c; EXPECT_EQ(c.Feed(0,cancellation((UINT64_C(1)<<62)-4)),0); }
+    { Control c; EXPECT_LT(c.Feed(0,cancellation(UINT64_C(1)<<62)),0); }
+}
 TEST(Http3Control, GoawayStopsNewAndClassifiesAlreadyStarted) {
     Control c;
     EXPECT_EQ(c.Feed(0, {0,4,0,7,1,8}), 0);

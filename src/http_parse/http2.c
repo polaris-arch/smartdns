@@ -1787,7 +1787,9 @@ static int _http2_process_frames(struct http2_ctx *ctx)
 			{
 				struct http2_stream *rst_stream = _http2_find_stream(ctx, stream_id);
 				if (rst_stream) {
-					__atomic_store_n(&rst_stream->reset_received, 1, __ATOMIC_RELEASE);
+                    /* A complete response survives a following NO_ERROR reset (RFC 9113 8.1). */
+                    if (!ctx->is_client || !rst_stream->end_stream_received)
+                        __atomic_store_n(&rst_stream->reset_received, 1, __ATOMIC_RELEASE);
 					rst_stream->state = HTTP2_STREAM_CLOSED;
 				}
 			}
@@ -1806,7 +1808,9 @@ static int _http2_process_frames(struct http2_ctx *ctx)
             struct http2_stream *pending;
             list_for_each_entry(pending, &ctx->streams, node) {
                 if (_http2_is_local_stream_id(ctx, pending->stream_id) && pending->stream_id > last) {
-                    pending->reset_received = 1; pending->state = HTTP2_STREAM_CLOSED;
+                    if (!ctx->is_client || !pending->end_stream_received)
+                        __atomic_store_n(&pending->reset_received, 1, __ATOMIC_RELEASE);
+                    pending->state = HTTP2_STREAM_CLOSED;
                 }
             }
             break;
@@ -2377,11 +2381,13 @@ void http2_stream_abort(struct http2_stream *stream)
     struct http2_ctx *ctx = stream->ctx;
     if (ctx) {
         pthread_mutex_lock(&ctx->mutex);
+        int send_rst = ctx->status >= 0 && stream->state != HTTP2_STREAM_IDLE &&
+            stream->state != HTTP2_STREAM_CLOSED && !(stream->end_stream_sent && stream->end_stream_received);
         _http2_stream_clear_pending_send(stream);
         stream->close_after_send = 0;
         stream->state = HTTP2_STREAM_CLOSED;
         stream->ex_data = NULL;
-        if (ctx->status >= 0 && !(stream->end_stream_sent && stream->end_stream_received))
+        if (send_rst)
             http2_send_rst_stream(ctx, stream->stream_id, 8); /* CANCEL; never flush body */
         pthread_mutex_unlock(&ctx->mutex);
         _http2_remove_stream(stream, 1);

@@ -38,6 +38,8 @@ ip -j -6 route show > ci-results/fixture-routes-v6.json
 command -v dig
 command -v dnsperf
 command -v nft
+command -v ipset
+export SMARTDNS_RUN_IPSET_INTEGRATION=1
 curl --version | grep -q HTTP2
 # Both compile-time headers and linked runtime must match the intended capability.
 cat > /tmp/native-ssl-capability.c <<'C'

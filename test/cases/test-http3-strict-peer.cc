@@ -3,6 +3,7 @@ extern "C" {
 #include "dns_client/client_http3_control.h"
 #include "dns_client/client_quic.h"
 #include "dns_client/client_http3.h"
+#include "dns_client/client_tls.h"
 #include "dns_client/conn_stream.h"
 #include "dns_client/upstream_policy.h"
 #include "smartdns/util.h"
@@ -15,6 +16,15 @@ extern "C" {
 #include <unistd.h>
 #include <vector>
 #include <cstring>
+namespace { thread_local bool block_quic_write; }
+extern "C" int __real__dns_client_socket_ssl_send_ext(dns_server_info *, SSL *, const void *, int, uint64_t);
+extern "C" int __wrap__dns_client_socket_ssl_send_ext(dns_server_info *server, SSL *ssl,
+                                                    const void *data, int size, uint64_t flags) {
+    if (block_quic_write && (server->type == DNS_SERVER_HTTP3 || server->type == DNS_SERVER_QUIC)) {
+        errno=EAGAIN; return -1;
+    }
+    return __real__dns_client_socket_ssl_send_ext(server,ssl,data,size,flags);
+}
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC) && OPENSSL_VERSION_NUMBER >= 0x30500000L
 namespace {
 class StrictPeer : public ::testing::Test {
@@ -140,6 +150,7 @@ protected:
         return offset == data.size();
     }
     void TearDown() override {
+        block_quic_write = false;
         _dns_http3_control_free(&client);
         _dns_policy_detach(&client);
         if (test_epoll >= 0) { ::client.epoll_fd = saved_epoll; close(test_epoll); }
@@ -206,6 +217,35 @@ struct StrictQuery {
         pthread_mutex_destroy(&q.lock);
     }
 };
+}
+TEST_F(StrictPeer, ProductionWantWriteDoesNotKeepUdpWritableAndResumesOnInput) {
+    for (int i=0; i<100 && observed.size()<7; i++) { ASSERT_GE(Pump(),0); usleep(1000); }
+    ASSERT_EQ(observed.size(),7u);
+    StrictQuery request(&client);
+    ASSERT_EQ(_dns_attempt_begin(&request.q,&client),DNS_ADMIT_OK);
+    unsigned char data[]={1,3,0,0,0xd9};
+    block_quic_write=true;
+    ASSERT_EQ(_dns_client_send_quic_data(&request.q,&client,data,sizeof(data)),0);
+    epoll_event event{}; event.events=EPOLLOUT;
+    for (int i=0; i<20; i++) {
+        ASSERT_GE(Pump(),0);
+        ASSERT_EQ(_dns_client_process_quic(&client,&event,get_tick_count()),0);
+        if (!SSL_net_write_desired(client.ssl)) break;
+        usleep(1000);
+    }
+    ASSERT_FALSE(SSL_net_write_desired(client.ssl));
+    epoll_event ready[4]{};
+    int count=epoll_wait(test_epoll,ready,4,0);
+    ASSERT_GE(count,0);
+    for (int i=0; i<count; i++) EXPECT_EQ(ready[i].events & EPOLLOUT,0u);
+    EXPECT_FALSE(dns_query_budget_exhausted(request.q.budget));
+    EXPECT_EQ(observed.size(),7u);
+    block_quic_write=false;
+    event.events=EPOLLIN;
+    ASSERT_EQ(_dns_client_process_quic(&client,&event,get_tick_count()),0);
+    for (int i=0; i<100 && observed.size()<7+sizeof(data); i++) { ASSERT_GE(Pump(),0); usleep(1000); }
+    EXPECT_EQ(observed.size(),7+sizeof(data));
+    EXPECT_NE(client.ssl,nullptr);
 }
 TEST_F(StrictPeer, ProductionQueueCancellationBeforeWriteSpendsNoSendBudget) {
     StrictQuery request(&client);

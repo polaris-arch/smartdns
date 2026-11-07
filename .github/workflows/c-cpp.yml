@@ -56,7 +56,7 @@ jobs:
         FROM ${BASE_IMAGE}
         RUN apt-get update && apt-get install -y --no-install-recommends \
             build-essential git libssl-dev libgtest-dev dnsperf dnsutils curl openssl \
-            pkg-config ca-certificates python3 zlib1g-dev iproute2 nftables && rm -rf /var/lib/apt/lists/*
+            pkg-config ca-certificates python3 zlib1g-dev iproute2 nftables ipset && rm -rf /var/lib/apt/lists/*
         WORKDIR /source
         DOCKERFILE
         docker image inspect smartdns-native-ci > ci-results/image.json
