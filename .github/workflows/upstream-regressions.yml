@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{"profile": "http2", "sha": "35d40bd56ba2e024edc2a86cae751a5139191e31", "sdk": "native"}, {"profile": "quic-http3", "sha": "de20c8106565b1704edb339a8c355bb7e167f5c0", "sdk": "3.5"}, {"profile": "sanitizers", "sha": "cdc66f3", "sdk": "3.5"}]
+        include: [{"profile": "http2", "sha": "860459d6f511ac03818bdcc679faf6cf42220249", "sdk": "native"}, {"profile": "quic-http3", "sha": "7bbdcbee1f857bd5ab86ad81ba443e62f944c99f", "sdk": "3.5"}, {"profile": "sanitizers", "sha": "8226ab409961fdba10ec262766cb69c6133d2b09", "sdk": "3.5"}]
     env:
       PROFILE: ${{ matrix.profile }}
       CANDIDATE: ${{ matrix.sha }}
