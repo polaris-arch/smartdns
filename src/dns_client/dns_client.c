@@ -18,6 +18,8 @@
 
 #define _GNU_SOURCE
 
+#include <limits.h>
+
 #include "smartdns/util.h"
 
 #include "client_http2.h"
@@ -617,13 +619,14 @@ static int _dns_client_quic_pending(unsigned long now, int timeout)
 		pthread_mutex_unlock(&client.server_list_lock);
 		if (server->type == DNS_SERVER_QUIC || server->type == DNS_SERVER_HTTP3) {
 			pthread_mutex_lock(&server->lock);
-			int due = _dns_client_quic_timeout(server, timeout);
+			/* A ready endpoint must not make later idle endpoints appear ready. */
+			int due = _dns_client_quic_timeout(server, INT_MAX);
 			pthread_mutex_unlock(&server->lock);
 			if (due == 0 && server->ssl) {
 				struct epoll_event event = {.events = EPOLLIN, .data.ptr = server};
 				_dns_client_process(server, &event, now);
 				pthread_mutex_lock(&server->lock);
-				due = _dns_client_quic_timeout(server, timeout);
+				due = _dns_client_quic_timeout(server, INT_MAX);
 				pthread_mutex_unlock(&server->lock);
 			}
 			if (due < timeout) timeout = due;

@@ -136,3 +136,18 @@ TEST_F(Http2Cancellation, DetachedStreamHasExactlyOneClosingOwner) {
     EXPECT_EQ(Frames(3),1U);
     _dns_client_conn_stream_put(conn);
 }
+TEST_F(Http2Cancellation, IdleAbortDoesNotResetAnUnopenedStream) {
+    auto *stream=http2_stream_new(ctx); ASSERT_NE(stream,nullptr);
+    owned.push_back(stream);
+    Release(stream,true);
+    EXPECT_EQ(Frames(1),0U);
+    EXPECT_EQ(Frames(3),0U);
+}
+TEST_F(Http2Cancellation, ReceivedResetDoesNotGenerateAnotherReset) {
+    auto *stream=Request(); ASSERT_NE(stream,nullptr);
+    Frame(3,0,http2_stream_get_id(stream),{0,0,0,8});
+    http2_ctx_poll(ctx,nullptr,0,nullptr);
+    EXPECT_EQ(http2_stream_is_reset(stream),1);
+    Release(stream,true);
+    EXPECT_EQ(Frames(3),0U);
+}

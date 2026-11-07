@@ -2345,11 +2345,13 @@ void http2_stream_abort(struct http2_stream *stream)
 	struct http2_ctx *ctx = stream->ctx;
 	if (ctx) {
 		pthread_mutex_lock(&ctx->mutex);
+        int send_rst = ctx->status >= 0 && stream->state != HTTP2_STREAM_IDLE &&
+            stream->state != HTTP2_STREAM_CLOSED && !(stream->end_stream_sent && stream->end_stream_received);
 		_http2_stream_clear_pending_send(stream);
 		stream->close_after_send = 0;
 		stream->state = HTTP2_STREAM_CLOSED;
 		stream->ex_data = NULL;
-		if (ctx->status >= 0 && !(stream->end_stream_sent && stream->end_stream_received))
+		if (send_rst)
 			http2_send_rst_stream(ctx, stream->stream_id, 8); /* CANCEL */
 		pthread_mutex_unlock(&ctx->mutex);
 		_http2_remove_stream(stream, 1);
