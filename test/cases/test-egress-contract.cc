@@ -32,6 +32,8 @@ protected:
     void adopt(dns_server_info &server) { service.wan_count=1;service.egress_contract=1; std::strcpy(service.wans[0].interface,"lo"); server.service=&service; server.type=DNS_SERVER_HTTPS; }
     void SetUp() override {
         ASSERT_EQ(geteuid(), 0U) << "contract fixtures require the privileged offline CI namespace";
+        _dns_egress_close();
+        _dns_egress_test_interface_opens = 0;
         saved = dns_conf.upstream_egress_contract;
         char name[] = "/tmp/smartdns-egress-XXXXXX"; int fd = mkstemp(name);
         ASSERT_GE(fd, 0); close(fd); path = name;
@@ -46,6 +48,7 @@ protected:
         /* Match dns_client_exit: stop discovery/timers before draining and freeing services. */
         _dns_services_stop();_dns_services_remove_all();_dns_paths_close(); free(service.failures); free(service.event_sources);
         std::strcpy(dns_conf.upstream_egress_contract, saved.c_str()); unlink(path.c_str()); _dns_egress_invalidate();
+        _dns_egress_close();
     }
     void write(const std::string &rows, long offset = 10000, const std::string &boot_override = "") {
         std::ofstream out(path); out << "smartdns-egress-v1 4000 " << (_dns_egress_now() + offset) << " " <<
@@ -68,6 +71,34 @@ TEST_F(EgressContract, ExpiryRevocationBootPermissionAndMalformedInputFailClosed
     write(row('a', 4)); EXPECT_EQ(lease(), -1);
     write(""); EXPECT_EQ(lease(), -1);
     unlink(path.c_str()); _dns_egress_invalidate(); EXPECT_EQ(lease(), -1);
+}
+TEST_F(EgressContract, RepeatedAdmissionReusesIoctlSocketWithoutCachingInterfaceIdentity) {
+    write(row());
+    for (unsigned i = 0; i < 1000; i++) ASSERT_EQ(lease(i % 2 ? AF_INET : AF_INET6), 1);
+    EXPECT_EQ(_dns_egress_test_interface_opens, 1U);
+    write(row('b'));
+    EXPECT_EQ(lease(), 1);
+    EXPECT_EQ(_dns_egress_test_interface_opens, 1U);
+    _dns_egress_close();
+    EXPECT_EQ(lease(), 1);
+    EXPECT_EQ(_dns_egress_test_interface_opens, 2U);
+}
+TEST_F(EgressContract, ReusedIoctlDetectsLinkRemovalAndRecreationBeforeLeaseRefresh) {
+    std::string name = "ec" + std::to_string(getpid());
+    ASSERT_EQ(std::system(("ip link add " + name + " type dummy").c_str()), 0);
+    unsigned index = if_nametoindex(name.c_str()), mark;
+    char session[65];
+    write(name + " " + std::to_string(index) + " " + std::string(64, 'a') + " 3\n" + row());
+    EXPECT_EQ(_dns_egress_lease(name.c_str(), AF_INET, -1, &mark, session), 1);
+    ASSERT_EQ(std::system(("ip link del " + name).c_str()), 0);
+    // No invalidation/lease renewal: the cached descriptor must see current links.
+    EXPECT_EQ(_dns_egress_lease(name.c_str(), AF_INET, -1, &mark, session), -1);
+    EXPECT_EQ(lease(), 1); // another WAN is unaffected
+    ASSERT_EQ(std::system(("ip link add " + name + " type dummy").c_str()), 0);
+    EXPECT_NE(if_nametoindex(name.c_str()), index);
+    EXPECT_EQ(_dns_egress_lease(name.c_str(), AF_INET, -1, &mark, session), -1);
+    EXPECT_EQ(_dns_egress_test_interface_opens, 1U);
+    EXPECT_EQ(std::system(("ip link del " + name).c_str()), 0);
 }
 TEST_F(EgressContract, LeaseParsingFitsSmallStackBelowNestedDiscoveryFrames) {
     write(row());

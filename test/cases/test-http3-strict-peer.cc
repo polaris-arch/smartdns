@@ -151,6 +151,7 @@ protected:
     }
     void TearDown() override {
         block_quic_write = false;
+        _dns_quic_lifecycle_test_hook = nullptr;
         _dns_http3_control_free(&client);
         _dns_policy_detach(&client);
         if (test_epoll >= 0) { ::client.epoll_fd = saved_epoll; close(test_epoll); }
@@ -172,6 +173,76 @@ TEST_F(StrictPeer, EmitsSettingsWithoutWaitingForPeerSettings) {
     EXPECT_TRUE(_dns_http3_request_allowed(&client, 0, 0));
     ASSERT_TRUE(WritePeer({0x40,0,0x40,4,0x40,0}, true));
     EXPECT_GE(Pump(), 0);
+}
+namespace {
+unsigned periodic_network_pumps;
+void count_periodic_network_pumps(dns_server_info *, unsigned stage) {
+    if (stage == 4) periodic_network_pumps++;
+}
+}
+TEST_F(StrictPeer, IdlePeriodicRetryDoesNotPumpNetworkEvents) {
+    for (int i = 0; i < 100 && observed.size() < 7; i++) { ASSERT_GE(Pump(), 0); usleep(1000); }
+    ASSERT_EQ(observed.size(), 7U);
+    ASSERT_TRUE(WritePeer({0,4,0}));
+    for (unsigned i = 0; i < 100; i++) { ASSERT_GE(Pump(), 0); usleep(1000); }
+    periodic_network_pumps = 0;
+    _dns_quic_lifecycle_test_hook = count_periodic_network_pumps;
+    for (unsigned i = 0; i < 100; i++) ASSERT_EQ(_dns_client_quic_retry_pending(&client, get_tick_count()), 0);
+    // A genuine SDK deadline is allowed; 100 idle polls are not 100 network events.
+    EXPECT_LE(periodic_network_pumps, 1U);
+    unsigned prior = periodic_network_pumps;
+    epoll_event writable{}; writable.events = EPOLLOUT;
+    ASSERT_EQ(_dns_client_process_quic(&client, &writable, get_tick_count()), 0);
+    EXPECT_EQ(periodic_network_pumps, prior + 1);
+}
+TEST_F(StrictPeer, PeriodicRetryDrainsDecodedControlWithoutSyntheticNetworkReadiness) {
+    for (int i = 0; i < 100 && observed.size() < 7; i++) { ASSERT_GE(Pump(), 0); usleep(1000); }
+    ASSERT_EQ(observed.size(), 7U);
+    peer_control = SSL_new_stream(peer, SSL_STREAM_FLAG_UNI);
+    ASSERT_NE(peer_control, nullptr);
+    const unsigned char data[] = {0,4,0,7,1,8};
+    size_t sent = 0;
+    ASSERT_EQ(SSL_write_ex(peer_control, data, sizeof(data), &sent), 1);
+    ASSERT_EQ(sent, sizeof(data));
+    bool ready = false;
+    for (unsigned i = 0; i < 100 && !ready; i++) {
+        SSL_handle_events(peer); SSL_handle_events(client.ssl);
+        ready = _dns_client_quic_buffered(&client);
+        if (!ready) usleep(1000);
+    }
+    ASSERT_TRUE(ready);
+    periodic_network_pumps = 0;
+    _dns_quic_lifecycle_test_hook = count_periodic_network_pumps;
+    ASSERT_EQ(_dns_client_quic_retry_pending(&client, get_tick_count()), 0);
+    EXPECT_TRUE(_dns_http3_is_draining(&client));
+    EXPECT_EQ(periodic_network_pumps, 0U);
+}
+TEST_F(StrictPeer, PeriodicRetryContinuesBudgetDeferredControlFrames) {
+    for (int i = 0; i < 100 && observed.size() < 7; i++) { ASSERT_GE(Pump(), 0); usleep(1000); }
+    ASSERT_EQ(observed.size(), 7U);
+    peer_control = SSL_new_stream(peer, SSL_STREAM_FLAG_UNI);
+    ASSERT_NE(peer_control, nullptr);
+    std::vector<unsigned char> data = {0,4,0};
+    for (unsigned i = 0; i < 80; i++) { data.push_back(0x21); data.push_back(0); }
+    data.insert(data.end(), {7,1,8});
+    size_t sent = 0;
+    ASSERT_EQ(SSL_write_ex(peer_control, data.data(), data.size(), &sent), 1);
+    ASSERT_EQ(sent, data.size());
+    bool ready = false;
+    for (unsigned i = 0; i < 100 && !ready; i++) {
+        SSL_handle_events(peer); SSL_handle_events(client.ssl);
+        ready = _dns_client_quic_buffered(&client);
+        if (!ready) usleep(1000);
+    }
+    ASSERT_TRUE(ready);
+    client.http3_control_epoch++;
+    ASSERT_EQ(_dns_client_quic_retry_pending(&client, get_tick_count()), 0);
+    ASSERT_FALSE(_dns_http3_is_draining(&client));
+    // The packet is drained; the remaining frames still need a new bounded turn.
+    ASSERT_TRUE(_dns_client_quic_buffered(&client));
+    client.http3_control_epoch++;
+    ASSERT_EQ(_dns_client_quic_retry_pending(&client, get_tick_count()), 0);
+    EXPECT_TRUE(_dns_http3_is_draining(&client));
 }
 TEST_F(StrictPeer, GoawayStopsNewRequestsAndCriticalFinFails) {
     ASSERT_TRUE(WritePeer({0,4,0,7,1,8}, true));
@@ -263,6 +334,23 @@ TEST_F(StrictPeer, ProductionQueueCancellationBeforeWriteSpendsNoSendBudget) {
     EXPECT_NE(client.ssl, nullptr);
     for (int i = 0; i < 20; i++) { Pump(); usleep(1000); }
     for (SSL *stream : incoming) EXPECT_EQ(SSL_get_stream_id(stream) & 2u, 2u);
+}
+TEST_F(StrictPeer, BufferedWriteRetryDoesNotPretendUdpBecameWritable) {
+    for (int i = 0; i < 100 && observed.size() < 7; i++) { ASSERT_GE(Pump(), 0); usleep(1000); }
+    ASSERT_EQ(observed.size(), 7U);
+    StrictQuery request(&client);
+    ASSERT_EQ(_dns_attempt_begin(&request.q, &client), DNS_ADMIT_OK);
+    unsigned char data[] = {1,3,0,0,0xd9};
+    block_quic_write = true;
+    ASSERT_EQ(_dns_client_send_quic_data(&request.q, &client, data, sizeof(data)), 0);
+    block_quic_write = false;
+    periodic_network_pumps = 0;
+    _dns_quic_lifecycle_test_hook = count_periodic_network_pumps;
+    ASSERT_EQ(_dns_client_quic_retry_pending(&client, get_tick_count()), 0);
+    EXPECT_EQ(periodic_network_pumps, 0U);
+    for (int i = 0; i < 100 && observed.size() < 7 + sizeof(data); i++) { ASSERT_GE(Pump(), 0); usleep(1000); }
+    EXPECT_EQ(observed.size(), 7 + sizeof(data));
+    EXPECT_NE(client.ssl, nullptr);
 }
 TEST_F(StrictPeer, AdmissionRechecksTerminalQueryAfterStreamAllocation) {
     StrictQuery request(&client);

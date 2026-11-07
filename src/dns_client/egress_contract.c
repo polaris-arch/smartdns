@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -21,6 +22,9 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static struct egress_record records[127];
 static unsigned count;
 static uint64_t epoch = 1, next_read, deadline;
+/* Only the ioctl transport is reused. Interface identity is read afresh for
+ * every admission, including deletion/recreation between lease renewals. */
+static int interface_fd = -1;
 static char last_path[DNS_MAX_PATH];
 /* All refreshes hold lock, including reads from transport callbacks. Keep the
  * bounded parsing workspace off those nested client-thread stacks. */
@@ -29,6 +33,7 @@ static char bytes[32769];
 
 #ifdef TEST
 uint64_t (*_dns_egress_test_now)(void);
+unsigned _dns_egress_test_interface_opens;
 #endif
 uint64_t _dns_egress_now(void)
 {
@@ -106,6 +111,27 @@ void _dns_egress_invalidate(void)
 {
     pthread_mutex_lock(&lock); next_read = 0; pthread_mutex_unlock(&lock);
 }
+void _dns_egress_close(void)
+{
+    pthread_mutex_lock(&lock);
+    if (interface_fd >= 0) close(interface_fd);
+    interface_fd = -1;
+    pthread_mutex_unlock(&lock);
+}
+static unsigned interface_index_locked(const char *interface)
+{
+    if (interface_fd < 0) {
+        interface_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (interface_fd < 0) return 0;
+#ifdef TEST
+        _dns_egress_test_interface_opens++;
+#endif
+    }
+    struct ifreq request = {0};
+    safe_strncpy(request.ifr_name, interface, sizeof(request.ifr_name));
+    if (ioctl(interface_fd, SIOCGIFINDEX, &request) < 0) return 0;
+    return request.ifr_ifindex;
+}
 static int lookup(const char *interface, int family, long long configured_mark,
     unsigned *mark, char session[65], unsigned *index)
 {
@@ -117,7 +143,7 @@ static int lookup(const char *interface, int family, long long configured_mark,
     int found = 0;
     for (unsigned i = 0; i < count; i++) {
         if (strcmp(interface, records[i].interface) || !(records[i].families & (family == AF_UNSPEC ? 3 : family == AF_INET6 ? 2 : 1))) continue;
-        if (if_nametoindex(interface) != records[i].index) continue;
+        if (interface_index_locked(interface) != records[i].index) continue;
         safe_strncpy(session, records[i].session, 65); *mark = DNS_EGRESS_MARK; if(index) *index=records[i].index; found = 1; break;
     }
     pthread_mutex_unlock(&lock);

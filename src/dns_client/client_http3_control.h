@@ -2,6 +2,8 @@
 #define SMARTDNS_HTTP3_CONTROL_H
 #include "dns_client.h"
 int _dns_http3_control_poll(struct dns_server_info *server);
+/* Readiness only: caller holds server->lock; never pumps QUIC or performs IO. */
+int _dns_http3_control_buffered(struct dns_server_info *server);
 void _dns_http3_control_free(struct dns_server_info *server);
 int _dns_http3_request_allowed(struct dns_server_info *server, uint64_t stream_id, int started);
 int _dns_http3_keepalive(struct dns_server_info *s);

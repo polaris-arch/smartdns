@@ -790,9 +790,7 @@ static void _dns_client_period_run(unsigned int msec)
             if (_dns_client_process_stream_writes(server) < 0) { _dns_service_endpoint_failure(server); _dns_client_close_socket(server); }
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
         } else if (server->type == DNS_SERVER_QUIC || server->type == DNS_SERVER_HTTP3) {
-            struct epoll_event event = {.events = EPOLLOUT};
-            event.data.ptr = server;
-            _dns_client_process_quic(server, &event, now);
+            _dns_client_quic_retry_pending(server, now);
 #endif
         }
     }
@@ -1073,6 +1071,7 @@ void dns_client_exit(void)
 	_dns_client_query_remove_all();
 	_dns_client_group_remove_all();
     _dns_services_remove_all();
+    _dns_egress_close();
 
 	pthread_mutex_destroy(&client.server_list_lock);
 	pthread_mutex_destroy(&client.domain_map_lock);

@@ -6,9 +6,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
 #define H3_SLOTS 8
 #define H3_BUFFER 8192
+/* stream type, SETTINGS frame length, capacity=0, blocked-streams=0 */
+static const unsigned char settings[] = {0, 4, 4, 1, 0, 7, 0};
 struct h3_peer_stream {
     SSL *ssl;
     unsigned char data[H3_BUFFER];
@@ -186,8 +189,6 @@ static int h3_control_poll(struct dns_server_info *s)
         if (local_state == SSL_STREAM_STATE_CONN_CLOSED) c->transport_fatal = 1;
         return h3_fail(c, 0x104);
     }
-    /* stream type, SETTINGS frame length, capacity=0, blocked-streams=0 */
-    static const unsigned char settings[] = {0, 4, 4, 1, 0, 7, 0};
     if (c->sent < sizeof(settings)) {
         size_t written = 0;
         if(!_dns_egress_io_allowed(s))return -1;
@@ -268,6 +269,24 @@ int _dns_http3_keepalive(struct dns_server_info *s)
     if (c->keepalive_offset < sizeof(grease)) return 0;
     c->keepalive_pending = c->keepalive_offset = 0; return 1;
 }
+int _dns_http3_control_buffered(struct dns_server_info *s)
+{
+    struct dns_http3_control *c = s->http3_control;
+    if (!c || c->fatal || c->transport_fatal || !c->local || c->sent < sizeof(settings)) return 1;
+    /* Parsing can stop at the per-turn budget after SSL data has been consumed.
+     * Such work lives in our buffers, not in SSL_poll's readiness state. */
+    if (c->bytes >= 16384 || c->transitions >= 64) return 1;
+    SSL_POLL_ITEM items[H3_SLOTS + 1];
+    size_t count = 0, ready = 0;
+    const struct timeval zero = {0};
+    items[count++] = (SSL_POLL_ITEM){.desc = SSL_as_poll_descriptor(c->local), .events = SSL_POLL_EVENT_EW};
+    for (size_t i = 0; i < H3_SLOTS; i++) {
+        if (!c->peer[i].ssl) continue;
+        items[count++] = (SSL_POLL_ITEM){.desc = SSL_as_poll_descriptor(c->peer[i].ssl),
+            .events = SSL_POLL_EVENT_R | SSL_POLL_EVENT_ER};
+    }
+    return SSL_poll(items, count, sizeof(items[0]), &zero, SSL_POLL_FLAG_NO_HANDLE_EVENTS, &ready) <= 0 || ready;
+}
 int _dns_http3_control_poll(struct dns_server_info *s)
 {
     if(!_dns_egress_io_allowed(s))return -1;
@@ -344,6 +363,7 @@ int _dns_http3_control_test_feed(struct dns_server_info *s, unsigned slot, const
 #endif
 
 #else
+int _dns_http3_control_buffered(struct dns_server_info *s) { (void)s; return 0; }
 int _dns_http3_control_poll(struct dns_server_info *s) { (void)s; return -1; }
 int _dns_http3_request_allowed(struct dns_server_info *s, uint64_t id, int started) { (void)s; (void)id; (void)started; return 0; }
 int _dns_http3_is_draining(struct dns_server_info *s) { (void)s; return 0; }

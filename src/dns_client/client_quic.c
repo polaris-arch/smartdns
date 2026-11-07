@@ -711,6 +711,7 @@ int _dns_client_quic_buffered(struct dns_server_info *s)
 {
     if (!s->ssl) return 0;
     if (s->status == DNS_SERVER_STATUS_CONNECTING) return SSL_is_init_finished(s->ssl);
+    if (s->type == DNS_SERVER_HTTP3 && _dns_http3_control_buffered(s)) return 1;
     SSL_POLL_ITEM items[128]; size_t count=0, ready=0;
     const struct timeval zero={0};
     items[count++]=(SSL_POLL_ITEM){.desc=SSL_as_poll_descriptor(s->ssl),
@@ -728,6 +729,36 @@ int _dns_client_quic_buffered(struct dns_server_info *s)
     return count && SSL_poll(items,count,sizeof(items[0]),&zero,SSL_POLL_FLAG_NO_HANDLE_EVENTS,&ready)>0 && ready;
 }
 
+int _dns_client_quic_retry_pending(struct dns_server_info *server, unsigned long now)
+{
+    /* Socket readiness and actual SDK deadlines have their own dispatchers.
+     * A periodic capacity retry is neither a writable UDP event nor a reason
+     * to pump every idle connection/control stream. */
+    pthread_mutex_lock(&server->lock);
+    if (!_dns_egress_io_allowed(server)) {
+        pthread_mutex_unlock(&server->lock);
+        _dns_client_close_socket(server);
+        return -1;
+    }
+    struct timeval timeout = {0};
+    int infinite = 1;
+    int timer_due = server->ssl && SSL_get_event_timeout(server->ssl, &timeout, &infinite) &&
+        !infinite && timeout.tv_sec == 0 && timeout.tv_usec == 0;
+    int pending = timer_due || _dns_client_quic_buffered(server);
+    struct dns_conn_stream *stream;
+    list_for_each_entry(stream, &server->conn_stream_list, server_list) {
+        if (stream->send_buff.len > 0) { pending = 1; break; }
+    }
+    pthread_mutex_unlock(&server->lock);
+    if (!pending) return 0;
+    /* A real SDK deadline needs event processing; buffered retries do not. */
+    struct epoll_event retry = {.events = timer_due ? EPOLLIN : 0, .data.ptr = server};
+    _dns_client_process_guard_enter(server);
+    int ret = _dns_client_process_quic(server, &retry, now);
+    _dns_client_process_guard_leave(server);
+    return ret;
+}
+
 int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now)
 {
     if(!_dns_egress_io_allowed(server_info)){_dns_client_close_socket(server_info);return -1;}
@@ -738,20 +769,22 @@ int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_e
 	/* An ICMP/socket error can be reported without EPOLLIN. Let QUIC consume
 	 * the network event instead of leaving a level-triggered error pending. */
 	if (event->events & (EPOLLIN | EPOLLERR | EPOLLOUT)) {
+#ifdef TEST
+        if (_dns_quic_lifecycle_test_hook) _dns_quic_lifecycle_test_hook(server_info, 4);
+#endif
 		if ((_ssl_do_handevent(server_info) <= 0 && !server_info->service_quic_close_valid) || server_info->egress_revoked) {
             _dns_client_close_socket(server_info); return -1;
         }
 
-        /* A close can arrive with the last DNS response. Drain decoded data
-         * before retiring streams, then consume the persistent close event. */
-		if (_dns_client_process_quic_poll(server_info) != 0) {
-			goto errout;
-		}
-        if (server_info->service_quic_close_valid || SSL_get_shutdown(server_info->ssl) != 0) {
-            _ssl_quic_close_normal(server_info);
-            _dns_client_close_socket(server_info); return -1;
-        }
 	}
+    /* A close can arrive with the last DNS response. Drain SDK-decoded data/FIN
+     * before retiring streams, even without another kernel readiness edge. */
+    if (_dns_client_process_quic_poll(server_info) != 0) goto errout;
+    if (!server_info->ssl) return -1;
+    if (server_info->service_quic_close_valid || SSL_get_shutdown(server_info->ssl) != 0) {
+        _ssl_quic_close_normal(server_info);
+        _dns_client_close_socket(server_info); return -1;
+    }
 
 	{ /* SDK input and timer turns can restore stream credit without UDP EPOLLOUT. */
 		int epoll_events = EPOLLIN;
