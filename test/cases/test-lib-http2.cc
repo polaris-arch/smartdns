@@ -1,4 +1,5 @@
 #include "gtest/gtest.h"
+#include "include/utils.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -498,7 +499,43 @@ TEST_F(LIBHTTP2, SettingsHeaderTableSizeEvictsResponseEncoderEntries)
 	ASSERT_GT(response_len, 0);
 	EXPECT_EQ(memchr(response_buf, 0xbe, response_len), nullptr);
 	EXPECT_NE(memchr(response_buf, 0x40, response_len), nullptr);
+	bool found_headers = false;
+	for (ssize_t pos = 0; pos + 9 <= response_len;) {
+		unsigned length = (response_buf[pos] << 16) | (response_buf[pos+1] << 8) | response_buf[pos+2];
+		ASSERT_LE(pos + 9 + length, response_len);
+		if (response_buf[pos+3] == 1) {
+			ASSERT_GT(length, 0U);
+			EXPECT_EQ(response_buf[pos+9], 0x20); // real wire must synchronize the decoder
+			found_headers = true;
+		}
+		pos += 9 + length;
+	}
+	EXPECT_TRUE(found_headers);
 
+	http2_stream_close(stream);
+	http2_ctx_close(ctx);
+}
+
+TEST_F(LIBHTTP2, OversizedDecoderTableClosesTheConnectionWithCompressionError)
+{
+	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
+	ASSERT_NE(ctx, nullptr);
+	StartClientWithServerSettings(ctx);
+	uint8_t drain[2048];
+	while (read(server_sock, drain, sizeof(drain)) > 0) {}
+	struct http2_stream *stream = http2_stream_new(ctx);
+	ASSERT_NE(stream, nullptr);
+	ASSERT_EQ(http2_stream_set_request(stream, "GET", "/", "https", NULL), 0);
+	while (read(server_sock, drain, sizeof(drain)) > 0) {}
+	const uint8_t block[] = {0x3f,0xe2,0xff,0x03,0x88}; // capacity 65537 then :status 200
+	WriteServerFrame(0x01,0x04,http2_stream_get_id(stream),block,sizeof(block));
+	EXPECT_EQ(http2_ctx_poll(ctx,NULL,0,NULL),HTTP2_ERR_PROTOCOL);
+	ssize_t length = read(server_sock,drain,sizeof(drain));
+	ASSERT_GE(length,17);
+	EXPECT_EQ(drain[3],7); // GOAWAY, not a stream-local RST_STREAM
+	// A client has not processed any peer-initiated stream.
+	EXPECT_EQ(drain[9],0); EXPECT_EQ(drain[10],0); EXPECT_EQ(drain[11],0); EXPECT_EQ(drain[12],0);
+	EXPECT_EQ(drain[13],0); EXPECT_EQ(drain[14],0); EXPECT_EQ(drain[15],0); EXPECT_EQ(drain[16],9);
 	http2_stream_close(stream);
 	http2_ctx_close(ctx);
 }
@@ -635,6 +672,12 @@ TEST_F(LIBHTTP2, SettingsMaxHeaderListSizeLimitsResponseHeaders)
 
 	struct http2_header_pair headers[] = {{"x-large-response-header", "too-large-for-peer"}};
 	EXPECT_LT(http2_stream_set_response(stream, 200, headers, 1), 0);
+	/* Encoding already mutated the shared table; no new stream may reuse it. */
+	errno = 0;
+	struct http2_stream *reused = http2_stream_new(ctx);
+	EXPECT_EQ(reused, nullptr);
+	EXPECT_EQ(errno, ECONNRESET);
+	if (reused) http2_stream_close(reused);
 
 	http2_stream_close(stream);
 	http2_ctx_close(ctx);
@@ -674,6 +717,10 @@ TEST_F(LIBHTTP2, Integrated)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
 					stream = http2_ctx_accept_stream(ctx);
@@ -755,6 +802,10 @@ TEST_F(LIBHTTP2, Integrated)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			if (http2_stream_get_status(stream) > 0)
 				break;
 
@@ -1754,6 +1805,10 @@ TEST_F(LIBHTTP2, MultiStream)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
@@ -1837,6 +1892,10 @@ TEST_F(LIBHTTP2, MultiStream)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream && items[i].readable) {
@@ -1901,6 +1960,10 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
 					stream = http2_ctx_accept_stream(ctx);
@@ -1986,6 +2049,10 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			if (http2_stream_get_status(stream) > 0)
 				break;
 
@@ -2051,6 +2118,10 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
 					stream = http2_ctx_accept_stream(ctx);
@@ -2098,6 +2169,7 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
 
 		EXPECT_LT(loop_count, 100) << "Server loop did not terminate (infinite loop detected)";
 
+		http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
 
@@ -2164,6 +2236,10 @@ TEST_F(LIBHTTP2, StreamClose)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
 					stream = http2_ctx_accept_stream(ctx);
@@ -2220,6 +2296,10 @@ TEST_F(LIBHTTP2, StreamClose)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			if (http2_stream_get_status(stream) > 0)
 				break;
 			usleep(20000);
