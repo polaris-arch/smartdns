@@ -71,3 +71,5 @@ $(SMARTDNS_TEST_LIB):
 clean:
 	$(RM) $(OBJS) $(BIN)
 	$(MAKE) -C $(SMARTDNS_SRC_DIR) clean
+
+LDFLAGS += -Wl,--wrap=http2_stream_set_ex_data
