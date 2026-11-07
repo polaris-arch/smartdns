@@ -159,7 +159,9 @@ TEST_F(Http2Cancellation, CompletedResponseSurvivesFollowingNoErrorReset) {
     Frame(3,0,id,{0,0,0,0});
     http2_ctx_poll(ctx,nullptr,0,nullptr);
     EXPECT_EQ(http2_stream_is_reset(stream),0);
-    EXPECT_EQ(http2_stream_is_end(stream),1);
+    EXPECT_EQ(http2_stream_is_remote_end(stream),1);
+    EXPECT_EQ(http2_stream_is_end(stream),0); // buffered content is still readable
     uint8_t body[3]; EXPECT_EQ(http2_stream_read_body(stream,body,sizeof(body)),3);
     EXPECT_EQ(body[0],1); EXPECT_EQ(body[2],3);
+    EXPECT_EQ(http2_stream_is_end(stream),1);
 }
