@@ -55,7 +55,7 @@ PY
 fi
 if [ "$PROFILE" = http2 ]; then
   previous=/tmp/previous-http2
-  git worktree add --detach "$previous" 6e69f21a0d037566b1cebfdd34e878b5cb2869b7
+  git worktree add --detach "$previous" 80ebc59562f0749b3cfa3092c524337b9a053fa9
   cp "$root/test/cases/test-http2-cancellation.cc" "$previous/test/cases/test-http2-cancellation.cc"
   make -C "$previous/test" -j4 > "$proof/previous-build.log" 2>&1
   set +e
