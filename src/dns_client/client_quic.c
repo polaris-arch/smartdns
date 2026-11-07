@@ -670,6 +670,10 @@ int _dns_client_process_quic(struct dns_server_info *server, struct epoll_event 
 	/* SSL_write can consume datagrams and make a different stream readable. */
 	if (_dns_client_process_quic_poll(server) < 0) goto out;
 	if (server->type == DNS_SERVER_HTTP3 && _dns_http3_control_poll(server) < 0) goto out;
+    pthread_mutex_lock(&server->lock);
+    int drained = server->type == DNS_SERVER_HTTP3 && _dns_http3_drain_complete(server);
+    pthread_mutex_unlock(&server->lock);
+    if (drained) _dns_client_close_socket(server);
 	ret = 0;
 out:
 	if (ret < 0) {

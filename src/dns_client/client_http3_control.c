@@ -1,5 +1,6 @@
 /* HTTP/3 control and static-only QPACK streams (RFC 9114 / RFC 9204). */
 #include "client_http3_control.h"
+#include "conn_stream.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -217,6 +218,19 @@ int _dns_http3_request_allowed(struct dns_server_info *s, SSL *stream)
     return c && c->sent == 7 && !c->fatal &&
         (!c->goaway || (stream && SSL_get_stream_id(stream) < c->goaway_id));
 }
+/* Caller holds the endpoint mutex. A drained GOAWAY connection must retire so
+ * pending queries can reconnect through the existing retry path. */
+int _dns_http3_drain_complete(struct dns_server_info *s)
+{
+    struct dns_http3_control *c = s->http3_control;
+    if (!c || !c->goaway || c->fatal) return 0;
+    struct dns_conn_stream *stream;
+    list_for_each_entry(stream, &s->conn_stream_list, server_list) {
+        if (stream->query && stream->quic_stream && SSL_get_stream_id(stream->quic_stream) < c->goaway_id)
+            return 0;
+    }
+    return 1;
+}
 int _dns_http3_connection_error(struct dns_server_info *s, uint64_t code)
 {
     if (!s->http3_control) s->http3_control = calloc(1, sizeof(*s->http3_control));
@@ -275,6 +289,7 @@ int _dns_http3_control_test_feed(struct dns_server_info *s, unsigned slot, const
 #else
 int _dns_http3_control_poll(struct dns_server_info *s) { (void)s; return -1; }
 int _dns_http3_control_pending(struct dns_server_info *s) { (void)s; return 0; }
+int _dns_http3_drain_complete(struct dns_server_info *s) { (void)s; return 0; }
 int _dns_http3_request_allowed(struct dns_server_info *s, SSL *stream) { (void)s; (void)stream; return 0; }
 int _dns_http3_connection_error(struct dns_server_info *s, uint64_t code) { (void)s; (void)code; return -1; }
 int _dns_http3_control_shutdown(struct dns_server_info *s) { (void)s; return 0; }

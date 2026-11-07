@@ -68,7 +68,7 @@ r=E.parse(sys.argv[1]).getroot()
 assert int(r.attrib['failures'])==0
 if sys.argv[2]!='http2':
     suite=r.find("testsuite[@name='QuicLifecycle']")
-    assert suite is not None and int(suite.attrib['tests'])==7 and int(suite.attrib['skipped'])==0
+    assert suite is not None and int(suite.attrib['tests'])==8 and int(suite.attrib['skipped'])==0
 print('Candidate:',r.attrib)
 PY
 git diff --exit-code -- src test

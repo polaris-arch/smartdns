@@ -3,6 +3,8 @@ extern "C" {
 #include "smartdns/http2.h"
 #include "dns_client/conn_stream.h"
 }
+#undef min
+#undef max
 #include <algorithm>
 #include <cerrno>
 #include <cstring>

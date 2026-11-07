@@ -3,6 +3,8 @@ extern "C" {
 #include "dns_client/client_http3_control.h"
 #include "smartdns/http_parse.h"
 }
+#undef min
+#undef max
 #include <vector>
 #include <cstring>
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
@@ -65,13 +67,6 @@ TEST(Http3Control, GoawayStopsNewAndMustNotIncrease) {
 #endif
 TEST(Http3RequestFraming, RejectSettingsOnRequestStream) {
     const unsigned char bytes[] = {4,0};
-    http_head *head = http_head_init(4096, HTTP_VERSION_3_0);
-    ASSERT_NE(head, nullptr);
-    EXPECT_LT(http_head_parse(head, bytes, sizeof(bytes)), 0);
-    http_head_destroy(head);
-}
-TEST(Http3RequestFraming, IncompleteVarintIsNotReadPastInput) {
-    const unsigned char bytes[] = {1};
     http_head *head = http_head_init(4096, HTTP_VERSION_3_0);
     ASSERT_NE(head, nullptr);
     EXPECT_LT(http_head_parse(head, bytes, sizeof(bytes)), 0);

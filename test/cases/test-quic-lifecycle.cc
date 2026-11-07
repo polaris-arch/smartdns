@@ -6,6 +6,8 @@ extern "C" {
 #include "dns_client/client_socket.h"
 #include "smartdns/util.h"
 }
+#undef min
+#undef max
 #include "include/utils.h"
 #include <algorithm>
 #include <cerrno>
@@ -185,6 +187,16 @@ TEST_F(QuicLifecycle, FragmentedPeerControlAndGoawayDrainStartedRequests) {
     EXPECT_TRUE(_dns_http3_request_allowed(&endpoint,request));
     ASSERT_TRUE(Send(control,{7,1,8}));
     ASSERT_TRUE(Until([&] { return _dns_http3_control_poll(&endpoint)<0; }));
+}
+TEST_F(QuicLifecycle, DrainedGoawayRetiresTheConnectionForRetry) {
+    Connect(true); ASSERT_TRUE(endpoint.ssl && peer);
+    ASSERT_EQ(_dns_http3_control_poll(&endpoint),0);
+    SSL *control=PeerStream(true); ASSERT_NE(control,nullptr);
+    Send(control,{0,4,0,7,1,0});
+    ASSERT_TRUE(Until([&] { _dns_http3_control_poll(&endpoint); return !_dns_http3_request_allowed(&endpoint,nullptr); }));
+    Service();
+    EXPECT_EQ(endpoint.ssl,nullptr);
+    EXPECT_EQ(endpoint.status,DNS_SERVER_STATUS_DISCONNECTED);
 }
 TEST_F(QuicLifecycle, CriticalControlFinIsAConnectionError) {
     Connect(true); ASSERT_EQ(_dns_http3_control_poll(&endpoint),0);
