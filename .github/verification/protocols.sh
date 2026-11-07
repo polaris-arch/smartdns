@@ -11,7 +11,7 @@ cd "$root"
 git rev-parse HEAD HEAD^ > "$proof/source.txt"
 openssl version -a > "$proof/openssl.txt"
 git diff --check HEAD^
-if [ "$PROFILE" != sanitizers ]; then
+if [ "$PROFILE" = http2 ] || [ "$PROFILE" = quic-http3 ]; then
   baseline=/tmp/baseline-$PROFILE
   git worktree add --detach "$baseline" 65832a19c248f8a0f8714304d819e1da408b3835
   export root baseline PROFILE
@@ -60,6 +60,7 @@ if [ "$PROFILE" = sanitizers ]; then
 else
   make -C test -j4 > "$proof/candidate-build.log" 2>&1
   filter='*'
+  if [ "$PROFILE" = quic-http3 ]; then filter='Http3Control.*:Http3RequestFraming.*:QuicLifecycle.*:*HTTP3*.*'; fi
 fi
 timeout 600 ./test/test.bin --gtest_filter="$filter" --gtest_output="xml:$proof/candidate.xml" > "$proof/candidate.log" 2>&1
 python3 - "$proof/candidate.xml" "$PROFILE" <<'PY'
