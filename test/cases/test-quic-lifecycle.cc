@@ -21,6 +21,7 @@ extern "C" {
 
 namespace {
 thread_local bool fail_quic_read, capture_quic_response;
+thread_local dns_query_struct *cancel_quic_query = nullptr;
 thread_local std::vector<unsigned char> captured_response;
 }
 extern "C" int __real__dns_client_socket_ssl_recv_ext(dns_server_info *, SSL *, void *, int);
@@ -32,7 +33,11 @@ extern "C" int __wrap__dns_client_socket_ssl_recv_ext(dns_server_info *server, S
 extern "C" int __real__dns_client_recv(dns_server_info *, unsigned char *, int, sockaddr *, socklen_t);
 extern "C" int __wrap__dns_client_recv(dns_server_info *server, unsigned char *data, int size, sockaddr *from, socklen_t len)
 {
-    if (capture_quic_response) { captured_response.assign(data,data+size); return 0; }
+    if (capture_quic_response) {
+        captured_response.assign(data,data+size);
+        if (cancel_quic_query) { auto *q=cancel_quic_query; cancel_quic_query=nullptr; _dns_client_conn_server_streams_free(server,q); }
+        return 0;
+    }
     return __real__dns_client_recv(server,data,size,from,len);
 }
 
@@ -58,7 +63,7 @@ protected:
         captured_response.clear();
     }
     void TearDown() override {
-        fail_quic_read = capture_quic_response = false;
+        fail_quic_read = capture_quic_response = false; cancel_quic_query=nullptr;
         for (auto *r : requests) {
             if (!list_empty(&r->query_list)) { list_del_init(&r->query_list); r->query = nullptr; _dns_client_conn_stream_put(r); }
             if (!list_empty(&r->server_list)) { list_del_init(&r->server_list); r->server_info = nullptr; _dns_client_conn_stream_put(r); }
@@ -144,7 +149,10 @@ protected:
     dns_conn_stream *Request() {
         auto *r=_dns_client_conn_stream_new();
         if (!r) return nullptr;
-        requests.push_back(r); r->server_info=&endpoint; r->query=&query; r->type=endpoint.type;
+        requests.push_back(r); r->server_info=&endpoint; r->query=&query;
+#ifndef UPSTREAM_BASELINE
+        r->query_id=query.sid;
+#endif r->type=endpoint.type;
         r->quic_stream=SSL_new_stream(endpoint.ssl,0);
         if (!r->quic_stream) return nullptr;
         SSL_set_ex_data(r->quic_stream,0,r);
@@ -234,10 +242,30 @@ TEST_F(QuicLifecycle, CompleteDoqPayloadWaitsForNormalFin) {
     capture_quic_response=true; Service();
     EXPECT_TRUE(captured_response.empty());
     ASSERT_EQ(SSL_stream_conclude(s,0),1);
-    ASSERT_TRUE(Until([&] { return SSL_get_stream_read_state(r->quic_stream)==SSL_STREAM_STATE_FINISHED; }));
+    ASSERT_TRUE(Until([&] {
+        SSL_POLL_ITEM item{}; item.desc=SSL_as_poll_descriptor(r->quic_stream); item.events=SSL_POLL_EVENT_R;
+        const timeval zero{}; size_t ready=0;
+        return SSL_poll(&item,1,sizeof(item),&zero,SSL_POLL_FLAG_NO_HANDLE_EVENTS,&ready)==1 && ready;
+    }));
     Service(); capture_quic_response=false;
     ASSERT_EQ(captured_response.size(),12U);
     EXPECT_EQ(captured_response[0],0x12); EXPECT_EQ(captured_response[1],0x34);
+}
+TEST_F(QuicLifecycle, CallbackCanCancelAnotherStreamInTheSameSnapshot) {
+    Connect(false); ASSERT_TRUE(endpoint.ssl && peer);
+    auto *first=Request(); ASSERT_TRUE(first && first->quic_stream);
+    SSL *a=AcceptRequest(); ASSERT_NE(a,nullptr);
+    auto *second=Request(); ASSERT_TRUE(second && second->quic_stream);
+    SSL *b=AcceptRequest(); ASSERT_NE(b,nullptr);
+    const std::vector<unsigned char> packet={0,12,0,0,0x80,0,0,0,0,0,0,0,0,0};
+    Send(a,packet); Send(b,packet);
+    ASSERT_EQ(SSL_stream_conclude(a,0),1); ASSERT_EQ(SSL_stream_conclude(b,0),1);
+    ASSERT_TRUE(Until([&] { return SSL_pending(first->quic_stream)>0 && SSL_pending(second->quic_stream)>0; }));
+    capture_quic_response=true; cancel_quic_query=&query;
+    Service();
+    EXPECT_EQ(captured_response.size(),12U);
+    EXPECT_EQ(cancel_quic_query,nullptr);
+    EXPECT_TRUE(list_empty(&endpoint.conn_stream_list));
 }
 TEST_F(QuicLifecycle, PartialControlPrefixDoesNotStayReady) {
     Connect(true); ASSERT_EQ(_dns_http3_control_poll(&endpoint),0);

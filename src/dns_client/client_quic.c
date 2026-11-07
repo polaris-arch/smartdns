@@ -399,7 +399,10 @@ static int _dns_client_process_quic_stream_read(struct dns_server_info *server_i
 		}
 
 		if (read_len == 0) {
-			if (SSL_get_stream_read_state(quic_stream) != SSL_STREAM_STATE_FINISHED) return -1;
+            pthread_mutex_lock(&server_info->lock);
+            int finished = SSL_get_stream_read_state(quic_stream) == SSL_STREAM_STATE_FINISHED;
+            pthread_mutex_unlock(&server_info->lock);
+            if (!finished) return -1;
 			if (!conn_stream->query) return -1;
 			conn_stream->recv_done = 1;
 			if (server_info->type == DNS_SERVER_HTTP3 && conn_stream->recv_buff.len > 0) {
@@ -415,7 +418,7 @@ static int _dns_client_process_quic_stream_read(struct dns_server_info *server_i
                 stream_ret = -1;
                 if (len >= 12 && len < DNS_IN_PACKSIZE && conn_stream->recv_buff.len == len + 2 &&
                     data[2] == 0 && data[3] == 0) {
-                    unsigned short qid = htons(conn_stream->query->sid);
+                    unsigned short qid = htons(conn_stream->query_id);
                     memcpy(data + 2, &qid, 2);
                     stream_ret = _dns_client_recv(server_info, data + 2, len, &server_info->addr, server_info->ai_addrlen);
                 }
@@ -466,6 +469,7 @@ static int _dns_client_process_quic_poll(struct dns_server_info *server)
 {
 	SSL_POLL_ITEM items[128] = {0};
 	struct dns_conn_stream *streams[128];
+	SSL *snapshots[128];
 	struct dns_conn_stream *stream, *tmp;
 	const struct timeval zero = {0};
 	size_t count = 0, ready = 0;
@@ -480,6 +484,8 @@ static int _dns_client_process_quic_poll(struct dns_server_info *server)
 			continue;
 		}
 		if (!stream->quic_stream) continue;
+		if (!SSL_up_ref(stream->quic_stream)) { result = -1; break; }
+		snapshots[count] = stream->quic_stream;
 		streams[count] = stream;
 		_dns_client_conn_stream_get(stream);
 		items[count].desc = SSL_as_poll_descriptor(stream->quic_stream);
@@ -489,8 +495,8 @@ static int _dns_client_process_quic_poll(struct dns_server_info *server)
 	/* Rotate only after collecting, so no stream is collected twice. */
 	for (size_t i = 0; i < count; i++)
 		list_move_tail(&streams[i]->server_list, &server->conn_stream_list);
-	int polled = count ? SSL_poll(items, count, sizeof(items[0]), &zero,
-						 SSL_POLL_FLAG_NO_HANDLE_EVENTS, &ready) : 1;
+	int polled = !result && count ? SSL_poll(items, count, sizeof(items[0]), &zero,
+						 SSL_POLL_FLAG_NO_HANDLE_EVENTS, &ready) : !result;
 	pthread_mutex_unlock(&server->lock);
 	if (polled != 1) {
 		result = -1;
@@ -499,13 +505,17 @@ static int _dns_client_process_quic_poll(struct dns_server_info *server)
 	for (size_t i = 0; i < count; i++) {
 		stream = streams[i];
 		if (!items[i].revents) continue;
+        pthread_mutex_lock(&server->lock);
+        int active = stream->server_info == server && stream->quic_stream == snapshots[i];
+        pthread_mutex_unlock(&server->lock);
+        if (!active) continue;
 		int ended = items[i].revents & (SSL_POLL_EVENT_ER | SSL_POLL_EVENT_EW);
 		if (!ended && stream->query)
-			ended = _dns_client_process_quic_stream_read(server, stream, stream->quic_stream) <= 0;
+			ended = _dns_client_process_quic_stream_read(server, stream, snapshots[i]) <= 0;
 		if (!stream->query) ended = 1;
 		if (!ended) continue;
 		pthread_mutex_lock(&server->lock);
-		int linked = !list_empty(&stream->server_list);
+		int linked = stream->server_info == server && !list_empty(&stream->server_list);
 		if (linked) {
 			list_del_init(&stream->server_list);
 			stream->server_info = NULL;
@@ -514,7 +524,12 @@ static int _dns_client_process_quic_poll(struct dns_server_info *server)
 		if (linked) _dns_client_conn_stream_put(stream);
 	}
 out:
-	for (size_t i = 0; i < count; i++) _dns_client_conn_stream_put(streams[i]);
+    pthread_mutex_lock(&server->lock);
+    for (size_t i = 0; i < count; i++) {
+        SSL_free(snapshots[i]);
+        _dns_client_conn_stream_put(streams[i]);
+    }
+    pthread_mutex_unlock(&server->lock);
 	_dns_client_process_guard_leave(server);
 	return result;
 }
@@ -646,7 +661,10 @@ int _dns_client_process_quic(struct dns_server_info *server, struct epoll_event 
 	if (server->type == DNS_SERVER_HTTP3 && _dns_http3_control_poll(server) < 0) goto out;
 	if (_dns_client_process_quic_poll(server) < 0) goto out;
 	if (server->type == DNS_SERVER_HTTP3 && _dns_http3_control_poll(server) < 0) goto out;
-	if (SSL_get_shutdown(server->ssl)) goto out;
+    pthread_mutex_lock(&server->lock);
+    int shutdown = SSL_get_shutdown(server->ssl);
+    pthread_mutex_unlock(&server->lock);
+    if (shutdown) goto out;
 	pthread_mutex_lock(&server->lock);
 	struct dns_conn_stream *stream;
 	int events = EPOLLIN;
@@ -719,6 +737,7 @@ static int _dns_client_quic_pending_data(struct dns_conn_stream *stream, struct 
 	if (list_empty(&stream->query_list)) {
 		pthread_mutex_lock(&query->lock);
 		stream->query = query;
+		stream->query_id = query->sid;
 		list_add_tail(&stream->query_list, &query->conn_stream_list);
 		pthread_mutex_unlock(&query->lock);
 		_dns_client_conn_stream_get(stream);

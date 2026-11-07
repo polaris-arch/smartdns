@@ -251,6 +251,7 @@ struct dns_conn_stream {
 	struct dns_server_info *server_info;
 
 	int recv_done;
+	unsigned short query_id; /* DoQ restores the original ID without dereferencing a canceled query. */
 	SSL *quic_stream;
 	struct http2_stream *http2_stream;
 	dns_server_type_t type;

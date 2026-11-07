@@ -233,8 +233,11 @@ int _dns_http3_drain_complete(struct dns_server_info *s)
 }
 int _dns_http3_connection_error(struct dns_server_info *s, uint64_t code)
 {
+    pthread_mutex_lock(&s->lock);
     if (!s->http3_control) s->http3_control = calloc(1, sizeof(*s->http3_control));
-    return s->http3_control ? h3_fail(s->http3_control, code) : -1;
+    int result = s->http3_control ? h3_fail(s->http3_control, code) : -1;
+    pthread_mutex_unlock(&s->lock);
+    return result;
 }
 int _dns_http3_control_pending(struct dns_server_info *s)
 {
@@ -272,6 +275,13 @@ void _dns_http3_control_free(struct dns_server_info *s)
     SSL_free(c->local); free(c); s->http3_control = NULL;
 }
 #ifdef TEST
+size_t _dns_http3_control_test_pending_bytes(struct dns_server_info *s)
+{
+    size_t bytes = 0;
+    if (s->http3_control)
+        for (unsigned i = 0; i < H3_SLOTS; i++) bytes += s->http3_control->peer[i].used;
+    return bytes;
+}
 int _dns_http3_control_test_feed(struct dns_server_info *s, unsigned slot, const unsigned char *data, size_t len)
 {
     if (slot >= H3_SLOTS) return -1;
