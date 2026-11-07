@@ -101,7 +101,7 @@ static int h3_parse(struct dns_http3_control *c, struct h3_peer_stream *p)
                     shift += 7;
                 }
             }
-            if (id & 3) return h3_fail(c, 0x202);
+            if ((id & 3) || id > (UINT64_C(1) << 62) - 1) return h3_fail(c, 0x202);
             h3_consume(p, n);
             c->transitions++;
         }
@@ -260,11 +260,16 @@ int _dns_http3_control_pending(struct dns_server_info *s)
 }
 int _dns_http3_control_shutdown(struct dns_server_info *s)
 {
-    if (!s->http3_control || !s->http3_control->fatal || !s->ssl) return 0;
+    pthread_mutex_lock(&s->lock);
+    if (!s->http3_control || !s->http3_control->fatal || !s->ssl) {
+        pthread_mutex_unlock(&s->lock);
+        return 0;
+    }
     SSL_SHUTDOWN_EX_ARGS args = {0};
     args.quic_error_code = s->http3_control->fatal;
     args.quic_reason = "HTTP/3 protocol error";
     SSL_shutdown_ex(s->ssl, SSL_SHUTDOWN_FLAG_NO_BLOCK | SSL_SHUTDOWN_FLAG_NO_STREAM_FLUSH, &args, sizeof(args));
+    pthread_mutex_unlock(&s->lock);
     return 1;
 }
 void _dns_http3_control_free(struct dns_server_info *s)
