@@ -1,114 +1,40 @@
-name: Upstream regression verification
+name: Upstream protocol verification
 on:
   push:
     branches: [verify/upstream-general-corrections]
 permissions:
   contents: read
 jobs:
-  topics:
+  protocols:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        include: [{"topic": "hpack-state", "sha": "a206a526c89d82d6561a53348a9b1bd06c8b1211", "filter": "HeaderCompression.*:LIBHTTP2.SettingsHeaderTableSizeEvictsResponseEncoderEntries:LIBHTTP2.OversizedDecoderTableClosesTheConnectionWithCompressionError:LIBHTTP2.SettingsMaxHeaderListSizeLimitsResponseHeaders", "kind": "native"}, {"topic": "thread-startup", "sha": "27f9777917d4b27af2f61c50e2bceb92e8be1579", "filter": "ThreadStartup.*", "kind": "native"}]
+        include: [{"profile": "http2", "sha": "35d40bd56ba2e024edc2a86cae751a5139191e31", "sdk": "native"}, {"profile": "quic-http3", "sha": "de20c8106565b1704edb339a8c355bb7e167f5c0", "sdk": "3.5"}, {"profile": "sanitizers", "sha": "cdc66f3", "sdk": "3.5"}]
     env:
-      TOPIC: ${{ matrix.topic }}
+      PROFILE: ${{ matrix.profile }}
       CANDIDATE: ${{ matrix.sha }}
-      FILTER: ${{ matrix.filter }}
-      KIND: ${{ matrix.kind }}
-      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Install test dependencies
+      - name: Verify native profile
+        if: matrix.sdk == 'native'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y libgtest-dev dnsutils libssl-dev zlib1g-dev libclang-dev
-      - name: Verify isolated source and regression
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/evidence"
-          git checkout --detach "$CANDIDATE"
-          git diff --check HEAD^
-          git rev-parse HEAD HEAD^ > "$RUNNER_TEMP/evidence/source.txt"
-          if [ "$KIND" = ui ]; then
-            make -C src -j4 WITH_ZLIB=0 libsmartdns-test.a > "$RUNNER_TEMP/evidence/native-build.log" 2>&1
-            cp plugin/smartdns-ui/src/data_stats.rs "$RUNNER_TEMP/data_stats.rs"
-            python3 - <<'PYBASE'
-          from pathlib import Path
-          p = Path('plugin/smartdns-ui/src/data_stats.rs')
-          s = p.read_text()
-          start = s.index('            let mut value = self.request_dropped.load(Ordering::Relaxed);')
-          end = s.index('\n        }', start)
-          s = s[:start] + '            self.request_dropped.fetch_and(count, Ordering::Relaxed);' + s[end:]
-          s = s.replace('now.saturating_sub(30 * DAY_MS)', '30 * DAY_MS')
-          s = s.replace('now.saturating_sub(90 * DAY_MS)', '90 * DAY_MS')
-          p.write_text(s)
-          PYBASE
-            set +e
-            (cd plugin/smartdns-ui && cargo test --lib "$FILTER" -- --test-threads=1) > "$RUNNER_TEMP/evidence/baseline.log" 2>&1
-            result=$?
-            set -e
-            test "$result" -eq 101
-            grep -q 'test result: FAILED' "$RUNNER_TEMP/evidence/baseline.log"
-            cp "$RUNNER_TEMP/data_stats.rs" plugin/smartdns-ui/src/data_stats.rs
-            (cd plugin/smartdns-ui && cargo test --lib "$FILTER" -- --test-threads=1) 2>&1 | tee "$RUNNER_TEMP/evidence/candidate.log"
-            cp plugin/smartdns-ui/Cargo.lock "$RUNNER_TEMP/evidence/Cargo.lock"
-          else
-            git diff HEAD^ HEAD -- src > "$RUNNER_TEMP/production.patch"
-            git apply --reverse "$RUNNER_TEMP/production.patch"
-            if [ "$TOPIC" = hpack-state ]; then
-              mv test/cases/test-hpack-state.cc "$RUNNER_TEMP/test-hpack-state.cc"
-              sed -i '/^LDFLAGS += -Wl,--wrap=strdup$/d' test/Makefile
-            fi
-            make -C test -j4 > "$RUNNER_TEMP/evidence/baseline-build.log" 2>&1
-            set +e
-            sudo timeout 180 ./test/test.bin --gtest_filter="$FILTER" --gtest_output="xml:$RUNNER_TEMP/evidence/baseline.xml" > "$RUNNER_TEMP/evidence/baseline.log" 2>&1
-            result=$?
-            set -e
-            test "$result" -eq 1
-            python3 - <<'PYRESULT'
-          import os, xml.etree.ElementTree as ET
-          r = ET.parse(os.environ['RUNNER_TEMP'] + '/evidence/baseline.xml').getroot()
-          assert int(r.attrib['failures']) > 0
-          PYRESULT
-            git reset --hard "$CANDIDATE"
-            if [ "$TOPIC" = hpack-state ]; then
-              mv "$RUNNER_TEMP/test-hpack-state.cc" test/cases/test-hpack-state.cc
-            fi
-            make -C test clean > "$RUNNER_TEMP/evidence/clean.log" 2>&1
-            make -C test -j4 > "$RUNNER_TEMP/evidence/candidate-build.log" 2>&1
-            if [ "$TOPIC" = hpack-state ]; then FILTER='HeaderCompression.*:LIBHTTP2.*'; fi
-            sudo timeout 300 ./test/test.bin --gtest_filter="$FILTER" --gtest_output="xml:$RUNNER_TEMP/evidence/candidate.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/candidate.log"
-          fi
-          git diff --exit-code -- src plugin/smartdns-ui/src test
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: regression-${{ matrix.topic }}
-          path: ${{ runner.temp }}/evidence
-          retention-days: 14
-  sanitizers:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - run: |
           sudo apt-get update -qq
           sudo apt-get install -y libgtest-dev dnsutils libssl-dev zlib1g-dev
-      - name: Run native regressions with address and undefined behavior sanitizers
-        shell: bash
+          sudo env PROFILE="$PROFILE" CANDIDATE="$CANDIDATE" PROOF="$RUNNER_TEMP/evidence" bash .github/verification/protocols.sh
+      - name: Verify OpenSSL QUIC profile
+        if: matrix.sdk == '3.5'
         run: |
-          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/evidence"
-          make -C test -j4 EXTRA_CFLAGS='-fsanitize=address,undefined -fno-sanitize-recover=all' CXXFLAGS='-g -DTEST -I./ -I../src -I../src/include -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all' EXTRA_LDFLAGS='-fsanitize=address,undefined' > "$RUNNER_TEMP/evidence/build.log" 2>&1
-          sudo env ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 timeout 180 ./test/test.bin --gtest_filter='LibConf.*:CacheCheckpoint.*:Ping.*:HeaderCompression.*:ThreadStartup.*:LIBHTTP2.SettingsHeaderTableSizeEvictsResponseEncoderEntries:LIBHTTP2.OversizedDecoderTableClosesTheConnectionWithCompressionError:LIBHTTP2.SettingsMaxHeaderListSizeLimitsResponseHeaders' --gtest_output="xml:$RUNNER_TEMP/evidence/sanitizers.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/sanitizers.log"
+          docker run --rm -v "$PWD:/work" -v "$RUNNER_TEMP/evidence:/evidence" -w /work -e PROFILE -e CANDIDATE debian:trixie bash -c '
+            apt-get update -qq && apt-get install -y build-essential git libssl-dev libgtest-dev dnsutils zlib1g-dev python3 ca-certificates &&
+            PROOF=/evidence bash .github/verification/protocols.sh'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: native-sanitizers
+          name: protocols-${{ matrix.profile }}
           path: ${{ runner.temp }}/evidence
           retention-days: 14
