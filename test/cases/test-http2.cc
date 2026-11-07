@@ -4,13 +4,18 @@
 #include "smartdns/http2.h"
 #include "smartdns/util.h"
 #include "gtest/gtest.h"
+#include "dns_client/dns_client.h"
+#undef min
+#undef max
 #include <arpa/inet.h>
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cctype>
 #include <cstring>
 #include <fcntl.h>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -25,6 +30,20 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+
+namespace {
+std::atomic<bool> observe_h2_publication{false};
+std::atomic<int> h2_publications{0}, h2_external_publications{0};
+}
+extern "C" void __real_http2_stream_set_ex_data(http2_stream *, void *);
+extern "C" void __wrap_http2_stream_set_ex_data(http2_stream *stream, void *data)
+{
+    if (data && observe_h2_publication.load()) {
+        h2_publications++;
+        if (!pthread_equal(pthread_self(), client.tid)) h2_external_publications++;
+    }
+    __real_http2_stream_set_ex_data(stream, data);
+}
 
 namespace
 {
@@ -104,7 +123,7 @@ class LimitedHTTP2DoHUpstream
   public:
 	~LimitedHTTP2DoHUpstream() { Stop(); }
 
-	bool Start(int port, int max_concurrent_streams, const char *response_ip)
+	bool Start(int port, int max_concurrent_streams, const char *response_ip, bool zero_window = false)
 	{
 		if (!EnsureHTTP2TestCert()) {
 			last_error_ = "generate HTTP/2 test cert failed";
@@ -112,6 +131,7 @@ class LimitedHTTP2DoHUpstream
 		}
 
 		response_ip_ = response_ip;
+		zero_window_ = zero_window;
 		max_concurrent_streams_ = max_concurrent_streams;
 
 		ssl_ctx_ = SSL_CTX_new(TLS_server_method());
@@ -180,11 +200,19 @@ class LimitedHTTP2DoHUpstream
 	}
 
 	int RequestCount() const { return request_count_.load(); }
+	int HeaderCount() const { return header_count_.load(); }
+	int ResetCount() const { return reset_count_.load(); }
+	int BodyBytes() const { return body_bytes_.load(); }
+	void ReleaseWindow() { release_window_ = true; }
+	bool WindowRestored() const { return window_restored_.load(); }
 	const std::string &LastError() const { return last_error_; }
 
   private:
 	struct Connection {
 		SSL *ssl = nullptr;
+		LimitedHTTP2DoHUpstream *owner = nullptr;
+		bool settings_rewritten = false, preface_read = false;
+		std::vector<uint8_t> trace;
 	};
 
 	static int AlpnSelectCallback(SSL *, const unsigned char **out, unsigned char *outlen, const unsigned char *in,
@@ -212,6 +240,21 @@ class LimitedHTTP2DoHUpstream
 		Connection *conn = (Connection *)private_data;
 		int ret = SSL_read(conn->ssl, buf, len);
 		if (ret > 0) {
+			if (conn->owner->zero_window_) {
+				auto &wire = conn->trace;
+				wire.insert(wire.end(), buf, buf + ret);
+				if (!conn->preface_read && wire.size() >= 24) {
+					wire.erase(wire.begin(), wire.begin() + 24);
+					conn->preface_read = true;
+				}
+				while (conn->preface_read && wire.size() >= 9) {
+					size_t n = (wire[0] << 16) | (wire[1] << 8) | wire[2];
+					if (wire.size() < n + 9) break;
+					if (wire[3] == 3) conn->owner->reset_count_++;
+					if (wire[3] == 0) conn->owner->body_bytes_ += n;
+					wire.erase(wire.begin(), wire.begin() + n + 9);
+				}
+			}
 			return ret;
 		}
 
@@ -226,8 +269,18 @@ class LimitedHTTP2DoHUpstream
 	static int BioWrite(void *private_data, const uint8_t *buf, int len)
 	{
 		Connection *conn = (Connection *)private_data;
-		int ret = SSL_write(conn->ssl, buf, len);
+		std::vector<uint8_t> changed;
+		bool rewrite = false;
+		if (conn->owner->zero_window_ && !conn->settings_rewritten && len >= 9 && buf[3] == 4 && !(buf[4] & 1)) {
+			changed.assign(buf, buf + len);
+			for (int p = 9; p + 6 <= len; p += 6) if (buf[p] == 0 && buf[p + 1] == 4) {
+				std::fill(changed.begin() + p + 2, changed.begin() + p + 6, 0);
+				rewrite = true;
+			}
+		}
+		int ret = SSL_write(conn->ssl, rewrite ? changed.data() : buf, len);
 		if (ret > 0) {
+			if (rewrite) conn->settings_rewritten = true;
 			return ret;
 		}
 
@@ -329,12 +382,14 @@ class LimitedHTTP2DoHUpstream
 		}
 
 		Connection conn;
+		conn.owner = this;
 		conn.ssl = SSL_new(ssl_ctx_);
 		if (conn.ssl == nullptr) {
 			close(fd);
 			return;
 		}
 		SSL_set_fd(conn.ssl, fd);
+		SSL_set_mode(conn.ssl, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 		if (!WaitSslAccept(conn.ssl, fd)) {
 			SSL_free(conn.ssl);
 			close(fd);
@@ -356,6 +411,10 @@ class LimitedHTTP2DoHUpstream
 		std::set<struct http2_stream *> streams;
 		std::map<struct http2_stream *, std::vector<uint8_t>> bodies;
 		while (run_) {
+			if (zero_window_ && release_window_ && !window_restored_) {
+				static const uint8_t restore[] = {0,0,6,4,0,0,0,0,0, 0,4,0,0,255,255};
+				if (SSL_write(conn.ssl, restore, sizeof(restore)) == sizeof(restore)) window_restored_ = true;
+			}
 			struct pollfd pfd = {fd, POLLIN | POLLOUT, 0};
 			poll(&pfd, 1, 10);
 
@@ -370,6 +429,7 @@ class LimitedHTTP2DoHUpstream
 				if (items[i].stream == nullptr && items[i].readable) {
 					struct http2_stream *stream = nullptr;
 					while ((stream = http2_ctx_accept_stream(ctx)) != nullptr) {
+						header_count_++;
 						streams.insert(stream);
 						bodies[stream] = std::vector<uint8_t>();
 					}
@@ -427,10 +487,82 @@ class LimitedHTTP2DoHUpstream
 	std::vector<std::thread> client_threads_;
 	std::atomic<bool> run_{false};
 	std::atomic<int> request_count_{0};
+	std::atomic<int> header_count_{0}, reset_count_{0}, body_bytes_{0};
+	std::atomic<bool> release_window_{false}, window_restored_{false};
+	bool zero_window_ = false;
 	int max_concurrent_streams_ = 1;
 	std::string response_ip_ = "1.2.3.4";
 	std::string last_error_;
 };
+
+TEST(HTTP2, ConnectedDohRequestsPublishOwnershipOnTheClientWorker)
+{
+    LimitedHTTP2DoHUpstream upstream;
+    ASSERT_TRUE(upstream.Start(63054, 8, "192.0.2.19")) << upstream.LastError();
+    smartdns::Server server(smartdns::Server::CREATE_MODE_THREAD);
+    ASSERT_TRUE(server.Start(R"(bind 127.0.0.1:60053
+server https://127.0.0.1:63054/dns-query -no-check-certificate -alpn h2
+cache-size 0
+speed-check-mode none
+dualstack-ip-selection no
+)"));
+    h2_publications = h2_external_publications = 0;
+    observe_h2_publication = true;
+    Defer { observe_h2_publication = false; };
+    // First connection and already-connected sends exercise both old entry paths.
+    for (const char *name : {"first.ownership.test", "second.ownership.test", "third.ownership.test"}) {
+        smartdns::Client query;
+        ASSERT_TRUE(query.Query(name, 60053));
+        EXPECT_EQ(query.GetStatus(), "NOERROR");
+        ASSERT_EQ(query.GetAnswerNum(), 1);
+        EXPECT_EQ(query.GetAnswer()[0].GetData(), "192.0.2.19");
+    }
+    EXPECT_EQ(h2_publications.load(), 3);
+    EXPECT_EQ(h2_external_publications.load(), 0);
+}
+
+TEST(HTTP2, CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit)
+{
+    auto wait = [](const std::function<bool()> &ready, int milliseconds = 3000) {
+        auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+        do { if (ready()) return true; poll(nullptr, 0, 1); }
+        while (std::chrono::steady_clock::now() < end);
+        return ready();
+    };
+    LimitedHTTP2DoHUpstream h2;
+    ASSERT_TRUE(h2.Start(63054, 1, "192.0.2.19", true)) << h2.LastError();
+    smartdns::MockServer alternate;
+    ASSERT_TRUE(alternate.Start("udp://127.0.0.1:63055", [&](smartdns::ServerRequestContext *r) {
+        if (r->domain != "cancelled.h2.test") return smartdns::SERVER_REQUEST_NO_RESPONSE;
+        if (!wait([&] { return h2.HeaderCount() > 0; })) return smartdns::SERVER_REQUEST_NO_RESPONSE;
+        smartdns::MockServer::AddIP(r, r->domain.c_str(), "192.0.2.20", 600);
+        return smartdns::SERVER_REQUEST_OK;
+    }));
+    smartdns::Server server;
+    ASSERT_TRUE(server.Start(R"(bind 127.0.0.1:60053
+server https://127.0.0.1:63054/dns-query -no-check-certificate -alpn h2
+server 127.0.0.1:63055
+cache-size 0
+speed-check-mode none
+dualstack-ip-selection no
+)"));
+    smartdns::Client client;
+    ASSERT_TRUE(client.Query("cancelled.h2.test +time=4 +tries=1", 60053));
+    EXPECT_EQ(client.GetStatus(), "NOERROR");
+    ASSERT_EQ(client.GetAnswerNum(), 1);
+    EXPECT_EQ(client.GetAnswer()[0].GetData(), "192.0.2.20");
+    EXPECT_EQ(h2.BodyBytes(), 0);
+    // The ordinary query retry/end path must retire the unfinished H2 request.
+    h2.ReleaseWindow();
+    ASSERT_TRUE(wait([&] { return h2.WindowRestored(); }));
+    EXPECT_TRUE(wait([&] { return h2.ResetCount() == 1; }));
+    EXPECT_FALSE(wait([&] { return h2.BodyBytes() != 0; }, 500));
+    ASSERT_TRUE(client.Query("replacement.h2.test +time=4 +tries=1", 60053));
+    EXPECT_EQ(client.GetStatus(), "NOERROR");
+    ASSERT_EQ(client.GetAnswerNum(), 1);
+    EXPECT_EQ(client.GetAnswer()[0].GetData(), "192.0.2.19");
+    EXPECT_EQ(h2.RequestCount(), 1);
+}
 
 class HTTP2DoHClient
 {
