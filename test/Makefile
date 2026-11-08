@@ -27,6 +27,7 @@ CXXFLAGS += -fno-omit-frame-pointer -Wstrict-aliasing -funwind-tables
 TEST_SOURCES := $(wildcard *.cc) $(wildcard */*.cc) $(wildcard */*/*.cc)
 TEST_OBJECTS := $(patsubst %.cc, %.o, $(TEST_SOURCES))
 OBJS += $(TEST_OBJECTS)
+OBJS += $(EXTRA_TEST_OBJECTS)
 
 SMARTDNS_SRC_FILES := $(wildcard $(SMARTDNS_SRC_DIR)/*.c) $(wildcard $(SMARTDNS_SRC_DIR)/*.h) $(wildcard $(SMARTDNS_SRC_DIR)/lib/*.c)
 
@@ -57,6 +58,7 @@ LDFLAGS += -Wl,--wrap=time,--wrap=fork,--wrap=waitpid,--wrap=kill,--wrap=close,-
 LDFLAGS += $(ZLIB_LDFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
 LDFLAGS += -Wl,--wrap=pthread_create,--wrap=_dns_client_socket_ssl_send_ext
+LDFLAGS += -Wl,--wrap=sendmsg,--wrap=sendmmsg,--wrap=sendto
 
 .PHONY: all clean test $(SMARTDNS_TEST_LIB)
 

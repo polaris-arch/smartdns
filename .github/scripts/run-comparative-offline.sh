@@ -15,6 +15,16 @@ trap 'rm -rf "$work"' EXIT
 unset ASAN_OPTIONS UBSAN_OPTIONS EXTRA_CFLAGS EXTRA_LDFLAGS CXXFLAGS LDFLAGS
 export CFLAGS='-O2 -g -fno-omit-frame-pointer'
 export NO_GIT_VER=1
+# Reuse the retired pristine slot for the unsanitized patched dependency. Both
+# application variants use these identical library bytes; never benchmark ASan.
+python3 .github/scripts/openssl-dependency.py build \
+    --archive "$source_dir/.ci-openssl/openssl.tar.gz" \
+    --work "$source_dir/.ci-openssl/secondary/build" \
+    --prefix "$source_dir/.ci-openssl/secondary/install" \
+    --receipt "$out/openssl-receipt.json"
+ssl_prefix="$source_dir/.ci-openssl/secondary/install"
+export EXTRA_CFLAGS="-I$ssl_prefix/include"
+export EXTRA_LDFLAGS="-L$ssl_prefix/lib"
 {
     printf 'CFLAGS=%s\nNO_GIT_VER=%s\n' "$CFLAGS" "$NO_GIT_VER"
     cc --version
@@ -25,7 +35,7 @@ export NO_GIT_VER=1
 for variant in baseline candidate; do
     mkdir "$work/$variant"
     tar -xf ".ci-$variant.tar" -C "$work/$variant"
-    make -C "$work/$variant" -j4 all
+    make -C "$work/$variant" -j4 all EXTRA_LDFLAGS="$EXTRA_LDFLAGS -Wl,-Map=$out/$variant-link.map"
     sha256sum "$work/$variant/src/smartdns" > "$out/$variant-binary.sha256"
     ldd "$work/$variant/src/smartdns" > "$out/$variant-linked-libraries.txt"
 done

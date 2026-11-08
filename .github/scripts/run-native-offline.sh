@@ -41,6 +41,24 @@ command -v nft
 command -v ipset
 export SMARTDNS_RUN_IPSET_INTEGRATION=1
 curl --version | grep -q HTTP2
+ssl_compile_flags=()
+ssl_link_flags=()
+if [[ "$CI_NATIVE_PROFILE" == quic ]]; then
+    dependency_args=()
+    if [[ "${CI_NATIVE_SANITIZERS:-0}" == 1 ]]; then
+        dependency_args+=(--sanitizers)
+        export ASAN_OPTIONS="detect_leaks=1:halt_on_error=1:abort_on_error=1"
+        export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
+    fi
+    python3 .github/scripts/run-openssl-quic-tests.py "${dependency_args[@]}"
+    ssl_prefix="$PWD/.ci-openssl/candidate/install"
+    ssl_source="$PWD/.ci-openssl/candidate/build/source"
+    ssl_compile_flags+=("-I$ssl_prefix/include")
+    ssl_link_flags+=("-L$ssl_prefix/lib")
+    if [[ "${CI_NATIVE_SANITIZERS:-0}" == 1 ]]; then
+        ssl_link_flags+=(-fsanitize=address,undefined)
+    fi
+fi
 # Both compile-time headers and linked runtime must match the intended capability.
 cat > /tmp/native-ssl-capability.c <<'C'
 #include <openssl/ssl.h>
@@ -67,7 +85,7 @@ int main(void) {
 C
 flags=()
 if [[ "$CI_NATIVE_PROFILE" == quic ]]; then flags+=(-DREQUIRE_QUIC); fi
-cc "${flags[@]}" /tmp/native-ssl-capability.c -o /tmp/native-ssl-capability -lssl -lcrypto
+cc "${flags[@]}" "${ssl_compile_flags[@]}" /tmp/native-ssl-capability.c -o /tmp/native-ssl-capability "${ssl_link_flags[@]}" -lssl -lcrypto
 /tmp/native-ssl-capability | tee ci-results/ssl-capability.txt
 # Existing make extension points instrument both C production code and C++ tests.
 # Never reuse objects from an uninstrumented build.
@@ -82,10 +100,32 @@ if [[ "${CI_NATIVE_SANITIZERS:-0}" == 1 ]]; then
         "EXTRA_LDFLAGS=$EXTRA_LDFLAGS" "ASAN_OPTIONS=$ASAN_OPTIONS" \
         "UBSAN_OPTIONS=$UBSAN_OPTIONS" > ci-results/sanitizer-options.txt
 fi
+if [[ "$CI_NATIVE_PROFILE" == quic ]]; then
+    export EXTRA_CFLAGS="${EXTRA_CFLAGS:-} ${ssl_compile_flags[*]}"
+    export CXXFLAGS="${CXXFLAGS:-} ${ssl_compile_flags[*]} -DSMARTDNS_TEST_PINNED_QUIC=1"
+    export EXTRA_LDFLAGS="${EXTRA_LDFLAGS:-} ${ssl_link_flags[*]}"
+fi
 # Preserve the upstream build-clean-test sequence. No test filter or stress override.
-make all -j4
+make all -j4 EXTRA_LDFLAGS="${EXTRA_LDFLAGS:-} -Wl,-Map=$PWD/ci-results/application-link.map"
 make clean
-make -C test -j8
+if [[ "$CI_NATIVE_PROFILE" == quic ]]; then
+    # Exact private headers belong only to this test object. App headers come
+    # from the verified installation, and all libraries are statically pinned.
+    cc ${EXTRA_CFLAGS:-} -DNDEBUG -I"$ssl_source/include" -I"$ssl_source" -I"$PWD" \
+        -c .github/tests/openssl-quic-probe.c -o .ci-openssl/candidate/probe.o
+    export EXTRA_TEST_OBJECTS="$PWD/.ci-openssl/candidate/probe.o"
+fi
+make -C test -j8 EXTRA_LDFLAGS="${EXTRA_LDFLAGS:-} -Wl,-Map=$PWD/ci-results/test-link.map"
+if [[ "$CI_NATIVE_PROFILE" == quic ]]; then
+    for map in ci-results/application-link.map ci-results/test-link.map; do
+        grep -F "LOAD $ssl_prefix/lib/libssl.a" "$map"
+        grep -F "LOAD $ssl_prefix/lib/libcrypto.a" "$map"
+        if grep -Eq '^LOAD .*lib(ssl|crypto)\.so' "$map"; then
+            echo 'Pinned QUIC build unexpectedly linked a shared system SSL library' >&2
+            exit 1
+        fi
+    done
+fi
 ldd test/test.bin > ci-results/test-linked-libraries.txt
 suite_seconds=600
 suite_log=ci-results/native-test.log
@@ -153,5 +193,8 @@ if [[ "${CI_NATIVE_SANITIZERS:-0}" == 1 ]] &&
     grep -Eq 'ERROR: (AddressSanitizer|LeakSanitizer)|AddressSanitizer:DEADLYSIGNAL|LeakSanitizer has encountered a fatal error|runtime error:' "$suite_log"; then
     echo 'Sanitizer report found; no suppressions are applied.' >&2
     exit 1
+fi
+if [[ "$CI_NATIVE_PROFILE" == quic && "$result" == 0 ]]; then
+    python3 .github/scripts/run-openssl-native-control.py
 fi
 exit "$result"

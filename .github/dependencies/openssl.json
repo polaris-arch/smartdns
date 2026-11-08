@@ -1,0 +1,18 @@
+{
+  "version": "3.5.9",
+  "url": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
+  "sha256": "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a",
+  "size": 53279637,
+  "patch": ".github/patches/openssl-quic-stream-reclamation.patch",
+  "configure": [
+    "no-shared", "no-tests", "no-apps",
+    "no-argon2", "no-aria", "no-async", "no-bf", "no-blake2",
+    "no-camellia", "no-cmp", "no-cms", "no-comp", "no-des", "no-dh",
+    "no-dsa", "no-ec2m", "no-engine", "no-gost", "no-http", "no-idea",
+    "no-legacy", "no-md4", "no-mdc2", "no-multiblock", "no-nextprotoneg",
+    "no-ocb", "no-ocsp", "no-rc2", "no-rc4", "no-rmd160", "no-scrypt",
+    "no-seed", "no-siphash", "no-siv", "no-sm2", "no-sm3", "no-sm4",
+    "no-srp", "no-srtp", "no-ts", "no-whirlpool", "no-ssl-trace",
+    "no-ssl", "no-ssl3"
+  ]
+}

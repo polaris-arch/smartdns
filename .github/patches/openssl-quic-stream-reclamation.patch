@@ -1,0 +1,224 @@
+--- a/include/internal/quic_stream_map.h
++++ b/include/internal/quic_stream_map.h
+@@ -864,9 +864,10 @@
+ 
+ /*
+  * Delete streams ready for GC. Pointers to those QUIC_STREAM objects become
+- * invalid.
+- */
+-void ossl_quic_stream_map_gc(QUIC_STREAM_MAP *qsm);
++ * invalid. Retire discarded receive bytes using the connection's smoothed RTT.
++ * Returns 0 on an internal flow-control error, retaining the failing stream.
++ */
++int ossl_quic_stream_map_gc(QUIC_STREAM_MAP *qsm, OSSL_TIME rtt);
+ 
+ /*
+  * Begins shutdown stream flush triage. Analyses all streams, including deleted
+--- a/ssl/quic/quic_channel.c
++++ b/ssl/quic/quic_channel.c
+@@ -2032,6 +2032,7 @@
+     uint32_t flags)
+ {
+     OSSL_TIME now, deadline;
++    OSSL_RTT_INFO rtt_info;
+     int channel_only = (flags & QUIC_REACTOR_TICK_FLAG_CHANNEL_ONLY) != 0;
+     int notify_other_threads = 0;
+ 
+@@ -2148,11 +2149,16 @@
+             ch_update_ping_deadline(ch);
+         }
+ 
++        /* No packetiser stream pointers are live here. Make retired byte
++         * credit visible to this tick's MAX_DATA generation, even without
++         * another application read or write. */
++        ossl_statm_get_rtt_info(ossl_quic_channel_get_statm(ch), &rtt_info);
++        if (!ossl_quic_stream_map_gc(&ch->qsm, rtt_info.smoothed_rtt))
++            ossl_quic_channel_raise_protocol_error(ch,
++                OSSL_QUIC_ERR_INTERNAL_ERROR, 0, "stream GC flow control error");
++
+         /* Queue any data to be sent for transmission. */
+         ch_tx(ch, &notify_other_threads);
+-
+-        /* Do stream GC. */
+-        ossl_quic_stream_map_gc(&ch->qsm);
+     }
+ 
+     /* Determine the time at which we should next be ticked. */
+--- a/ssl/quic/quic_fifd.c
++++ b/ssl/quic/quic_fifd.c
+@@ -141,28 +141,23 @@
+         sstream = fifd->get_sstream_by_id(chunks[i].stream_id,
+             pkt->ackm_pkt.pkt_space,
+             fifd->get_sstream_by_id_arg);
+-        if (sstream == NULL)
+-            continue;
+-
+         sstream_updated = 0;
+-
+-        if (chunks[i].end >= chunks[i].start) {
+-            /*
+-             * Note: If the stream is being reset, we do not need to retransmit
+-             * old data as this is pointless. In this case this will be handled
+-             * by (sstream == NULL) above as the QSM will free the QUIC_SSTREAM
+-             * and our call to get_sstream_by_id above will return NULL.
+-             */
+-            ossl_quic_sstream_mark_lost(sstream,
+-                chunks[i].start, chunks[i].end);
+-            sstream_updated = 1;
++        if (sstream != NULL) {
++            if (chunks[i].end >= chunks[i].start) {
++                /* Reset streams have no send buffer or data to retransmit. */
++                ossl_quic_sstream_mark_lost(sstream,
++                    chunks[i].start, chunks[i].end);
++                sstream_updated = 1;
++            }
++
++            if (chunks[i].has_fin && chunks[i].stream_id != UINT64_MAX) {
++                ossl_quic_sstream_mark_lost_fin(sstream);
++                sstream_updated = 1;
++            }
++
+         }
+ 
+-        if (chunks[i].has_fin && chunks[i].stream_id != UINT64_MAX) {
+-            ossl_quic_sstream_mark_lost_fin(sstream);
+-            sstream_updated = 1;
+-        }
+-
++        /* Receive/control frame delivery does not depend on a send buffer. */
+         if (chunks[i].has_stop_sending && chunks[i].stream_id != UINT64_MAX)
+             fifd->regen_frame(OSSL_QUIC_FRAME_TYPE_STOP_SENDING,
+                 chunks[i].stream_id, pkt,
+--- a/ssl/quic/quic_rx_depack.c
++++ b/ssl/quic/quic_rx_depack.c
+@@ -603,8 +603,11 @@
+      * this must happen after RXFC checks above as even if we sent STOP_SENDING
+      * we must still enforce correct flow control (RFC 9000 s. 3.5).
+      */
+-    if (stream->stop_sending)
++    if (stream->stop_sending) {
++        /* FIN may have established final size since STOP was acknowledged. */
++        ossl_quic_stream_map_update_state(&ch->qsm, stream);
+         return 1; /* not an error - packet reordering, etc. */
++    }
+ 
+     /*
+      * The receive stream buffer may or may not choose to consume the data
+@@ -644,8 +647,10 @@
+         return 0;
+     }
+ 
+-    if (rs_fin)
++    if (rs_fin) {
+         ossl_quic_stream_map_notify_totally_received(&ch->qsm, stream);
++        ossl_quic_stream_map_update_state(&ch->qsm, stream);
++    }
+ 
+     *datalen = frame_data.len;
+ 
+--- a/ssl/quic/quic_stream_map.c
++++ b/ssl/quic/quic_stream_map.c
+@@ -294,7 +294,14 @@
+ 
+ static int qsm_ready_for_gc(QUIC_STREAM_MAP *qsm, QUIC_STREAM *qs)
+ {
+-    int recv_stream_fully_drained = 0; /* TODO(QUIC FUTURE): Optimisation */
++    int recv_stream_fully_drained
++        = qs->recv_state == QUIC_RSTREAM_STATE_NONE
++        || qs->recv_state == QUIC_RSTREAM_STATE_DATA_RECVD
++        || qs->recv_state == QUIC_RSTREAM_STATE_DATA_READ
++        || qs->recv_state == QUIC_RSTREAM_STATE_RESET_RECVD
++        || qs->recv_state == QUIC_RSTREAM_STATE_RESET_READ;
++
++    /* A STOP ACK does not establish the peer's final size (RFC 9000 s. 4.5). */
+ 
+     /*
+      * If sstream has no FIN, we auto-reset it at marked-for-deletion time, so
+@@ -306,9 +313,9 @@
+         || ossl_quic_stream_send_get_final_size(qs, NULL));
+ 
+     return qs->deleted
+-        && (!ossl_quic_stream_has_recv(qs)
+-            || recv_stream_fully_drained
+-            || qs->acked_stop_sending)
++        && (recv_stream_fully_drained
++            || (qs->recv_state == QUIC_RSTREAM_STATE_SIZE_KNOWN
++                && qs->acked_stop_sending))
+         && (!ossl_quic_stream_has_send(qs)
+             || qs->send_state == QUIC_SSTREAM_STATE_DATA_RECVD
+             || qs->send_state == QUIC_SSTREAM_STATE_RESET_RECVD);
+@@ -530,10 +537,10 @@
+ 
+     case QUIC_SSTREAM_STATE_RESET_SENT:
+         qs->send_state = QUIC_SSTREAM_STATE_RESET_RECVD;
+-        return 1;
+-
++        /* FALLTHROUGH */
+     case QUIC_SSTREAM_STATE_RESET_RECVD:
+-        /* Already in the correct state. */
++        /* A queued retransmission is no longer needed after any copy is ACKed. */
++        qs->want_reset_stream = 0;
+         return 1;
+     }
+ }
+@@ -794,13 +801,24 @@
+         + ossl_quic_stream_map_get_accept_queue_len(qsm, /*is_uni=*/1);
+ }
+ 
+-void ossl_quic_stream_map_gc(QUIC_STREAM_MAP *qsm)
++int ossl_quic_stream_map_gc(QUIC_STREAM_MAP *qsm, OSSL_TIME rtt)
+ {
+     QUIC_STREAM *qs;
++    uint64_t swm, rwm;
+ 
+     while ((qs = ready_for_gc_head(&qsm->ready_for_gc_list)) != NULL) {
++        if (ossl_quic_stream_has_recv(qs)) {
++            /* Final size is accounted; discard unread bytes exactly once. */
++            swm = ossl_quic_rxfc_get_swm(&qs->rxfc);
++            rwm = ossl_quic_rxfc_get_rwm(&qs->rxfc);
++            if (rwm > swm
++                || (swm != rwm
++                    && !ossl_quic_rxfc_on_retire(&qs->rxfc, swm - rwm, rtt)))
++                return 0;
++        }
+         ossl_quic_stream_map_release(qsm, qs);
+     }
++    return 1;
+ }
+ 
+ static int eligible_for_shutdown_flush(QUIC_STREAM *qs)
+--- a/ssl/quic/quic_txp.c
++++ b/ssl/quic/quic_txp.c
+@@ -1658,7 +1658,7 @@
+         QUIC_STREAM *s
+             = ossl_quic_stream_map_get_by_id(txp->args.qsm, stream_id);
+ 
+-        if (s == NULL)
++        if (s == NULL || s->recv_state != QUIC_RSTREAM_STATE_RECV)
+             return;
+ 
+         s->want_max_stream_data = 1;
+@@ -1677,7 +1677,7 @@
+         QUIC_STREAM *s
+             = ossl_quic_stream_map_get_by_id(txp->args.qsm, stream_id);
+ 
+-        if (s == NULL)
++        if (s == NULL || s->send_state != QUIC_SSTREAM_STATE_RESET_SENT)
+             return;
+ 
+         s->want_reset_stream = 1;
+@@ -3014,10 +3014,11 @@
+     txpkt.pn = txp->next_pn[pn_space];
+     txpkt.flags = OSSL_QTX_PKT_FLAG_COALESCE; /* always try to coalesce */
+ 
+-    /* Generate TXPIM chunks representing STOP_SENDING and RESET_STREAM frames. */
++    /* Track stream credit and abort frames even without STREAM payload. */
+     for (stream = pkt->stream_head; stream != NULL; stream = stream->txp_next)
+-        if (stream->txp_sent_stop_sending || stream->txp_sent_reset_stream) {
+-            /* Log STOP_SENDING/RESET_STREAM chunk to TXPIM. */
++        if (stream->txp_sent_fc || stream->txp_sent_stop_sending
++            || stream->txp_sent_reset_stream) {
++            /* Empty range: FIFD regenerates control without STREAM data. */
+             QUIC_TXPIM_CHUNK chunk;
+ 
+             chunk.stream_id = stream->id;

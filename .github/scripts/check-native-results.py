@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Require frozen critical cases, not merely a green or empty filtered test run."""
 import argparse
+import hashlib
+import json
+from pathlib import Path
 import sys
 import xml.etree.ElementTree as ET
 
@@ -444,6 +447,69 @@ LocalPtrPolicy.ReservedPtrPolicyPreservesStaticPublicAndOtherQtypes
 LocalPtrPolicy.SpecificOverridesAndInheritedGroupPolicyRemainIndependent
 """.split())
 QUIC.add('UpstreamServiceQuic.H3CompletedStreamsDoNotConsumeTheLiveStreamLimit')
+QUIC.update({
+    'UpstreamServiceQuic.PersistentH3ReclaimsRetiredStreams',
+    'UpstreamServiceQuic.PersistentDoqReclaimsRetiredStreams',
+    'StrictPeerCredit.GcPublishesCreditWithoutFurtherApplicationIo',
+})
+
+# Each control must reach its known protocol assertion, rather than fail setup.
+OPENSSL_QUIC_REQUIRED = {
+    'StateMatrix': 'matrix case 0 send=4 receive=4',
+    'ByteCreditOnce': 'ossl_quic_rxfc_get_rwm(&f.connection)==12',
+    'MultipleGcAndOwners': 'released-before==7',
+    'RetirementFailureRetainsStream': '!collect(&f.map)',
+    'NullSendBufferControlLoss': 'loss flags reset=0 stop=0 credit=0',
+    'ResetAckThenLateLoss': '!s->want_reset_stream',
+    'ResetQueuedLossThenAck': '!s->want_reset_stream',
+    'ReceiveFinAfterStop': 'f.stream->ready_for_gc',
+    'ReceiveZeroFinCompletes': 'f.stream->ready_for_gc',
+    'ResetFinalSizeRetiresUnreadGap': 'ossl_quic_stream_map_get_by_id(&f.map,0)==s',
+    'LateAckLossAfterGc': 'released==before+1',
+}
+
+
+def validate_dependency(report, evidence_dir=None, sanitizers=None):
+    root = Path(__file__).resolve().parents[2]
+    spec = json.loads((root / '.github/dependencies/openssl.json').read_text())
+    if report['archive_sha256'] != spec['sha256'] or report['patch_sha256'] != hashlib.sha256((root / spec['patch']).read_bytes()).hexdigest():
+        raise ValueError('Dependency regression source/patch identity mismatch')
+    cases = report['cases']
+    if len(cases) != len(OPENSSL_QUIC_REQUIRED) or {c['name'] for c in cases} != set(OPENSSL_QUIC_REQUIRED):
+        raise ValueError('Missing/duplicate/unexpected dependency regression')
+    if any(c['candidate'] != 0 or c['pristine'] != 1 or c['candidate_completed'] is not True
+           or c['pristine_expected_failure'] is not True or c['sanitizer_clean'] is not True for c in cases):
+        raise ValueError('Dependency regression/real pristine negative control did not complete as required')
+    if set(report['variants']) != {'candidate', 'pristine'}:
+        raise ValueError('Both exact dependency variants required')
+    control = report['native_credit_control']
+    if (control['case'] != 'StrictPeerCredit.GcPublishesCreditWithoutFurtherApplicationIo'
+            or control['candidate'] != 0 or control['pristine'] != 1
+            or control['qualified_failure'] is not True or not control['unchanged_objects']):
+        raise ValueError('Real native credit/scheduling negative control did not qualify')
+    if sanitizers is not None and report['sanitizers'] is not sanitizers:
+        raise ValueError('Dependency sanitizer policy differs from this job')
+    if evidence_dir is not None:
+        inputs = []
+        for variant in ['candidate', 'pristine']:
+            receipt = json.loads((evidence_dir / ('openssl-' + variant + '.json')).read_text())
+            value = dict(receipt['input'])
+            if (value['archive_sha256'] != spec['sha256'] or value['version'] != spec['version']
+                    or value['recipe_sha256'] != hashlib.sha256((root / '.github/scripts/openssl-dependency.py').read_bytes()).hexdigest()
+                    or value['pristine'] is not (variant == 'pristine')
+                    or value['patch_sha256'] != (report['patch_sha256'] if variant == 'candidate' else None)
+                    or value['sanitizers'] is not report['sanitizers']):
+                raise ValueError('Dependency receipt does not match tested source/variant')
+            binary_sha = report['variants'][variant]['binary_sha256']
+            if len(binary_sha) != 64 or any(c not in '0123456789abcdef' for c in binary_sha):
+                raise ValueError('Missing exact dependency test executable identity')
+            for name in ['lib/libssl.a', 'lib/libcrypto.a']:
+                if receipt['files'][name]['size'] <= 0 or len(receipt['files'][name]['sha256']) != 64:
+                    raise ValueError('Missing installed static archive identity')
+            value.pop('pristine'); value.pop('patch_sha256'); inputs.append(value)
+        if inputs[0] != inputs[1]:
+            raise ValueError('Pristine and candidate must differ only by the repair patch')
+    print(f'Accepted {len(cases)} patched/pristine dependency regression pairs.')
 
 
 def validate(root, profile):
@@ -505,12 +571,44 @@ def self_test():
             continue
         raise AssertionError('negative gate fixture incorrectly passed: ' + kind)
     print('Result-gate synthetic positive/negative checks passed; no native tests executed.')
+    root = Path(__file__).resolve().parents[2]
+    spec = json.loads((root / '.github/dependencies/openssl.json').read_text())
+    dependency = {
+        'archive_sha256': spec['sha256'],
+        'patch_sha256': hashlib.sha256((root / spec['patch']).read_bytes()).hexdigest(),
+        'sanitizers': False, 'variants': {'candidate': {}, 'pristine': {}},
+        'cases': [{'name': name, 'candidate': 0, 'pristine': 1,
+                   'candidate_completed': True, 'pristine_expected_failure': True, 'sanitizer_clean': True}
+                  for name in OPENSSL_QUIC_REQUIRED],
+        'native_credit_control': {
+            'case': 'StrictPeerCredit.GcPublishesCreditWithoutFurtherApplicationIo',
+            'candidate': 0, 'pristine': 1, 'qualified_failure': True,
+            'unchanged_objects': {'test-only-synthetic.o': 'synthetic'},
+        },
+    }
+    validate_dependency(dependency, sanitizers=False)
+    for kind in ('missing', 'duplicate', 'old-passes', 'wrong-assertion', 'sanitizer', 'wrong-source', 'native-unqualified'):
+        report = json.loads(json.dumps(dependency))
+        if kind == 'missing': report['cases'].pop()
+        elif kind == 'duplicate': report['cases'][0] = report['cases'][1]
+        elif kind == 'old-passes': report['cases'][0]['pristine'] = 0
+        elif kind == 'wrong-assertion': report['cases'][0]['pristine_expected_failure'] = False
+        elif kind == 'sanitizer': report['cases'][0]['sanitizer_clean'] = False
+        elif kind == 'wrong-source': report['archive_sha256'] = '0' * 64
+        elif kind == 'native-unqualified': report['native_credit_control']['qualified_failure'] = False
+        try:
+            validate_dependency(report, sanitizers=False)
+        except ValueError:
+            continue
+        raise AssertionError('bad dependency control accepted: ' + kind)
+    print('Dependency result-gate synthetic positive/negative checks passed; no dependency executed.')
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--self-test', action='store_true')
     parser.add_argument('--profile', choices=('system', 'quic'))
+    parser.add_argument('--sanitizers', choices=('0', '1'))
     parser.add_argument('xml', nargs='?')
     args = parser.parse_args()
     if args.self_test:
@@ -520,7 +618,10 @@ def main():
         parser.error('--profile and XML path required')
     try:
         validate(ET.parse(args.xml).getroot(), args.profile)
-    except (OSError, ET.ParseError, ValueError) as error:
+        if args.profile == 'quic':
+            validate_dependency(json.loads(Path(args.xml).with_name('openssl-quic-tests.json').read_text()),
+                                Path(args.xml).parent, None if args.sanitizers is None else args.sanitizers == '1')
+    except (OSError, ET.ParseError, ValueError, KeyError, TypeError) as error:
         print(error, file=sys.stderr)
         sys.exit(1)
 

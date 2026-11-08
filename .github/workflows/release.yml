@@ -99,7 +99,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtest-dev dnsperf jq wget unzip tar make gcc clang libclang-dev
+          sudo apt-get install -y libgtest-dev dnsperf jq wget unzip tar make gcc clang libclang-dev patch perl
           
           # Download and install Alpine's apk.static dynamically
           APK_FILE=$(wget -qO- https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/ | grep -oE 'apk-tools-static-[0-9][a-zA-Z0-9.-]*\.apk' | head -n 1)
@@ -116,7 +116,7 @@ jobs:
         id: cache-toolchain
         with:
           path: ~/toolchain
-          key: ${{ runner.os }}-${{ env.BUILD_TARGET }}-toolchains-openssl-3.5.4-v2
+          key: ${{ runner.os }}-${{ env.BUILD_TARGET }}-toolchains-openssl-${{ hashFiles('.github/dependencies/openssl.json', '.github/patches/openssl-quic-stream-reclamation.patch', '.github/scripts/openssl-dependency.py') }}
 
       # 9. Link Cached Toolchains to /opt/toolchain (Runs always so paths match)
       - name: Link Cached Toolchains
@@ -193,40 +193,18 @@ jobs:
             ln -s "${prefix_from}-objdump" "$HOME/toolchain/$dir_name/bin/objdump"
           done
 
-      # 11. Download and compile OpenSSL for each target
-      - name: Compile OpenSSL for Cross-Compilers
-        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+      # Use the exact recipe and patch exercised by mandatory native QUIC CI.
+      - name: Build or verify pinned OpenSSL for all selected targets
+        env:
+          TOOLCHAIN_CACHE_HIT: ${{ steps.cache-toolchain.outputs.cache-hit }}
         run: |
-          wget -q https://github.com/openssl/openssl/releases/download/openssl-3.5.4/openssl-3.5.4.tar.gz -O /tmp/openssl-3.5.4.tar.gz
-          
-          build_openssl() {
-            local cc_path="$1"
-            local target="$2"
-            echo "==========================================="
-            echo "Building OpenSSL for $cc_path ($target)..."
-            echo "==========================================="
-            local sysroot=$($cc_path --print-sysroot)
-            mkdir -p /tmp/build-openssl
-            cd /tmp/build-openssl
-            rm -rf openssl-3.5.4
-            tar -xzf /tmp/openssl-3.5.4.tar.gz
-            cd openssl-3.5.4
-            
-            CC="$cc_path" ./Configure "$target" \
-              --prefix="$sysroot" \
-              no-shared no-tests no-apps \
-              no-argon2 no-aria no-async no-bf no-blake2 no-camellia no-cmp no-cms \
-              no-comp no-des no-dh no-dsa no-ec2m no-engine no-gost \
-              no-http no-idea no-legacy no-md4 no-mdc2 no-multiblock \
-              no-nextprotoneg no-ocb no-ocsp no-rc2 no-rc4 no-rmd160 \
-              no-scrypt no-seed no-siphash no-siv no-sm2 no-sm3 no-sm4 \
-              no-srp no-srtp no-ts no-whirlpool no-ssl-trace no-ssl no-ssl3 -Os
-              
-            make -j$(nproc)
-            sudo make install_sw
-          }
-          
-          # Compile OpenSSL for each target in parallel or sequence
+          set -euo pipefail
+          recipe="$GITHUB_WORKSPACE/.github/scripts/openssl-dependency.py"
+          archive="$GITHUB_WORKSPACE/.ci-openssl/openssl.tar.gz"
+          mkdir -p release-evidence
+          if [ "$TOOLCHAIN_CACHE_HIT" != true ]; then
+            python3 "$recipe" fetch --archive "$archive"
+          fi
           for arch in mips mipsel arm aarch64 x86_64 i686; do
             if [ "$BUILD_TARGET" != all ] && [ "$arch" != "$BUILD_TARGET" ]; then continue; fi
             case "$arch" in
@@ -238,7 +216,19 @@ jobs:
             esac
             toolchain="$arch-unknown-linux-musl"
             if [ "$arch" = arm ]; then toolchain=arm-unknown-linux-musleabi; fi
-            build_openssl "/opt/toolchain/$toolchain/bin/$toolchain-gcc" "$ssl_target"
+            compiler="/opt/toolchain/$toolchain/bin/$toolchain-gcc"
+            sysroot=$("$compiler" --print-sysroot)
+            args=(--cc "$compiler" --target "$ssl_target" --prefix "$sysroot"
+                  --receipt "$GITHUB_WORKSPACE/release-evidence/openssl-$arch.json")
+            if [ "$TOOLCHAIN_CACHE_HIT" = true ]; then
+              # Version strings alone cannot qualify a restored archive.
+              python3 "$recipe" verify "${args[@]}"
+            else
+              python3 "$recipe" build --archive "$archive" --work /tmp/build-openssl "${args[@]}"
+              # Completed and joined build; reuse one fixed slot for the next target.
+              rm -rf /tmp/build-openssl
+            fi
+            test "$(realpath "$("$compiler" -print-file-name=libssl.a)")" = "$(realpath "$sysroot/lib/libssl.a")"
           done
 
       - name: Record immutable source and compiler inputs
@@ -346,7 +336,20 @@ jobs:
                   { echo "target=$rust_target"; echo 'profile=release-optmize-size'; echo "CC=$CC"; "$CC" --version; "$CC" -dumpmachine; "$CC" --print-sysroot; } > "$CURR_DIR/release-evidence/$1-toolchain.txt"
               fi
 
+              local ssl_prefix=""
+              unset EXTRA_CFLAGS EXTRA_LDFLAGS
+              if [ -n "${CC:-}" ]; then
+                  ssl_prefix=$(realpath "$("$CC" --print-sysroot)")
+                  test -s "$ssl_prefix/lib/libssl.a"
+                  test -s "$ssl_prefix/lib/libcrypto.a"
+                  export EXTRA_CFLAGS="-I$ssl_prefix/include"
+                  export EXTRA_LDFLAGS="-L$ssl_prefix/lib -Wl,-Map=$CURR_DIR/release-evidence/$1-core-link.map"
+              fi
               $CODE_DIR/package/build-pkg.sh  $BUILD_OPT || { echo "build-pkg.sh failed for $1 $2"; exit 1; }
+              if [ -n "$ssl_prefix" ]; then
+                  grep -F "$ssl_prefix/lib/libssl.a" "$CURR_DIR/release-evidence/$1-core-link.map"
+                  grep -F "$ssl_prefix/lib/libcrypto.a" "$CURR_DIR/release-evidence/$1-core-link.map"
+              fi
               if [ "${4:-}" = ui ]; then
                   local plugin="$CODE_DIR/plugin/smartdns-ui/target/smartdns_ui.so"
                   test -s "$plugin"

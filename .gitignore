@@ -1,4 +1,5 @@
 .vscode
+.ci-openssl/
 *.o
 *.a
 *.pem

@@ -16,6 +16,10 @@ extern "C" {
 #include <unistd.h>
 #include <vector>
 #include <cstring>
+#include <memory>
+#ifdef SMARTDNS_TEST_PINNED_QUIC
+#include "include/openssl-quic-probe.h"
+#endif
 namespace { thread_local bool block_quic_write; }
 extern "C" int __real__dns_client_socket_ssl_send_ext(dns_server_info *, SSL *, const void *, int, uint64_t);
 extern "C" int __wrap__dns_client_socket_ssl_send_ext(dns_server_info *server, SSL *ssl,
@@ -38,6 +42,7 @@ protected:
     bool mutex_ready = false;
     bool handshake_confirmed = false;
     int test_epoll = -1, saved_epoll = -1;
+    virtual void BeforeHandshake() {}
     void SetUp() override {
         pthread_mutexattr_t attr;
         pthread_mutexattr_init(&attr);
@@ -96,6 +101,8 @@ protected:
         ASSERT_EQ(SSL_set1_initial_peer_addr(client.ssl, address), 1);
         BIO_ADDR_free(address);
         client.type = DNS_SERVER_HTTP3;
+        BeforeHandshake();
+        if (HasFatalFailure()) return;
         auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         bool connected = false;
         while (std::chrono::steady_clock::now() < until) {
@@ -482,6 +489,72 @@ TEST_F(StrictPeer, RequestSettingsErrorReachesPeerAsApplicationConnectionClose) 
     EXPECT_EQ(info.flags & (SSL_CONN_CLOSE_FLAG_LOCAL | SSL_CONN_CLOSE_FLAG_TRANSPORT), 0u);
     client.process_depth = 0; client.close_deferred = 0;
 }
+
+#ifdef SMARTDNS_TEST_PINNED_QUIC
+class StrictPeerCredit : public StrictPeer {
+protected:
+    void BeforeHandshake() override {
+        ASSERT_EQ(test_openssl_quic_receive_window(client.ssl,64),1);
+    }
+};
+TEST_F(StrictPeerCredit, GcPublishesCreditWithoutFurtherApplicationIo) {
+    std::unique_ptr<SSL,decltype(&SSL_free)> request(SSL_new_stream(client.ssl,0),SSL_free);ASSERT_NE(request.get(),nullptr);
+    const uint64_t id=SSL_get_stream_id(request.get());
+    ASSERT_EQ(SSL_stream_conclude(request.get(),0),1);
+    SSL *response=nullptr;
+    auto until=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while(!response&&std::chrono::steady_clock::now()<until) {
+        ASSERT_GE(Pump(),0);
+        for(SSL *stream:incoming)if(SSL_get_stream_id(stream)==id)response=stream;
+        usleep(1000);
+    }
+    ASSERT_NE(response,nullptr);
+    unsigned char data[64]{};size_t wrote=0;
+    ASSERT_EQ(SSL_write_ex(response,data,sizeof(data),&wrote),1);ASSERT_EQ(wrote,sizeof(data));
+    ASSERT_EQ(SSL_stream_conclude(response,0),1);
+    openssl_quic_stream_snapshot before{}, peer_before{};
+    until=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    do {
+        ASSERT_GE(Pump(),0);
+        ASSERT_EQ(test_openssl_quic_snapshot(client.ssl,&before),1);
+        if(before.fully_received_requests==1&&before.fully_acked_requests==1)break;
+        usleep(1000);
+    }while(std::chrono::steady_clock::now()<until);
+    ASSERT_EQ(before.fully_received_requests,1U);ASSERT_EQ(before.fully_acked_requests,1U);
+    ASSERT_EQ(before.received_bytes,64U);ASSERT_EQ(before.retired_bytes,0U);
+    ASSERT_EQ(test_openssl_quic_snapshot(peer,&peer_before),1);
+    ASSERT_EQ(peer_before.transmitted_bytes,64U); // advertised connection credit is exhausted
+    unsigned max_data=0;
+    struct CallbackGuard {SSL *ssl;~CallbackGuard(){SSL_set_msg_callback(ssl,nullptr);SSL_set_msg_callback_arg(ssl,nullptr);}} guard{peer};
+    SSL_set_msg_callback(peer,[](int writing,int version,int type,const void *bytes,size_t size,SSL *,void *arg) {
+        if(!writing&&version==OSSL_QUIC1_VERSION&&type==SSL3_RT_QUIC_FRAME_FULL&&size&&
+            *static_cast<const unsigned char *>(bytes)==0x10)++*static_cast<unsigned *>(arg);
+    });
+    SSL_set_msg_callback_arg(peer,&max_data);
+    request.reset();
+    ASSERT_EQ(test_openssl_quic_single_tick(client.ssl),1);
+    // Only the peer runs now. No client API read/write/extra event tick may
+    // conceal the old TX-before-GC ordering or missing unread retirement.
+    until=std::chrono::steady_clock::now()+std::chrono::seconds(1);
+    while(!max_data&&std::chrono::steady_clock::now()<until) {
+        ASSERT_EQ(SSL_handle_events(peer),1);usleep(1000);
+    }
+    EXPECT_GT(max_data,0U)<<"GC must publish MAX_DATA in the same tick";
+    std::unique_ptr<SSL,decltype(&SSL_free)> next(SSL_new_stream(peer,SSL_STREAM_FLAG_UNI),SSL_free);ASSERT_NE(next.get(),nullptr);
+    size_t next_written=0;
+    ASSERT_EQ(SSL_write_ex(next.get(),data,1,&next_written),1);ASSERT_EQ(next_written,1U);
+    until=std::chrono::steady_clock::now()+std::chrono::seconds(1);
+    openssl_quic_stream_snapshot after{};
+    do {
+        ASSERT_EQ(SSL_handle_events(peer),1);
+        ASSERT_EQ(test_openssl_quic_snapshot(peer,&after),1);
+        if(after.transmitted_bytes>64)break;
+        usleep(1000);
+    }while(std::chrono::steady_clock::now()<until);
+    EXPECT_GT(after.transmitted_bytes,64U)<<"peer must resume actual transmission after returned credit";
+    next.reset();
+}
+#endif
 
 #else
 TEST(StrictPeer, RequiresOpenSSL35QuicServer) { GTEST_SKIP() << "OpenSSL 3.5 QUIC server support required"; }
