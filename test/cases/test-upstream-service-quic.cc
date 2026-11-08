@@ -202,8 +202,26 @@ public:
     std::atomic<bool> failed{false};
     std::function<void()> on_request;
     std::set<std::string> reset_names, hold_names; // frozen before worker starts
-    std::atomic<unsigned> retained_requests{0}, dropped_ack_datagrams{0}, closed_connections{0}, emitted_closes{0};
+    std::atomic<unsigned> dropped_ack_datagrams{0}, closed_connections{0}, emitted_closes{0};
     std::atomic<unsigned> ack_frames{0}, reset_requests{0}, held_requests{0};
+#ifdef SMARTDNS_TEST_PINNED_QUIC
+    bool FreshStreamSnapshot(openssl_quic_stream_snapshot &snapshot) {
+        uint64_t requested;
+        { std::lock_guard<std::mutex> lock(snapshot_mutex_); requested=++snapshot_requested_; }
+        auto until=std::chrono::steady_clock::now()+std::chrono::seconds(1);
+        do {
+            {
+                std::lock_guard<std::mutex> lock(snapshot_mutex_);
+                if(snapshot_completed_>=requested) {
+                    snapshot=stream_snapshot_;return snapshot_valid_;
+                }
+            }
+            if(!run_||failed)return false;
+            poll(nullptr,0,1);
+        }while(std::chrono::steady_clock::now()<until);
+        return false;
+    }
+#endif
     void DropNextAck() { drop_ack_requested_ = true; }
     void RequestClose() { close_requested_ = true; }
     bool Start(const char *ip, unsigned port, bool h3) {
@@ -375,18 +393,29 @@ private:
                 }
             }
 #ifdef SMARTDNS_TEST_PINNED_QUIC
-            unsigned retained=0;
-            for (auto &item : peers) {
-                openssl_quic_stream_snapshot snapshot{};
-                if (test_openssl_quic_snapshot(item.ssl,&snapshot)) retained += snapshot.deleted_requests;
+            // Sample only after observing the consumer's request, then publish
+            // the complete SDK-owner-thread snapshot. No stale zero atomic or
+            // second live read, and no additional SDK or I/O tick.
+            uint64_t requested;
+            { std::lock_guard<std::mutex> lock(snapshot_mutex_); requested=snapshot_requested_; }
+            openssl_quic_stream_snapshot snapshot{};
+            bool valid=peers.size()==1&&test_openssl_quic_snapshot(peers.front().ssl,&snapshot);
+            {
+                std::lock_guard<std::mutex> lock(snapshot_mutex_);
+                stream_snapshot_=snapshot;snapshot_valid_=valid;snapshot_completed_=requested;
             }
-            retained_requests=retained; // copied on the peer's own SDK thread
 #endif
             pollfd p{fd_, POLLIN, 0}; poll(&p, 1, 1);
         }
         for (auto &peer : peers) { for (auto &stream : peer.streams) SSL_free(stream.ssl); SSL_free(peer.ssl); }
         quic_wire_fault=QuicWireFault{};
     }
+#ifdef SMARTDNS_TEST_PINNED_QUIC
+    std::mutex snapshot_mutex_;
+    openssl_quic_stream_snapshot stream_snapshot_{};
+    uint64_t snapshot_requested_=0,snapshot_completed_=0;
+    bool snapshot_valid_=false;
+#endif
     bool h3_ = false; int fd_ = -1; SSL_CTX *ctx_ = nullptr; SSL *listener_ = nullptr;
     std::atomic<bool> run_{false}, close_requested_{false}, drop_ack_requested_{false}; std::thread worker_;
 };
@@ -443,14 +472,19 @@ void quic_error_ready_case(bool h3) {
 // cohort must disappear on this same connection. All retained current IDs must
 // be acknowledged, fully read, deleted and GC-ready, within the exact number
 // allocated by this cohort. Unfinished streams get no exemption.
-bool quic_batch_quiescent(const openssl_quic_stream_snapshot &s, uint64_t begin,
-                          uint64_t end) {
-    if (end <= begin || s.next_local_bidi_ordinal != end || s.requests > end-begin ||
+bool quic_cohort_retention_valid(const openssl_quic_stream_snapshot &s, uint64_t begin,
+                                 uint64_t end) {
+    if (end <= begin || s.requests > end-begin ||
         s.deleted_requests != s.requests || s.deleted_ready_requests != s.requests ||
         s.fully_acked_requests != s.requests || s.fully_read_requests != s.requests)
         return false;
     return s.requests == 0 ||
         (s.oldest_request_id >= (begin << 2) && s.newest_request_id < (end << 2));
+}
+
+bool quic_batch_quiescent(const openssl_quic_stream_snapshot &s, uint64_t begin,
+                          uint64_t end) {
+    return s.next_local_bidi_ordinal==end&&quic_cohort_retention_valid(s,begin,end);
 }
 
 void quic_reclamation_child_result() {
@@ -495,25 +529,38 @@ void quic_reclamation_case(bool h3) {
         infinite=1;timeout_valid=valid&&SSL_get_event_timeout(endpoint->ssl,&timeout,&infinite);
         pthread_mutex_unlock(&endpoint->lock);
     };
+    struct CohortObservation {
+        openssl_quic_stream_snapshot client{},peer{};
+        bool peer_valid=false;
+    };
     auto wait_quiescent=[&](uint64_t begin,uint64_t end,unsigned batch) {
         auto until=std::chrono::steady_clock::now()+std::chrono::seconds(6);
-        openssl_quic_stream_snapshot snapshot{};
+        CohortObservation observed;
+        auto &snapshot=observed.client;
         do {
             capture(snapshot);
-            if(valid&&quic_batch_quiescent(snapshot,begin,end)&&peer.retained_requests==0)break;
+            observed.peer_valid=peer.FreshStreamSnapshot(observed.peer);
+            if(valid&&quic_batch_quiescent(snapshot,begin,end)&&observed.peer_valid&&
+               quic_cohort_retention_valid(observed.peer,begin,end))break;
             poll(nullptr,0,10);
         }while(std::chrono::steady_clock::now()<until);
         fprintf(stderr,"QUIC retained h3=%d batch=%u requests=%zu deleted=%zu ready=%zu acked=%zu read=%zu"
-            " ids=%llu..%llu ordinals=%llu..%llu actual_next=%llu state=%u/%u control=%zu peer_deleted=%u"
+            " ids=%llu..%llu ordinals=%llu..%llu actual_next=%llu state=%u/%u control=%zu peer_deleted=%zu"
             " connections=%u acks=%u drops=%u timeout_valid=%d infinite=%d timeout_us=%lld\n",h3,batch,
             snapshot.requests,snapshot.deleted_requests,snapshot.deleted_ready_requests,
             snapshot.fully_acked_requests,snapshot.fully_read_requests,
             (unsigned long long)snapshot.oldest_request_id,(unsigned long long)snapshot.newest_request_id,
             (unsigned long long)begin,(unsigned long long)end,(unsigned long long)snapshot.next_local_bidi_ordinal,
             snapshot.oldest_request_send_state,snapshot.oldest_request_recv_state,snapshot.control,
-            peer.retained_requests.load(),peer.connections.load(),peer.ack_frames.load(),peer.dropped_ack_datagrams.load(),timeout_valid,infinite,
+            observed.peer.deleted_requests,peer.connections.load(),peer.ack_frames.load(),peer.dropped_ack_datagrams.load(),timeout_valid,infinite,
             infinite?-1LL:(long long)timeout.tv_sec*1000000+timeout.tv_usec);
-        return snapshot;
+        fprintf(stderr,"QUIC peer h3=%d batch=%u valid=%d requests=%zu deleted=%zu ready=%zu acked=%zu read=%zu"
+            " ids=%llu..%llu state=%u/%u\n",h3,batch,observed.peer_valid,observed.peer.requests,
+            observed.peer.deleted_requests,observed.peer.deleted_ready_requests,
+            observed.peer.fully_acked_requests,observed.peer.fully_read_requests,
+            (unsigned long long)observed.peer.oldest_request_id,(unsigned long long)observed.peer.newest_request_id,
+            observed.peer.oldest_request_send_state,observed.peer.oldest_request_recv_state);
+        return observed;
     };
     openssl_quic_stream_snapshot initial{};capture(initial);ASSERT_TRUE(same&&valid);
     auto wait_endpoint_ready=[&](const char *stage) {
@@ -552,9 +599,11 @@ void quic_reclamation_case(bool h3) {
             });
             for(auto &thread:clients)thread.join();ASSERT_EQ(successes,32U);
         }
-        auto snapshot=wait_quiescent(before,before+32,batch);
+        auto observed=wait_quiescent(before,before+32,batch);
+        auto &snapshot=observed.client;
         ASSERT_TRUE(same&&valid);EXPECT_TRUE(quic_batch_quiescent(snapshot,before,before+32));
-        EXPECT_EQ(peer.retained_requests,0U);EXPECT_EQ(peer.connections,1U);EXPECT_FALSE(peer.failed);
+        EXPECT_TRUE(observed.peer_valid&&quic_cohort_retention_valid(observed.peer,before,before+32))<<batch;
+        EXPECT_EQ(peer.connections,1U);EXPECT_FALSE(peer.failed);
         EXPECT_GE(peer.dropped_ack_datagrams,batch+1)<<"real ACK-bearing datagram loss must execute";
         before=snapshot.next_local_bidi_ordinal;
     }
@@ -569,9 +618,10 @@ void quic_reclamation_case(bool h3) {
     openssl_quic_stream_snapshot canceled{};capture(canceled);ASSERT_TRUE(same&&valid);
     before=canceled.next_local_bidi_ordinal;
     ASSERT_TRUE(query_udp("sibling.reclamation.example",listen));
-    auto snapshot=wait_quiescent(before,before+1,6);
-    ASSERT_TRUE(same&&valid);EXPECT_TRUE(quic_batch_quiescent(snapshot,before,before+1));
-    EXPECT_EQ(peer.retained_requests,0U);EXPECT_EQ(peer.connections,1U);EXPECT_FALSE(peer.failed);
+    auto observed=wait_quiescent(before,before+1,6);
+    ASSERT_TRUE(same&&valid);EXPECT_TRUE(quic_batch_quiescent(observed.client,before,before+1));
+    EXPECT_TRUE(observed.peer_valid&&quic_cohort_retention_valid(observed.peer,before,before+1));
+    EXPECT_EQ(peer.connections,1U);EXPECT_FALSE(peer.failed);
     // Connection shutdown/reconnect is a separate phase, never the reason that
     // the preceding six same-connection cohorts pass their retention checks.
     peer.RequestClose();auto until=std::chrono::steady_clock::now()+std::chrono::seconds(6);

@@ -91,7 +91,7 @@ jobs:
         SANITIZERS: ${{ inputs.release_validation && '1' || '0' }}
       run: python3 .github/scripts/check-native-results.py --profile "$PROFILE" --sanitizers "$SANITIZERS" ci-results/results.xml
     - name: Compare pinned upstream and candidate (network disabled)
-      if: ${{ !cancelled() && inputs.release_validation && matrix.profile == 'quic' }}
+      if: ${{ success() && inputs.release_validation && matrix.profile == 'quic' }}
       run: |
         set -o pipefail
         # No benchmark privileges needed; runner ownership keeps private-mode logs uploadable.

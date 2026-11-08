@@ -17,6 +17,12 @@ export CFLAGS='-O2 -g -fno-omit-frame-pointer'
 export NO_GIT_VER=1
 # Reuse the retired pristine slot for the unsanitized patched dependency. Both
 # application variants use these identical library bytes; never benchmark ASan.
+# The successful native control retires this slot. Never overwrite a retained
+# pristine SDK from a failed/incomplete validation or broaden its permissions.
+if [[ -e "$source_dir/.ci-openssl/secondary" ]]; then
+    echo 'Native validation must finish and retire its secondary slot before comparison' >&2
+    exit 1
+fi
 python3 .github/scripts/openssl-dependency.py build \
     --archive "$source_dir/.ci-openssl/openssl.tar.gz" \
     --work "$source_dir/.ci-openssl/secondary/build" \
