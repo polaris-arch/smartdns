@@ -530,12 +530,22 @@ TEST(HTTP2, CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit)
         while (std::chrono::steady_clock::now() < end);
         return ready();
     };
+    auto pending_query = [] {
+        bool pending = false;
+        pthread_mutex_lock(&::client.domain_map_lock);
+        dns_query_struct *query;
+        list_for_each_entry(query, &::client.dns_request_list, dns_request_list)
+            if (strcmp(query->domain, "cancelled.h2.test") == 0) pending = true;
+        pthread_mutex_unlock(&::client.domain_map_lock);
+        return pending;
+    };
     LimitedHTTP2DoHUpstream h2;
     ASSERT_TRUE(h2.Start(63054, 1, "192.0.2.19")) << h2.LastError();
     smartdns::MockServer alternate;
     ASSERT_TRUE(alternate.Start("udp://127.0.0.1:63055", [&](smartdns::ServerRequestContext *r) {
         if (r->domain != "cancelled.h2.test") return smartdns::SERVER_REQUEST_NO_RESPONSE;
         if (!wait([&] { return h2.HeaderCount() > 1; })) return smartdns::SERVER_REQUEST_NO_RESPONSE;
+        if (!wait(pending_query)) return smartdns::SERVER_REQUEST_NO_RESPONSE;
         smartdns::MockServer::AddIP(r, r->domain.c_str(), "192.0.2.20", 600);
         return smartdns::SERVER_REQUEST_OK;
     }));
@@ -561,15 +571,7 @@ dualstack-ip-selection no
     EXPECT_EQ(client.GetAnswer()[0].GetData(), "192.0.2.20");
     EXPECT_EQ(h2.BodyBytes(), previous_bytes);
     // A downstream answer precedes the ordinary upstream query-end callback.
-    ASSERT_TRUE(wait([&] {
-        bool pending = false;
-        pthread_mutex_lock(&::client.domain_map_lock);
-        dns_query_struct *query;
-        list_for_each_entry(query, &::client.dns_request_list, dns_request_list)
-            if (strcmp(query->domain, "cancelled.h2.test") == 0) pending = true;
-        pthread_mutex_unlock(&::client.domain_map_lock);
-        return !pending;
-    }));
+    ASSERT_TRUE(wait([&] { return !pending_query(); }));
     h2.ReleaseWindow();
     ASSERT_TRUE(wait([&] { return h2.WindowRestored(); }));
     EXPECT_TRUE(wait([&] { return h2.ResetCount() > previous_resets; }));

@@ -124,7 +124,7 @@
   {
     "name": "hpack-state",
     "branch": "fix/hpack-state",
-    "sha": "e1aedcd20861997d8c6c1e362cad53b4d1ac0d6d",
+    "sha": "4269980d7489a5d215a8f9af1c7fcff67447eee4",
     "title": "fix(http2): synchronize HPACK capacity changes and reject corrupted contexts",
     "items": [
       10,
@@ -144,7 +144,7 @@
     "pr": 2490,
     "previous_head": "a206a526c89d82d6561a53348a9b1bd06c8b1211",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "d13bba8c4ae749740209b719643feba66d85f44f",
+    "tree": "4385bbd1c34de16abe3054730ea68b1bf90043ed",
     "required_tests": [
       "HeaderCompression.DynamicInsertionFailureIsNotReportedAsSuccess",
       "HeaderCompression.EncoderSettingsShrinkAndGrowSynchronizeNextHeaderBlock",
@@ -273,7 +273,7 @@
   {
     "name": "http2-cancellation",
     "branch": "fix/http2-cancellation",
-    "sha": "8793a6f32d5c64b309b3e35a0c7b863d86c6c34f",
+    "sha": "be9f4130b90669d5518c1cb59b8d8444eb307851",
     "title": "fix(http2): cancel abandoned streams without flushing pending bodies",
     "items": [
       26
@@ -291,7 +291,7 @@
     "pr": 2493,
     "previous_head": "b57a2e45c3804629d11bdec3f8f510bf48c62e1c",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "1c71247afbe65c04cd79518caacabbcfe2aa9950",
+    "tree": "60648bc42499bc9976427290ca1a2e3484a88b29",
     "test_filter": "Http2Cancellation.*:Http2Scheduling.*:HTTP2.CancelledZeroWindow*:HTTP2.ConnectedDohRequests*",
     "required_tests": [
       "HTTP2.CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit",

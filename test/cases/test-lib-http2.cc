@@ -2169,6 +2169,7 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
 
 		EXPECT_LT(loop_count, 100) << "Server loop did not terminate (infinite loop detected)";
 
+		http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
 
