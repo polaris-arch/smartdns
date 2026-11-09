@@ -497,15 +497,13 @@ static int _dns_client_http2_pending_data(struct dns_conn_stream *stream, struct
 	event.data.ptr = server_info;
 	if (epoll_ctl(client.epoll_fd, EPOLL_CTL_MOD, server_info->fd, &event) != 0) {
 		tlog(TLOG_ERROR, "epoll ctl failed, %s", strerror(errno));
-		pthread_mutex_unlock(&server_info->lock);
 		goto errout_put;
 	}
 	pthread_mutex_unlock(&server_info->lock);
 
 	return 0;
 errout_put:
-	/* Clean up stream on error */
-	pthread_mutex_lock(&server_info->lock);
+	/* Withdraw both published references before a worker can select this stream. */
 	if (!list_empty(&stream->server_list)) {
 		list_del_init(&stream->server_list);
 		stream->server_info = NULL;

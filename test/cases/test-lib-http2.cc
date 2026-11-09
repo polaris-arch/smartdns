@@ -1,4 +1,5 @@
 #include "gtest/gtest.h"
+#include "include/utils.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -716,6 +717,10 @@ TEST_F(LIBHTTP2, Integrated)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
 					stream = http2_ctx_accept_stream(ctx);
@@ -797,6 +802,10 @@ TEST_F(LIBHTTP2, Integrated)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			if (http2_stream_get_status(stream) > 0)
 				break;
 
@@ -1796,6 +1805,10 @@ TEST_F(LIBHTTP2, MultiStream)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
@@ -1879,6 +1892,10 @@ TEST_F(LIBHTTP2, MultiStream)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream && items[i].readable) {
@@ -1943,6 +1960,10 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
 					stream = http2_ctx_accept_stream(ctx);
@@ -2028,6 +2049,10 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			if (http2_stream_get_status(stream) > 0)
 				break;
 
@@ -2093,6 +2118,10 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
 					stream = http2_ctx_accept_stream(ctx);
@@ -2206,6 +2235,10 @@ TEST_F(LIBHTTP2, StreamClose)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
 					stream = http2_ctx_accept_stream(ctx);
@@ -2262,6 +2295,10 @@ TEST_F(LIBHTTP2, StreamClose)
 			struct http2_poll_item items[10];
 			int count = 0;
 			http2_ctx_poll(ctx, items, 10, &count);
+            Defer {
+                for (int item = 0; item < count; item++)
+                    if (items[item].stream) http2_stream_put(items[item].stream);
+            };
 			if (http2_stream_get_status(stream) > 0)
 				break;
 			usleep(20000);

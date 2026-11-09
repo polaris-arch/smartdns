@@ -124,7 +124,7 @@
   {
     "name": "hpack-state",
     "branch": "fix/hpack-state",
-    "sha": "98ac249a3126454f8d0a13773c97e1a08f56c24d",
+    "sha": "e1aedcd20861997d8c6c1e362cad53b4d1ac0d6d",
     "title": "fix(http2): synchronize HPACK capacity changes and reject corrupted contexts",
     "items": [
       10,
@@ -144,7 +144,7 @@
     "pr": 2490,
     "previous_head": "a206a526c89d82d6561a53348a9b1bd06c8b1211",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "4c1ae60d1292fc695c498bab669f05b0dd32a21d",
+    "tree": "d13bba8c4ae749740209b719643feba66d85f44f",
     "required_tests": [
       "HeaderCompression.DynamicInsertionFailureIsNotReportedAsSuccess",
       "HeaderCompression.EncoderSettingsShrinkAndGrowSynchronizeNextHeaderBlock",
@@ -273,7 +273,7 @@
   {
     "name": "http2-cancellation",
     "branch": "fix/http2-cancellation",
-    "sha": "2b5c8805332829fc06e41b86e33958e53252a921",
+    "sha": "8793a6f32d5c64b309b3e35a0c7b863d86c6c34f",
     "title": "fix(http2): cancel abandoned streams without flushing pending bodies",
     "items": [
       26
@@ -291,7 +291,7 @@
     "pr": 2493,
     "previous_head": "b57a2e45c3804629d11bdec3f8f510bf48c62e1c",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "22da891e464e61759b73fbce2ab2782a51f594fa",
+    "tree": "1c71247afbe65c04cd79518caacabbcfe2aa9950",
     "test_filter": "Http2Cancellation.*:Http2Scheduling.*:HTTP2.CancelledZeroWindow*:HTTP2.ConnectedDohRequests*",
     "required_tests": [
       "HTTP2.CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit",
@@ -305,6 +305,7 @@
       "Http2Cancellation.ReceivedResetDoesNotGenerateAnotherReset",
       "Http2Cancellation.ResetIsDistinctFromFinishedBodyAndSurvivesContextTeardown",
       "Http2Scheduling.ConcurrentEnqueueCannotLoseWriteInterest",
+      "Http2Scheduling.FailedInterestUpdateWithdrawsBothOwners",
       "Http2Scheduling.PeerCapacityWaitDoesNotSpinOnWritableSocket"
     ],
     "required_failures": [
@@ -317,7 +318,7 @@
   {
     "name": "quic-http3-lifecycle",
     "branch": "fix/quic-http3-lifecycle",
-    "sha": "170f2decc4669117382be789b6cb7a642cac5c31",
+    "sha": "8a60506f57347dfdf89d3fb60be8dea6045c48e2",
     "title": "fix(quic): drive SDK readiness and handle HTTP/3 control streams",
     "items": [
       27,
@@ -342,7 +343,7 @@
     "pr": 2494,
     "previous_head": "af6f2a6dcf725cd40157e37a08c535cc9e3cdaf5",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "cfd8eba6cc2bb2b54151696eba56ab77e9eb5984",
+    "tree": "e510557cdd979d580e2c3df6875f1584b66b4b9b",
     "test_filter": "Http3Control.*:Http3RequestFraming.*:QuicLifecycle.*:QuicEndToEnd.*",
     "required_tests": [
       "Http3Control.DecoderCancellationUsesOnlyQuicStreamIdentifiers",

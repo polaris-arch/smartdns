@@ -72,8 +72,10 @@ import sys
 p=Path(sys.argv[1]);assert 'test result: ok. 5 passed; 0 failed; 0 ignored' in (p/'candidate.log').read_text()
 text=(p/'baseline.log').read_text()
 assert 'test result: FAILED' in text
-assert 'test data_stats::regression_tests::request_drop_accumulates_and_saturates ... FAILED' in text
-assert 'test data_stats::regression_tests::retention_uses_absolute_cutoffs_and_inclusive_boundary ... FAILED' in text
+failures=text.rsplit('\nfailures:\n',1)[1].split('\n\ntest result:',1)[0].splitlines()
+failures={line.strip() for line in failures}
+assert 'data_stats::regression_tests::request_drop_accumulates_and_saturates' in failures
+assert 'data_stats::regression_tests::retention_uses_absolute_cutoffs_and_inclusive_boundary' in failures
 PY
     cp "$proof/data_stats.rs" plugin/smartdns-ui/src/data_stats.rs
     sha256sum plugin/smartdns-ui/Cargo.lock > "$proof/lock.sha256"

@@ -203,6 +203,7 @@ class LimitedHTTP2DoHUpstream
 	int ResetCount() const { return reset_count_.load(); }
 	int BodyBytes() const { return body_bytes_.load(); }
 	void PauseWindow() { pause_window_ = true; }
+	bool InitialSettingsAcknowledged() const { return settings_acks_ > 0; }
 	bool WindowPaused() const { return zero_window_sent_ && settings_acks_ > pause_ack_base_; }
 	void ReleaseWindow() { release_window_ = true; }
 	bool WindowRestored() const { return window_restored_.load(); }
@@ -449,6 +450,8 @@ class LimitedHTTP2DoHUpstream
 				}
 				++it;
 			}
+			for (int i = 0; i < count; i++)
+				if (items[i].stream) http2_stream_put(items[i].stream);
 		}
 
 		for (auto stream : streams) {
@@ -536,7 +539,7 @@ TEST(HTTP2, CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit)
         smartdns::MockServer::AddIP(r, r->domain.c_str(), "192.0.2.20", 600);
         return smartdns::SERVER_REQUEST_OK;
     }));
-    smartdns::Server server;
+    smartdns::Server server(smartdns::Server::CREATE_MODE_THREAD);
     ASSERT_TRUE(server.Start(R"(bind 127.0.0.1:60053
 server https://127.0.0.1:63054/dns-query -no-check-certificate -alpn h2
 server 127.0.0.1:63055
@@ -547,18 +550,30 @@ dualstack-ip-selection no
     smartdns::Client client;
     ASSERT_TRUE(client.Query("warmup.h2.test +time=4 +tries=1", 60053));
     ASSERT_EQ(client.GetStatus(), "NOERROR");
+    ASSERT_TRUE(wait([&] { return h2.InitialSettingsAcknowledged(); }));
     h2.PauseWindow();
     ASSERT_TRUE(wait([&] { return h2.WindowPaused(); }));
     int previous_bytes = h2.BodyBytes();
+    int previous_resets = h2.ResetCount();
     ASSERT_TRUE(client.Query("cancelled.h2.test +time=4 +tries=1", 60053));
     EXPECT_EQ(client.GetStatus(), "NOERROR");
     ASSERT_EQ(client.GetAnswerNum(), 1);
     EXPECT_EQ(client.GetAnswer()[0].GetData(), "192.0.2.20");
     EXPECT_EQ(h2.BodyBytes(), previous_bytes);
-    // The ordinary query retry/end path must retire the unfinished H2 request.
+    // A downstream answer precedes the ordinary upstream query-end callback.
+    ASSERT_TRUE(wait([&] {
+        bool pending = false;
+        pthread_mutex_lock(&::client.domain_map_lock);
+        dns_query_struct *query;
+        list_for_each_entry(query, &::client.dns_request_list, dns_request_list)
+            if (strcmp(query->domain, "cancelled.h2.test") == 0) pending = true;
+        pthread_mutex_unlock(&::client.domain_map_lock);
+        return !pending;
+    }));
     h2.ReleaseWindow();
     ASSERT_TRUE(wait([&] { return h2.WindowRestored(); }));
-    EXPECT_TRUE(wait([&] { return h2.ResetCount() == 1; }));
+    EXPECT_TRUE(wait([&] { return h2.ResetCount() > previous_resets; }));
+    EXPECT_EQ(h2.ResetCount(), previous_resets + 1);
     EXPECT_FALSE(wait([&] { return h2.BodyBytes() != previous_bytes; }, 500));
     ASSERT_TRUE(client.Query("replacement.h2.test +time=4 +tries=1", 60053));
     EXPECT_EQ(client.GetStatus(), "NOERROR");

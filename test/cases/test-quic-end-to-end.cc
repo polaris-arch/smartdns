@@ -68,9 +68,9 @@ public:
         if (!listener || SSL_set_fd(listener, fd) != 1 || SSL_set_blocking_mode(listener, 0) != 1 ||
             SSL_listen(listener) != 1) return false;
         run = true;
-        worker = std::thread([this] { Run(); });
         return true;
     }
+    void StartWorker() { worker = std::thread([this] { Run(); }); }
     std::string Configuration() const {
         return "bind 127.0.0.1:60053\ncache-size 0\nspeed-check-mode none\ndualstack-ip-selection no\n" +
             std::string(h3 ? "server-http3 https://127.0.0.1:" : "server-quic quic://127.0.0.1:") +
@@ -200,6 +200,7 @@ TEST(QuicEndToEnd, HttpsHttp3QueryRequiresClientSettingsAndReusesTheConnection)
     ASSERT_TRUE(upstream.Start(true));
     smartdns::Server server;
     ASSERT_TRUE(server.Start(upstream.Configuration()));
+    upstream.StartWorker(); // Fork the resolver before the peer runs OpenSSL calls.
     for (const char *name : {"first.h3.test", "second.h3.test"}) {
         smartdns::Client client;
         ASSERT_TRUE(client.Query(std::string(name) + " +time=3 +tries=1", 60053));
@@ -217,6 +218,7 @@ TEST(QuicEndToEnd, ValidDoqAnswerIsNotDeliveredUntilFin)
     ASSERT_TRUE(upstream.Start(false, true));
     smartdns::Server server;
     ASSERT_TRUE(server.Start(upstream.Configuration()));
+    upstream.StartWorker();
     smartdns::Client client;
     std::atomic<bool> done{false}; bool queried = false;
     std::thread query([&] { queried = client.Query("fin.doq.test +time=3 +tries=1", 60053); done = true; });

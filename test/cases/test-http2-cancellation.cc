@@ -250,3 +250,12 @@ TEST_F(Http2Scheduling, PeerCapacityWaitDoesNotSpinOnWritableSocket)
     ASSERT_EQ(dns_client_http2_test_process_write(&endpoint), 0);
     EXPECT_EQ(Frames(1), 2U);
 }
+TEST_F(Http2Scheduling, FailedInterestUpdateWithdrawsBothOwners)
+{
+    ASSERT_EQ(epoll_ctl(client.epoll_fd, EPOLL_CTL_DEL, endpoint.fd, nullptr), 0);
+    unsigned char bytes[] = {1, 2, 3};
+    EXPECT_EQ(_dns_client_send_http2(&endpoint, &query, bytes, sizeof(bytes)), -1);
+    EXPECT_TRUE(list_empty(&endpoint.conn_stream_list));
+    EXPECT_TRUE(list_empty(&query.conn_stream_list));
+    EXPECT_EQ(Frames(1), 0U);
+}
