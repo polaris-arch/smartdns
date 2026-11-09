@@ -48,7 +48,7 @@ PY
 )"
 if [[ $PR == 2486 && ( -n ${CARGO_BUILD_TARGET:-} || ${UI_COMBINED:-0} == 1 ) ]]; then
     CANDIDATE=$(git rev-parse HEAD)
-    printf '%s\n' 'combined-UI: UI statistics plus cache native-time ABI compatibility; isolated UI-statistics evidence remains bound to its unchanged topic SHA' > "$proof/source-scope.txt"
+    printf '%s\n' 'combined-UI: statistics plus cache native-time ABI compatibility; isolated statistics proof is separately bound to its manifest topic SHA' > "$proof/source-scope.txt"
     cp "$manifest" "$proof/component-candidates.json"
 fi
 root=/tmp/closure-candidate
@@ -70,7 +70,7 @@ if [[ $PR == 2486 ]]; then
 import sys
 text=open(sys.argv[1]).read()
 assert 'test smartdns::tests::cache_callback_preserves_native_timestamp_width ... ok' in text
-assert 'test result: ok. 7 passed; 0 failed; 0 ignored' in text
+assert 'test result: ok. 6 passed; 0 failed; 0 ignored' in text
 PY
     fi
     python3 "$driver" inverse-ui plugin/smartdns-ui/src/data_stats.rs
@@ -82,13 +82,17 @@ PY
     python3 - "$proof" <<'PY'
 from pathlib import Path
 import sys
-p=Path(sys.argv[1]);assert 'test result: ok. 5 passed; 0 failed; 0 ignored' in (p/'candidate.log').read_text()
+p=Path(sys.argv[1]);assert 'test result: ok. 4 passed; 0 failed; 0 ignored' in (p/'candidate.log').read_text()
 text=(p/'baseline.log').read_text()
 assert 'test result: FAILED' in text
 failures=text.rsplit('\nfailures:\n',1)[1].split('\n\ntest result:',1)[0].splitlines()
 failures={line.strip() for line in failures}
-assert 'data_stats::regression_tests::request_drop_accumulates_and_saturates' in failures
-assert 'data_stats::regression_tests::retention_uses_absolute_cutoffs_and_inclusive_boundary' in failures
+assert failures == {'data_stats::regression_tests::'+name for name in [
+    'request_drop_accumulates_and_saturates',
+    'request_drop_parallel_updates_are_not_lost',
+    'request_drop_parallel_saturation_does_not_wrap',
+    'request_drop_persistent_initialization_accumulates_without_reset',
+]}
 PY
     cp "$proof/data_stats.rs" plugin/smartdns-ui/src/data_stats.rs
     sha256sum plugin/smartdns-ui/Cargo.lock > "$proof/lock.sha256"

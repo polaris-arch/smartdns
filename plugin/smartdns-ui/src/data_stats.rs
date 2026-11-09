@@ -61,8 +61,6 @@ fn add_locked_drop_count(counter: &Mutex<u64>, count: u64) {
     *value = value.saturating_add(count);
 }
 
-const DAY_MS: u64 = 24 * 3600 * 1000;
-
 impl DataStatsItem {
     pub fn new() -> Self {
         #[cfg(target_has_atomic = "64")]
@@ -429,15 +427,11 @@ impl DataStats {
     }
 
     pub fn refresh(self: &Arc<Self>) {
-        self.refresh_at(get_utc_time_ms());
-    }
+        let now = get_utc_time_ms();
 
-    // Capture wall clock once for every retention/aggregation cutoff. Saturating
-    // subtraction handles clocks before the retention window without wrapping.
-    fn refresh_at(self: &Arc<Self>, now: u64) {
         let ret = self
             .db
-            .delete_domain_before_timestamp(now.saturating_sub(self.conf.read().unwrap().max_log_age_ms));
+            .delete_domain_before_timestamp(now - self.conf.read().unwrap().max_log_age_ms as u64);
         if let Err(e) = ret {
             if e.to_string() != "Query returned no rows" {
               dns_log!(
@@ -448,21 +442,21 @@ impl DataStats {
             }
         }
 
-        let ret = self.db.refresh_client_top_list(now.saturating_sub(7 * DAY_MS));
+        let ret = self.db.refresh_client_top_list(now - 7 * 24 * 3600 * 1000);
         if let Err(e) = ret {
             dns_log!(LogLevel::WARN, "refresh client top list error: {}", e);
         }
 
-        let ret = self.db.refresh_domain_top_list(now.saturating_sub(7 * DAY_MS));
+        let ret = self.db.refresh_domain_top_list(now - 7 * 24 * 3600 * 1000);
         if let Err(e) = ret {
             dns_log!(LogLevel::WARN, "refresh domain top list error: {}", e);
         }
         let _ = self
             .db
-            .delete_hourly_query_count_before_timestamp(now.saturating_sub(30 * DAY_MS));
+            .delete_hourly_query_count_before_timestamp(30 * 24 * 3600 * 1000);
         let _ = self
             .db
-            .delete_daily_query_count_before_timestamp(now.saturating_sub(90 * DAY_MS));
+            .delete_daily_query_count_before_timestamp(90 * 24 * 3600 * 1000);
     }
 
     async fn update_stats(self: &Arc<Self>) {
@@ -618,7 +612,7 @@ mod regression_tests {
         let conf = Arc::new(RwLock::new(DataServerConfig {
             data_path: dir.path().to_str().unwrap().to_owned(),
             db_file: path.to_str().unwrap().to_owned(),
-            max_log_age_ms: 30 * DAY_MS,
+            max_log_age_ms: 30 * 24 * 3600 * 1000,
         }));
         let stats = DataStats::new(db.clone(), conf.clone());
         assert_eq!(stats.get_request_drop(), 0);
@@ -634,40 +628,5 @@ mod regression_tests {
         restarted.add_request_drop(2);
         restarted.save_status_data().unwrap();
         assert_eq!(db.get_status_data_list().unwrap()["request_drop"], u64::MAX.to_string());
-    }
-
-    #[test]
-    fn retention_uses_absolute_cutoffs_and_inclusive_boundary() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("retention.db");
-        let db = Arc::new(DB::new());
-        db.open(path.to_str().unwrap()).unwrap();
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        let now = 100 * DAY_MS;
-        let hourly = now - 30 * DAY_MS;
-        let daily = now - 90 * DAY_MS;
-        for (table, cutoff) in [("domain_hourly_count", hourly), ("domain_daily_count", daily)] {
-            for timestamp in [cutoff - 1, cutoff, cutoff + 1] {
-                conn.execute(&format!("INSERT INTO {table}(timestamp, count) VALUES (?, 1)"), [timestamp]).unwrap();
-            }
-        }
-        let conf = Arc::new(RwLock::new(DataServerConfig {
-            data_path: dir.path().to_str().unwrap().to_owned(),
-            db_file: path.to_str().unwrap().to_owned(),
-            max_log_age_ms: 30 * DAY_MS,
-        }));
-        let stats = DataStats::new(db, conf);
-        stats.refresh_at(now);
-        for (table, expected) in [("domain_hourly_count", hourly + 1), ("domain_daily_count", daily + 1)] {
-            let rows: (u64, u64) = conn.query_row(
-                &format!("SELECT COUNT(*), MIN(timestamp) FROM {table}"), [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ).unwrap();
-            assert_eq!(rows, (1, expected));
-        }
-        // A wall clock rollback must not wrap to a huge cutoff and erase data.
-        stats.refresh_at(DAY_MS);
-        let count: u64 = conn.query_row("SELECT COUNT(*) FROM domain_hourly_count", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 1);
     }
 }

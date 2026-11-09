@@ -90,9 +90,6 @@ def ui_inverse(path):
     text = text[:start] + '            self.request_dropped.fetch_and(count, Ordering::Relaxed);' + text[end:]
     assert text.count('*value = value.saturating_add(count);') == 1
     text = text.replace('*value = value.saturating_add(count);', '*value += count;')
-    for days in (30, 90):
-        assert text.count(f'now.saturating_sub({days} * DAY_MS)') == 1
-        text = text.replace(f'now.saturating_sub({days} * DAY_MS)', f'{days} * DAY_MS')
     path.write_text(text)
 
 

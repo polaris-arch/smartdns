@@ -2,11 +2,10 @@
   {
     "name": "ui-statistics",
     "branch": "fix/ui-statistics",
-    "sha": "8990006bad5becbf9e8042393523513950e39c02",
-    "title": "fix(ui): accumulate dropped requests and expire historical statistics",
+    "sha": "872f3bab17c7c4b4a0c36e355bda06b87f86bdc1",
+    "title": "fix(ui): accumulate dropped requests without counter wrap",
     "items": [
-      1,
-      2
+      1
     ],
     "test_filter": "data_stats::regression_tests",
     "paths": [
@@ -15,7 +14,7 @@
     "pr": 2486,
     "previous_head": "d72ab946acdaaf84cba96d5296a77334bdfc1f35",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "3d900f23138cd3155f1eb61cc68b955028fcaa62",
+    "tree": "a229bc06cac7ca16e6204e27386e4c8347fed6d9",
     "required_tests": [],
     "required_failures": [],
     "negative_filter": "data_stats::regression_tests"

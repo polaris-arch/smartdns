@@ -1,0 +1,46 @@
+name: UI statistics scope qualification
+on:
+  push:
+    branches: [verify/ui-statistics-clock-scope]
+permissions:
+  contents: read
+jobs:
+  ui:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [isolated64, combined64, combined32]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.mode == 'combined32' && 'i686-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}
+      - name: Qualify counters and inverse control
+        env:
+          MODE: ${{ matrix.mode }}
+          PR: 2486
+          PROOF: ${{ runner.temp }}/evidence
+        run: |
+          sudo apt-get update -qq
+          if [[ $MODE == combined32 ]]; then
+            sudo dpkg --add-architecture i386
+            sudo apt-get update -qq
+            sudo apt-get install -y g++-multilib libclang-dev libssl-dev:amd64 libssl-dev:i386 libgtest-dev:i386 zlib1g-dev:i386 dnsutils
+            export CC='gcc -m32' CXX='g++ -m32' CFLAGS='-O2 -m32' CARGO_BUILD_TARGET=i686-unknown-linux-gnu BINDGEN_EXTRA_CLANG_ARGS='--target=i686-linux-gnu'
+            export I686_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR=/usr/lib/i386-linux-gnu I686_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR=/usr/include
+          else
+            sudo apt-get install -y libclang-dev libssl-dev libgtest-dev dnsutils zlib1g-dev
+          fi
+          if [[ $MODE == combined64 ]]; then export UI_COMBINED=1; fi
+          bash .github/verification/closure.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-${{ matrix.mode }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
