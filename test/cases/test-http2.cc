@@ -123,7 +123,7 @@ class LimitedHTTP2DoHUpstream
   public:
 	~LimitedHTTP2DoHUpstream() { Stop(); }
 
-	bool Start(int port, int max_concurrent_streams, const char *response_ip, bool zero_window = false)
+	bool Start(int port, int max_concurrent_streams, const char *response_ip)
 	{
 		if (!EnsureHTTP2TestCert()) {
 			last_error_ = "generate HTTP/2 test cert failed";
@@ -131,7 +131,6 @@ class LimitedHTTP2DoHUpstream
 		}
 
 		response_ip_ = response_ip;
-		zero_window_ = zero_window;
 		max_concurrent_streams_ = max_concurrent_streams;
 
 		ssl_ctx_ = SSL_CTX_new(TLS_server_method());
@@ -203,6 +202,8 @@ class LimitedHTTP2DoHUpstream
 	int HeaderCount() const { return header_count_.load(); }
 	int ResetCount() const { return reset_count_.load(); }
 	int BodyBytes() const { return body_bytes_.load(); }
+	void PauseWindow() { pause_window_ = true; }
+	bool WindowPaused() const { return zero_window_sent_ && settings_acks_ > pause_ack_base_; }
 	void ReleaseWindow() { release_window_ = true; }
 	bool WindowRestored() const { return window_restored_.load(); }
 	const std::string &LastError() const { return last_error_; }
@@ -211,7 +212,7 @@ class LimitedHTTP2DoHUpstream
 	struct Connection {
 		SSL *ssl = nullptr;
 		LimitedHTTP2DoHUpstream *owner = nullptr;
-		bool settings_rewritten = false, preface_read = false;
+		bool preface_read = false;
 		std::vector<uint8_t> trace;
 	};
 
@@ -240,7 +241,7 @@ class LimitedHTTP2DoHUpstream
 		Connection *conn = (Connection *)private_data;
 		int ret = SSL_read(conn->ssl, buf, len);
 		if (ret > 0) {
-			if (conn->owner->zero_window_) {
+			{
 				auto &wire = conn->trace;
 				wire.insert(wire.end(), buf, buf + ret);
 				if (!conn->preface_read && wire.size() >= 24) {
@@ -251,6 +252,7 @@ class LimitedHTTP2DoHUpstream
 					size_t n = (wire[0] << 16) | (wire[1] << 8) | wire[2];
 					if (wire.size() < n + 9) break;
 					if (wire[3] == 3) conn->owner->reset_count_++;
+					if (wire[3] == 4 && (wire[4] & 1)) conn->owner->settings_acks_++;
 					if (wire[3] == 0) conn->owner->body_bytes_ += n;
 					wire.erase(wire.begin(), wire.begin() + n + 9);
 				}
@@ -269,18 +271,8 @@ class LimitedHTTP2DoHUpstream
 	static int BioWrite(void *private_data, const uint8_t *buf, int len)
 	{
 		Connection *conn = (Connection *)private_data;
-		std::vector<uint8_t> changed;
-		bool rewrite = false;
-		if (conn->owner->zero_window_ && !conn->settings_rewritten && len >= 9 && buf[3] == 4 && !(buf[4] & 1)) {
-			changed.assign(buf, buf + len);
-			for (int p = 9; p + 6 <= len; p += 6) if (buf[p] == 0 && buf[p + 1] == 4) {
-				std::fill(changed.begin() + p + 2, changed.begin() + p + 6, 0);
-				rewrite = true;
-			}
-		}
-		int ret = SSL_write(conn->ssl, rewrite ? changed.data() : buf, len);
+		int ret = SSL_write(conn->ssl, buf, len);
 		if (ret > 0) {
-			if (rewrite) conn->settings_rewritten = true;
 			return ret;
 		}
 
@@ -411,7 +403,12 @@ class LimitedHTTP2DoHUpstream
 		std::set<struct http2_stream *> streams;
 		std::map<struct http2_stream *, std::vector<uint8_t>> bodies;
 		while (run_) {
-			if (zero_window_ && release_window_ && !window_restored_) {
+			if (pause_window_ && !zero_window_sent_) {
+				static const uint8_t pause[] = {0,0,6,4,0,0,0,0,0, 0,4,0,0,0,0};
+				pause_ack_base_ = settings_acks_.load();
+				if (SSL_write(conn.ssl, pause, sizeof(pause)) == sizeof(pause)) zero_window_sent_ = true;
+			}
+			if (release_window_ && !window_restored_) {
 				static const uint8_t restore[] = {0,0,6,4,0,0,0,0,0, 0,4,0,0,255,255};
 				if (SSL_write(conn.ssl, restore, sizeof(restore)) == sizeof(restore)) window_restored_ = true;
 			}
@@ -489,7 +486,8 @@ class LimitedHTTP2DoHUpstream
 	std::atomic<int> request_count_{0};
 	std::atomic<int> header_count_{0}, reset_count_{0}, body_bytes_{0};
 	std::atomic<bool> release_window_{false}, window_restored_{false};
-	bool zero_window_ = false;
+	std::atomic<bool> pause_window_{false}, zero_window_sent_{false};
+	std::atomic<int> settings_acks_{0}, pause_ack_base_{0};
 	int max_concurrent_streams_ = 1;
 	std::string response_ip_ = "1.2.3.4";
 	std::string last_error_;
@@ -530,11 +528,11 @@ TEST(HTTP2, CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit)
         return ready();
     };
     LimitedHTTP2DoHUpstream h2;
-    ASSERT_TRUE(h2.Start(63054, 1, "192.0.2.19", true)) << h2.LastError();
+    ASSERT_TRUE(h2.Start(63054, 1, "192.0.2.19")) << h2.LastError();
     smartdns::MockServer alternate;
     ASSERT_TRUE(alternate.Start("udp://127.0.0.1:63055", [&](smartdns::ServerRequestContext *r) {
         if (r->domain != "cancelled.h2.test") return smartdns::SERVER_REQUEST_NO_RESPONSE;
-        if (!wait([&] { return h2.HeaderCount() > 0; })) return smartdns::SERVER_REQUEST_NO_RESPONSE;
+        if (!wait([&] { return h2.HeaderCount() > 1; })) return smartdns::SERVER_REQUEST_NO_RESPONSE;
         smartdns::MockServer::AddIP(r, r->domain.c_str(), "192.0.2.20", 600);
         return smartdns::SERVER_REQUEST_OK;
     }));
@@ -547,21 +545,26 @@ speed-check-mode none
 dualstack-ip-selection no
 )"));
     smartdns::Client client;
+    ASSERT_TRUE(client.Query("warmup.h2.test +time=4 +tries=1", 60053));
+    ASSERT_EQ(client.GetStatus(), "NOERROR");
+    h2.PauseWindow();
+    ASSERT_TRUE(wait([&] { return h2.WindowPaused(); }));
+    int previous_bytes = h2.BodyBytes();
     ASSERT_TRUE(client.Query("cancelled.h2.test +time=4 +tries=1", 60053));
     EXPECT_EQ(client.GetStatus(), "NOERROR");
     ASSERT_EQ(client.GetAnswerNum(), 1);
     EXPECT_EQ(client.GetAnswer()[0].GetData(), "192.0.2.20");
-    EXPECT_EQ(h2.BodyBytes(), 0);
+    EXPECT_EQ(h2.BodyBytes(), previous_bytes);
     // The ordinary query retry/end path must retire the unfinished H2 request.
     h2.ReleaseWindow();
     ASSERT_TRUE(wait([&] { return h2.WindowRestored(); }));
     EXPECT_TRUE(wait([&] { return h2.ResetCount() == 1; }));
-    EXPECT_FALSE(wait([&] { return h2.BodyBytes() != 0; }, 500));
+    EXPECT_FALSE(wait([&] { return h2.BodyBytes() != previous_bytes; }, 500));
     ASSERT_TRUE(client.Query("replacement.h2.test +time=4 +tries=1", 60053));
     EXPECT_EQ(client.GetStatus(), "NOERROR");
     ASSERT_EQ(client.GetAnswerNum(), 1);
     EXPECT_EQ(client.GetAnswer()[0].GetData(), "192.0.2.19");
-    EXPECT_EQ(h2.RequestCount(), 1);
+    EXPECT_EQ(h2.RequestCount(), 2);
 }
 
 class HTTP2DoHClient

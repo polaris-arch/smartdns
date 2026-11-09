@@ -21,7 +21,7 @@ if [[ ${PROFILE:-} == integration || ${PROFILE:-} == sanitizers || ${PROFILE:-} 
         make -C test -j4 > "$proof/build.log" 2>&1
     fi
     filter='*'
-    if [[ $PROFILE != integration ]]; then filter='LibConf.*:CacheCheckpoint.*:Ping.*:ThreadStartup.*:HeaderCompression.*:LIBHTTP2.*:Http2Cancellation.*:HTTP2.CancelledZeroWindow*:HTTP2.ConnectedDohRequests*:Http3Control.*:Http3RequestFraming.*:QuicLifecycle.*:QuicEndToEnd.*:Cache.InvalidPersisted*:Cache.BrokenRecordFraming*:Cache.ValidLargeTtl*:Cache.FuturePersisted*:Cache.ValidPersistedCounterBounds*:Cache.PersistedExpiry*:Cache.TtlConsumers*'; fi
+    if [[ $PROFILE != integration ]]; then filter='LibConf.*:CacheCheckpoint.*:Ping.*:ThreadStartup.*:HeaderCompression.*:LIBHTTP2.*:Http2Cancellation.*:Http2Scheduling.*:HTTP2.CancelledZeroWindow*:HTTP2.ConnectedDohRequests*:Http3Control.*:Http3RequestFraming.*:QuicLifecycle.*:QuicEndToEnd.*:Cache.InvalidPersisted*:Cache.BrokenRecordFraming*:Cache.ValidLargeTtl*:Cache.FuturePersisted*:Cache.ValidPersistedCounterBounds*:Cache.PersistedExpiry*:Cache.TtlConsumers*'; fi
     executor=()
     if [[ $PROFILE == compat32 && $EUID != 0 ]]; then executor=(sudo); fi
     "${executor[@]}" timeout 900 ./test/test.bin --gtest_filter="$filter" --gtest_output="xml:$proof/candidate.xml" > "$proof/candidate.log" 2>&1
@@ -96,6 +96,26 @@ make -C "$root/test" -j4 > "$proof/candidate-build.log" 2>&1
 timeout 600 "$root/test/test.bin" --gtest_filter="$FILTER" --gtest_output="xml:$proof/candidate.xml" > "$proof/candidate.log" 2>&1
 python3 "$driver" xml "$proof/candidate.xml" --manifest "$manifest" --pr "$PR"
 sha256sum "$root/test/test.bin" "$root/src/libsmartdns-test.a" > "$proof/binaries.sha256"
+if [[ $PR == 2493 ]]; then
+    file="$root/src/dns_client/client_http2.c"
+    cp "$file" "$proof/client_http2.c"
+    python3 "$driver" inverse-h2-wakeup "$file"
+    git -C "$root" diff --binary > "$proof/inverse-wakeup.patch"
+    make -C "$root/test" -j4 > "$proof/inverse-wakeup-build.log" 2>&1
+    set +e
+    timeout 30 "$root/test/test.bin" --gtest_filter=Http2Scheduling.ConcurrentEnqueueCannotLoseWriteInterest --gtest_output="xml:$proof/inverse-wakeup.xml" > "$proof/inverse-wakeup.log" 2>&1
+    result=$?
+    set -e
+    test "$result" -eq 1
+    python3 - "$proof/inverse-wakeup.xml" <<'PY'
+import sys,xml.etree.ElementTree as E
+r=E.parse(sys.argv[1]).getroot();assert int(r.attrib['tests'])==1 and int(r.attrib['failures'])==1
+c=next(r.iter('testcase'));assert c.attrib['name']=='ConcurrentEnqueueCannotLoseWriteInterest' and c.find('failure') is not None
+PY
+    cp "$proof/client_http2.c" "$file"
+    make -C "$root/test" -j4 > "$proof/restored-build.log" 2>&1
+    timeout 60 "$root/test/test.bin" --gtest_filter='Http2Scheduling.*' --gtest_output="xml:$proof/restored.xml" > "$proof/restored.log" 2>&1
+fi
 if [[ $PR == 2487 || $PR == 2489 ]]; then
     previous=/tmp/closure-previous
     old=$(python3 - "$manifest" "$PR" <<'PY'

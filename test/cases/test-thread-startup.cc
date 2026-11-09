@@ -92,7 +92,9 @@ void check_client_failure_recovery(bool &fail)
     EXPECT_EQ(client.fd_wakeup, -1);
     EXPECT_EQ(client.default_group, nullptr);
     EXPECT_EQ(atomic_read(&client.run), 0);
-    EXPECT_TRUE(hash_empty(client.group));
+    bool groups_empty = true;
+    for (auto &bucket : client.group) if (!hlist_empty(&bucket)) groups_empty = false;
+    EXPECT_TRUE(groups_empty);
     result = dns_client_init();
     EXPECT_EQ(result, 0);
     if (result == 0) dns_client_exit();

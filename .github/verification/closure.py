@@ -98,7 +98,7 @@ def ui_inverse(path):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=['baseline', 'xml', 'inverse-ui'])
+    parser.add_argument('mode', choices=['baseline', 'xml', 'inverse-ui', 'inverse-h2-wakeup'])
     parser.add_argument('path', type=Path)
     parser.add_argument('--manifest', type=Path)
     parser.add_argument('--pr', type=int)
@@ -106,6 +106,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.mode == 'inverse-ui':
         ui_inverse(args.path)
+    elif args.mode == 'inverse-h2-wakeup':
+        text = args.path.read_text()
+        assert text.count('if (send_ret == 0) {') == 1
+        args.path.write_text(text.replace('if (send_ret == 0) {', 'if (send_ret == 0 && 0) {'))
     else:
         item = next(t for t in json.loads(args.manifest.read_text()) if t['pr'] == args.pr)
         if args.mode == 'baseline': baseline(args.pr, item, args.path)

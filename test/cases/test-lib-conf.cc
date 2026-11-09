@@ -30,6 +30,7 @@ extern "C" {
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -219,19 +220,22 @@ TEST(LibConf, DefaultTlsCertificatesStayBesideTheTopConfiguration)
 	Defer {
 		if (had_workdir) setenv("SMARTDNS_WORKDIR", saved_workdir.c_str(), 1);
 		else unsetenv("SMARTDNS_WORKDIR");
+		unlink((config_dir + "/smartdns.conf").c_str());
 		for (const auto &dir : {config_dir, work_dir}) {
 			for (const char *name : {"smartdns-cert.pem", "smartdns-key.pem", "smartdns-root-key.pem"})
 				unlink((dir + "/" + name).c_str());
 		}
 		rmdir(config_dir.c_str()); rmdir(work_dir.c_str()); rmdir(root.c_str());
 	};
-	smartdns::TempFile conf;
-	conf.SetPattern(config_dir + "/smartdns.XXXXXX");
-	ASSERT_TRUE(conf.Write("bind-tls 127.0.0.1:60053\nserver 127.0.0.1:61053\n"
-		"cache-persist no\nlog-console yes\nlog-num 0\n"));
+	std::string config_file = config_dir + "/smartdns.conf";
+	std::ofstream conf(config_file);
+	conf << "bind-tls 127.0.0.1:60053\nserver 127.0.0.1:61053\n"
+		"cache-persist no\nlog-console yes\nlog-num 0\n";
+	conf.close();
+	ASSERT_TRUE(conf.good());
 	ASSERT_EQ(setenv("SMARTDNS_WORKDIR", work_dir.c_str(), 1), 0);
 	smartdns::Server server;
-	ASSERT_TRUE(server.Start(conf.GetPath(), smartdns::Server::CONF_TYPE_FILE));
+	ASSERT_TRUE(server.Start(config_file, smartdns::Server::CONF_TYPE_FILE));
 	for (const char *name : {"smartdns-cert.pem", "smartdns-key.pem", "smartdns-root-key.pem"}) {
 		EXPECT_EQ(access((config_dir + "/" + name).c_str(), F_OK), 0);
 		EXPECT_NE(access((work_dir + "/" + name).c_str(), F_OK), 0);

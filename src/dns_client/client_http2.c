@@ -423,7 +423,7 @@ static int _dns_client_send_buffered_http2_requests(struct dns_server_info *serv
 		}
 
 		if (send_ret == DNS_CLIENT_HTTP2_STREAM_SEND_RETRY_LATER) {
-			return 0;
+			return 1;
 		}
 
 		if (send_ret == DNS_CLIENT_HTTP2_STREAM_SEND_CONN_ERROR) {
@@ -589,9 +589,10 @@ static int _dns_client_http2_init_ctx(struct dns_server_info *server_info)
 static int _dns_client_http2_process_write(struct dns_server_info *server_info)
 {
 	struct http2_ctx *http2_ctx = NULL;
+	int send_ret = _dns_client_send_buffered_http2_requests(server_info);
 
 	/* Send buffered requests */
-	if (_dns_client_send_buffered_http2_requests(server_info) != 0) {
+	if (send_ret < 0) {
 		return -1;
 	}
 
@@ -607,7 +608,26 @@ static int _dns_client_http2_process_write(struct dns_server_info *server_info)
 	/* Flush pending writes */
 	_dns_client_flush_http2_writes(http2_ctx);
 
-	if (_dns_client_http2_mod_epoll_events(server_info, _dns_client_http2_ctx_events(http2_ctx)) != 0) {
+	int events = _dns_client_http2_ctx_events(http2_ctx);
+#ifdef TEST
+	extern void dns_client_http2_test_before_mod(struct dns_server_info *) __attribute__((weak));
+	if (dns_client_http2_test_before_mod) dns_client_http2_test_before_mod(server_info);
+#endif
+	/* Serialize the final interest update with producers enqueueing requests.
+	 * A RETRY_LATER waits for peer progress, rather than spinning on writable TCP. */
+	pthread_mutex_lock(&server_info->lock);
+	if (send_ret == 0) {
+		struct dns_conn_stream *queued;
+		list_for_each_entry(queued, &server_info->conn_stream_list, server_list) {
+			if (!queued->http2_stream && queued->send_buff.len > 0) {
+				events |= EPOLLOUT;
+				break;
+			}
+		}
+	}
+	int ret = _dns_client_http2_mod_epoll_events(server_info, events);
+	pthread_mutex_unlock(&server_info->lock);
+	if (ret != 0) {
 		http2_ctx_put(http2_ctx);
 		return -1;
 	}
@@ -615,6 +635,13 @@ static int _dns_client_http2_process_write(struct dns_server_info *server_info)
 	http2_ctx_put(http2_ctx);
 	return 0;
 }
+
+#ifdef TEST
+int dns_client_http2_test_process_write(struct dns_server_info *server_info)
+{
+	return _dns_client_http2_process_write(server_info);
+}
+#endif
 
 static int _dns_client_http2_process_stream_one(struct dns_server_info *server_info,
 												struct dns_conn_stream *conn_stream)

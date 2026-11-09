@@ -2,13 +2,29 @@
 extern "C" {
 #include "smartdns/http2.h"
 #include "dns_client/conn_stream.h"
+#include "dns_client/client_http2.h"
 }
 #undef min
 #undef max
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <functional>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <vector>
+
+namespace {
+thread_local std::function<void(dns_server_info *)> before_h2_mod;
+}
+extern "C" void dns_client_http2_test_before_mod(dns_server_info *endpoint)
+{
+    if (!before_h2_mod) return;
+    auto invoke = std::move(before_h2_mod);
+    before_h2_mod = nullptr;
+    invoke(endpoint);
+}
 
 class Http2Cancellation : public ::testing::Test {
 protected:
@@ -163,4 +179,74 @@ TEST_F(Http2Cancellation, CompletedServerRequestStillHonorsPeerCancellation) {
     EXPECT_EQ(http2_stream_is_reset(stream),0);
     Frame(3,0,1,{0,0,0,8}); http2_ctx_poll(ctx,nullptr,0,nullptr);
     EXPECT_EQ(http2_stream_is_reset(stream),1);
+}
+
+class Http2Scheduling : public Http2Cancellation {
+protected:
+    dns_server_info endpoint{};
+    dns_query_struct query{};
+    int sockets[2] = {-1, -1}, old_epoll = -1;
+    void SetUp() override {
+        Http2Cancellation::SetUp();
+        pthread_mutex_init(&endpoint.lock, nullptr);
+        pthread_mutex_init(&query.lock, nullptr);
+        INIT_LIST_HEAD(&endpoint.conn_stream_list);
+        INIT_LIST_HEAD(&query.conn_stream_list);
+        ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets), 0);
+        old_epoll = client.epoll_fd;
+        client.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+        ASSERT_GE(client.epoll_fd, 0);
+        endpoint.fd = sockets[0]; endpoint.type = DNS_SERVER_HTTPS;
+        endpoint.status = DNS_SERVER_STATUS_CONNECTED;
+        endpoint.http2_ctx = ctx;
+        strcpy(endpoint.flags.https.path, "/dns-query");
+        epoll_event event{}; event.events = EPOLLIN; event.data.ptr = &endpoint;
+        ASSERT_EQ(epoll_ctl(client.epoll_fd, EPOLL_CTL_ADD, endpoint.fd, &event), 0);
+    }
+    void TearDown() override {
+        before_h2_mod = nullptr;
+        while (!list_empty(&query.conn_stream_list)) {
+            auto *stream = list_entry(query.conn_stream_list.next, dns_conn_stream, query_list);
+            list_del_init(&stream->query_list); stream->query = nullptr;
+            _dns_client_conn_stream_put(stream);
+        }
+        _dns_client_conn_server_streams_free(&endpoint, nullptr);
+        close(client.epoll_fd); client.epoll_fd = old_epoll;
+        for (int fd : sockets) if (fd >= 0) close(fd);
+        pthread_mutex_destroy(&query.lock);
+        pthread_mutex_destroy(&endpoint.lock);
+        Http2Cancellation::TearDown();
+    }
+    void Queue() {
+        const unsigned char bytes[] = {1, 2, 3};
+        ASSERT_EQ(_dns_client_send_http2(&endpoint, &query, const_cast<unsigned char *>(bytes), sizeof(bytes)), 0);
+    }
+    unsigned Ready() {
+        epoll_event event{};
+        int count = epoll_wait(client.epoll_fd, &event, 1, 0);
+        EXPECT_GE(count, 0);
+        return count > 0 ? event.events : 0;
+    }
+};
+TEST_F(Http2Scheduling, ConcurrentEnqueueCannotLoseWriteInterest)
+{
+    // Exact producer interleaving after the worker observes an empty queue.
+    before_h2_mod = [&](dns_server_info *server) { EXPECT_EQ(server, &endpoint); Queue(); };
+    ASSERT_EQ(dns_client_http2_test_process_write(&endpoint), 0);
+    EXPECT_NE(Ready() & EPOLLOUT, 0U);
+    ASSERT_EQ(dns_client_http2_test_process_write(&endpoint), 0);
+    EXPECT_EQ(Frames(1), 1U);
+}
+TEST_F(Http2Scheduling, PeerCapacityWaitDoesNotSpinOnWritableSocket)
+{
+    Frame(4, 0, 0, {0,3,0,0,0,1});
+    http2_ctx_poll(ctx, nullptr, 0, nullptr);
+    ASSERT_NE(Request(), nullptr); // occupies the only stream slot
+    Queue();
+    ASSERT_EQ(dns_client_http2_test_process_write(&endpoint), 0);
+    EXPECT_EQ(Ready() & EPOLLOUT, 0U);
+    Frame(4, 0, 0, {0,3,0,0,0,2});
+    http2_ctx_poll(ctx, nullptr, 0, nullptr);
+    ASSERT_EQ(dns_client_http2_test_process_write(&endpoint), 0);
+    EXPECT_EQ(Frames(1), 2U);
 }

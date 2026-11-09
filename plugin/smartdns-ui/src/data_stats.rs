@@ -105,6 +105,8 @@ impl DataStatsItem {
         {
             // Observational counter only: saturation prevents a full counter wrapping
             // back to a misleading zero. Match the non-atomic implementation.
+            // Keep compatibility with toolchains predating try_update (Rust 1.95).
+            #[allow(deprecated)]
             let _ = self.request_dropped.fetch_update(
                 Ordering::Relaxed, Ordering::Relaxed,
                 |value| Some(value.saturating_add(count)),
