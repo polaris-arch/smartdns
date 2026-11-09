@@ -177,6 +177,7 @@ TEST(HeaderCompression, EncoderSettingsShrinkAndGrowSynchronizeNextHeaderBlock) 
     EXPECT_EQ(hpack_decode_headers(&decoder,wire,n,Save,&value),0);
     EXPECT_EQ(value,"second"); EXPECT_EQ(decoder.entry_count,1);
     EXPECT_EQ(decoder.dynamic_table_size,encoder.dynamic_table_size);
+    EXPECT_EQ(decoder.max_dynamic_table_size,4096U);
     n=hpack_encode_header(&encoder,"x-test","second",wire,sizeof(wire)); ASSERT_GT(n,0);
     EXPECT_EQ(wire[0],0xbe); // both peers now reference the same single entry
     EXPECT_EQ(hpack_decode_headers(&decoder,wire,n,Save,&value),0);

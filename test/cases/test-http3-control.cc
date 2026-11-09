@@ -29,6 +29,20 @@ TEST(Http3Control, MissingRepeatedAndDuplicateUnknownSettingsFail) {
     { Control c; EXPECT_LT(c.Feed(0, {0,4,4,0x21,0,0x21,1}), 0); }
     { Control c; EXPECT_LT(c.Feed(0, {0,4,2,2,0}), 0); }
 }
+TEST(Http3Control, MaximumSettingsPayloadFitsWithLongestFrameHeader) {
+    Control c;
+    ASSERT_EQ(c.Feed(0, {0}), 0);
+    std::vector<unsigned char> frame = {0xc0,0,0,0,0,0,0,4,0xc0,0,0,0,0,0,0x10,0};
+    for (unsigned id = 64; id < 64 + 1365; id++) {
+        frame.push_back(0x40 | (id >> 8)); frame.push_back(id);
+        if (id == 64) frame.push_back(0x40);
+        frame.push_back(0);
+    }
+    ASSERT_EQ(frame.size(), 4096U + 16U);
+    EXPECT_EQ(c.Feed(0, frame), 0);
+    Control oversized;
+    EXPECT_LT(oversized.Feed(0, {0,4,0x50,1}), 0); // SETTINGS payload 4097
+}
 TEST(Http3Control, UnknownFramesSkipIncrementally) {
     Control c;
     EXPECT_EQ(c.Feed(0, {0,4,0,0x21,4,1}), 0);

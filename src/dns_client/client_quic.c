@@ -715,7 +715,7 @@ int _dns_client_quic_buffered(struct dns_server_info *s)
     SSL_POLL_ITEM items[128]; size_t count=0, ready=0;
     const struct timeval zero={0};
     items[count++]=(SSL_POLL_ITEM){.desc=SSL_as_poll_descriptor(s->ssl),
-        .events=SSL_POLL_EVENT_EC | (s->type==DNS_SERVER_HTTP3 ? SSL_POLL_EVENT_ISU|SSL_POLL_EVENT_ISB : 0)};
+        .events=SSL_POLL_EVENT_EC | (s->type==DNS_SERVER_HTTP3 ? SSL_POLL_EVENT_ISB : 0)};
     struct dns_conn_stream *stream;
     list_for_each_entry(stream,&s->conn_stream_list,server_list) {
         if (!stream->quic_stream) continue;

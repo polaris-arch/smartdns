@@ -1,4 +1,5 @@
 #include "gtest/gtest.h"
+#include "include/utils.h"
 extern "C" {
 #include "dns_client/client_http2.h"
 #include "dns_client/client_socket.h"
@@ -21,6 +22,15 @@ extern "C" {
 #include <thread>
 #include <memory>
 #include <atomic>
+
+static thread_local std::function<void()> before_http2_interest;
+extern "C" void dns_client_http2_test_before_mod(dns_server_info *)
+{
+    if (!before_http2_interest) return;
+    auto invoke = std::move(before_http2_interest);
+    before_http2_interest = nullptr;
+    invoke();
+}
 
 namespace {
 struct FlowQuery {
@@ -444,4 +454,30 @@ TEST_F(ClientH2FlowOwner, GracefulGoawayStopsAdmissionAndDoesNotBecomeProtocolEr
     for(unsigned i=0;i<10&&!http2_ctx_draining(server.http2_ctx,nullptr,nullptr);i++)_dns_client_process_http2(&server,&e,get_tick_count());
     uint32_t last=99,error=99;EXPECT_TRUE(http2_ctx_draining(server.http2_ctx,&last,&error));
     EXPECT_EQ(last,0U);EXPECT_EQ(error,0U);EXPECT_EQ(http2_stream_new(server.http2_ctx),nullptr);
+}
+
+TEST_F(ClientH2FlowOwner, ConcurrentEnqueueRetainsKernelWriteInterest) {
+    FlowQuery queued(&server);
+    unsigned char dns[12] = {};
+    before_http2_interest = [&] {
+        EXPECT_EQ(_dns_attempt_begin(&queued.query, &server), DNS_ADMIT_OK);
+        EXPECT_EQ(_dns_client_send_http2(&server, &queued.query, dns, sizeof(dns)), 0);
+    };
+    Defer { before_http2_interest = nullptr; };
+    ASSERT_EQ(_dns_client_http2_process_write(&server), 0);
+    epoll_event event{};
+    ASSERT_EQ(epoll_wait(epoll_fd, &event, 1, 0), 1);
+    EXPECT_NE(event.events & EPOLLOUT, 0U);
+}
+TEST_F(ClientH2FlowOwner, BlockedWriteOwnerDoesNotSpinOnWritableSocket) {
+    FlowQuery first(&server), queued(&server);
+    ASSERT_GT(Queue(first), 0); // peer stream window is zero
+    unsigned char dns[12] = {};
+    ASSERT_EQ(_dns_attempt_begin(&queued.query, &server), DNS_ADMIT_OK);
+    ASSERT_EQ(_dns_client_send_http2(&server, &queued.query, dns, sizeof(dns)), 0);
+    ASSERT_EQ(_dns_client_http2_process_write(&server), 0);
+    epoll_event event{};
+    int count = epoll_wait(epoll_fd, &event, 1, 0);
+    EXPECT_GE(count, 0);
+    EXPECT_EQ(count > 0 ? event.events & EPOLLOUT : 0U, 0U);
 }

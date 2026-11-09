@@ -29,6 +29,7 @@
 
 static const char *current_conf_file = NULL;
 static int current_conf_lineno = 0;
+static char top_conf_file[PATH_MAX];
 
 const char *conf_get_conf_file(void)
 {
@@ -657,9 +658,14 @@ static int load_conf_file(const char *file, const struct config_item *items, con
 		}
 
 		if (is_func_found == 0) {
-			if (handler(key, value, file, line_no, CONF_RET_NOENT) != 0) {
-				goto errout;
-			}
+			last_file = current_conf_file;
+			last_lineno = current_conf_lineno;
+			current_conf_file = file;
+			current_conf_lineno = line_no;
+			ret = handler(key, value, file, line_no, CONF_RET_NOENT);
+			current_conf_file = last_file;
+			current_conf_lineno = last_lineno;
+			if (ret != 0) goto errout;
 		}
 	}
 
@@ -675,5 +681,22 @@ errout:
 
 int load_conf(const char *file, const struct config_item items[], conf_error_handler handler)
 {
-	return load_conf_file(file, items, handler);
+	static int load_depth;
+	if (load_depth == 0) {
+		size_t len = strnlen(file, sizeof(top_conf_file));
+		if (len == sizeof(top_conf_file)) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+		/* Startup still resolves default certificates relative to this file.
+		 * Own the name rather than retaining a caller's stack or string. */
+		memmove(top_conf_file, file, len + 1);
+		current_conf_file = top_conf_file;
+		current_conf_lineno = 0;
+		file = top_conf_file;
+	}
+	load_depth++;
+	int ret = load_conf_file(file, items, handler);
+	load_depth--;
+	return ret;
 }

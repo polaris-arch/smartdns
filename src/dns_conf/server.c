@@ -234,7 +234,13 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 
 	if (scheme[0] != '\0') {
 		if (strcasecmp(scheme, "https") == 0) {
-			type = DNS_SERVER_HTTPS;
+			/* Preserve the HTTP/3 keyword when the URL names no HTTP version. */
+			if (type != DNS_SERVER_HTTP3) {
+				type = DNS_SERVER_HTTPS;
+			} else if (dns_is_quic_supported() == 0) {
+				tlog(TLOG_WARN, "HTTP3 is not supported in this version, use HTTPS for %s.", ip);
+				type = DNS_SERVER_HTTPS;
+			}
 			default_port = DEFAULT_DNS_HTTPS_PORT;
 		} else if (strcasecmp(scheme, "http3") == 0) {
 			type = DNS_SERVER_HTTP3;

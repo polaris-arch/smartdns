@@ -24,6 +24,7 @@
 #include "gtest/gtest.h"
 #include "fast_ping/ping_host.h"
 #include "fast_ping/ping_fake.h"
+#include "dns_server/dualstack.h"
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -211,6 +212,8 @@ struct PingStartProbe {
 	int error = 0;
 	int replacement_fd = -1;
 	struct fast_ping_fake_ip *held_fake = nullptr;
+	bool caller_owns = false;
+	struct ping_host_struct *held_host = nullptr;
 };
 
 /* Only the calling test thread installs a probe; unrelated ping sends are untouched. */
@@ -248,10 +251,17 @@ void start_probe_callback(struct ping_host_struct *host, const char *, FAST_PING
 extern "C" int fast_ping_test_send_hook(struct ping_host_struct *host, int before)
 {
 	PingStartProbe *probe = start_probe;
-	if (probe == nullptr || host->userptr != probe) {
+	if (probe == nullptr || (host->userptr != probe && !(probe->caller_owns && host->userptr == nullptr))) {
 		return 0;
 	}
 	if (before) {
+		if (probe->caller_owns) {
+			/* Keep two test references: an erroneous second caller stop becomes
+			 * a count assertion, rather than dereferencing an already freed host. */
+			probe->held_host = host;
+			_fast_ping_host_get(host);
+			_fast_ping_host_get(host);
+		}
 		pthread_mutex_lock(&ping.map_lock);
 		probe->registered_before_send = hash_hashed(&host->addr_node);
 		probe->pending_before_send = host->send == 1;
@@ -264,6 +274,14 @@ extern "C" int fast_ping_test_send_hook(struct ping_host_struct *host, int befor
 			}
 			errno = EIO;
 			return -1;
+		}
+	} else if (probe->caller_owns) {
+		for (int i = 0; i < 500; i++) {
+			if (atomic_read(&host->notified) > 0 && atomic_read(&host->ref) <= 4) {
+				probe->completed_before_return = true;
+				break;
+			}
+			usleep(1000);
 		}
 	} else {
 		/* Hold startup open until the real receiver has consumed the first
@@ -280,6 +298,15 @@ extern "C" int fast_ping_test_send_hook(struct ping_host_struct *host, int befor
 
 static void check_first_reply_before_start_returns(PING_TYPE type, const char *address, bool stop_on_end = false)
 {
+	if (type == PING_TYPE_TCP_SYN) {
+		int family = address[0] == '[' ? AF_INET6 : AF_INET;
+		int fd = socket(family, SOCK_RAW, IPPROTO_TCP);
+		if (fd < 0 && (errno == EPERM || errno == EACCES || errno == EAFNOSUPPORT)) {
+			GTEST_SKIP() << "Raw TCP socket unavailable";
+		}
+		ASSERT_GE(fd, 0);
+		close(fd);
+	}
 	PingStartProbe probe;
 	probe.stop_on_end = stop_on_end;
 	start_probe = &probe;
@@ -327,6 +354,32 @@ TEST_F(Ping, fake_end_callback_stops_during_start)
 {
 	ASSERT_EQ(fast_ping_fake_ip_add(PING_TYPE_ICMP, "192.0.2.1", 60, 1), 0);
 	check_first_reply_before_start_returns(PING_TYPE_ICMP, "192.0.2.1", true);
+}
+
+TEST_F(Ping, Ipv6ReadinessCallerRetainsItsStopReferenceAfterEarlyEnd)
+{
+	int icmp = dns_conf.has_icmp_check, tcp = dns_conf.has_tcp_check, syn = dns_conf.has_tcp_syn_check;
+	int ready = is_ipv6_ready;
+	Defer {
+		dns_conf.has_icmp_check = icmp; dns_conf.has_tcp_check = tcp; dns_conf.has_tcp_syn_check = syn;
+		_dns_server_ipv6_check_conf_init();
+		is_ipv6_ready = ready;
+	};
+	dns_conf.has_icmp_check = 1; dns_conf.has_tcp_check = 0; dns_conf.has_tcp_syn_check = 0;
+	_dns_server_ipv6_check_conf_init();
+	ASSERT_EQ(fast_ping_fake_ip_add(PING_TYPE_ICMP, "2001::", 60, 1), 0);
+	PingStartProbe probe;
+	probe.caller_owns = true;
+	start_probe = &probe;
+	dns_server_check_ipv6_ready();
+	start_probe = nullptr;
+	fast_ping_exit();
+	EXPECT_TRUE(probe.completed_before_return);
+	EXPECT_EQ(is_ipv6_ready, 1);
+	ASSERT_NE(probe.held_host, nullptr);
+	int remaining = atomic_read(&probe.held_host->ref);
+	EXPECT_EQ(remaining, 2); // both test references survive the caller's one stop
+	for (int i = 0; i < remaining; i++) _fast_ping_host_put(probe.held_host);
 }
 
 TEST_F(Ping, failed_start_rolls_back_registered_fake)

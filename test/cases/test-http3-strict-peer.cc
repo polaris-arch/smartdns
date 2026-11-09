@@ -251,6 +251,53 @@ TEST_F(StrictPeer, PeriodicRetryContinuesBudgetDeferredControlFrames) {
     ASSERT_EQ(_dns_client_quic_retry_pending(&client, get_tick_count()), 0);
     EXPECT_TRUE(_dns_http3_is_draining(&client));
 }
+TEST_F(StrictPeer, FullUnknownStreamSlotsWaitWithoutSpinningAndResumeQueuedControl) {
+    for (int i = 0; i < 100 && observed.size() < 7; i++) { ASSERT_GE(Pump(), 0); usleep(1000); }
+    ASSERT_EQ(observed.size(), 7U);
+    std::vector<std::unique_ptr<SSL, decltype(&SSL_free)>> streams;
+    const unsigned char prefix = 0x40; // first half of the legal two-byte type 0x21
+    for (unsigned i = 0; i < 8; i++) {
+        streams.emplace_back(SSL_new_stream(peer, SSL_STREAM_FLAG_UNI), SSL_free);
+        ASSERT_NE(streams.back(), nullptr);
+        size_t sent = 0;
+        ASSERT_EQ(SSL_write_ex(streams.back().get(), &prefix, 1, &sent), 1);
+        ASSERT_EQ(sent, 1U);
+    }
+    for (int i = 0; i < 100 && SSL_get_accept_stream_queue_len(client.ssl) < 8; i++) {
+        SSL_handle_events(peer); SSL_handle_events(client.ssl); usleep(1000);
+    }
+    ASSERT_EQ(SSL_get_accept_stream_queue_len(client.ssl), 8U);
+    ASSERT_EQ(Pump(), 0);
+    ASSERT_EQ(SSL_get_accept_stream_queue_len(client.ssl), 0U);
+    // All eight accepted types are incomplete, so none can be skipped yet.
+    peer_control = SSL_new_stream(peer, SSL_STREAM_FLAG_UNI);
+    ASSERT_NE(peer_control, nullptr);
+    const unsigned char control[] = {0, 4, 0, 7, 1, 8};
+    size_t sent = 0;
+    ASSERT_EQ(SSL_write_ex(peer_control, control, sizeof(control), &sent), 1);
+    ASSERT_EQ(sent, sizeof(control));
+    for (int i = 0; i < 100 && SSL_get_accept_stream_queue_len(client.ssl) == 0; i++) {
+        SSL_handle_events(peer); SSL_handle_events(client.ssl); usleep(1000);
+    }
+    ASSERT_EQ(SSL_get_accept_stream_queue_len(client.ssl), 1U);
+    for (unsigned i = 0; i < 3; i++) {
+        ASSERT_EQ(Pump(), 0); // used to reject the queued ninth stream with H3_EXCESSIVE_LOAD
+        EXPECT_EQ(SSL_get_accept_stream_queue_len(client.ssl), 1U);
+        EXPECT_FALSE(_dns_client_quic_buffered(&client)); // queued ISU alone is not runnable work
+    }
+    const unsigned char suffix = 0x21;
+    for (auto &stream : streams) {
+        sent = 0;
+        ASSERT_EQ(SSL_write_ex(stream.get(), &suffix, 1, &sent), 1);
+        ASSERT_EQ(sent, 1U);
+    }
+    // Complete types release slots; a later epoch must accept and parse control/GOAWAY.
+    for (int i = 0; i < 100 && !_dns_http3_is_draining(&client); i++) {
+        ASSERT_EQ(Pump(), 0); usleep(1000);
+    }
+    EXPECT_TRUE(_dns_http3_is_draining(&client));
+    EXPECT_EQ(SSL_get_accept_stream_queue_len(client.ssl), 0U);
+}
 TEST_F(StrictPeer, GoawayStopsNewRequestsAndCriticalFinFails) {
     ASSERT_TRUE(WritePeer({0,4,0,7,1,8}, true));
     for (int i = 0; i < 30; i++) { Pump(); usleep(1000); }

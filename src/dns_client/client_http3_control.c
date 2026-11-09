@@ -9,7 +9,8 @@
 #include <sys/time.h>
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
 #define H3_SLOTS 8
-#define H3_BUFFER 8192
+/* Maximum accepted SETTINGS payload plus two eight-byte frame varints. */
+#define H3_BUFFER (4096 + 16)
 /* stream type, SETTINGS frame length, capacity=0, blocked-streams=0 */
 static const unsigned char settings[] = {0, 4, 4, 1, 0, 7, 0};
 struct h3_peer_stream {
@@ -208,8 +209,12 @@ static int h3_control_poll(struct dns_server_info *s)
         size_t slot;
         for (slot = 0; slot < H3_SLOTS; slot++) if (!c->peer[slot].ssl) break;
         if (slot == H3_SLOTS) {
-            if (SSL_get_accept_stream_queue_len(s->ssl)) return h3_fail(c, 0x107);
-            break;
+            SSL_POLL_ITEM incoming = {.desc = SSL_as_poll_descriptor(s->ssl), .events = SSL_POLL_EVENT_ISB};
+            size_t ready = 0;
+            const struct timeval zero = {0};
+            if (SSL_poll(&incoming, 1, sizeof(incoming), &zero, SSL_POLL_FLAG_NO_HANDLE_EVENTS, &ready) == 1 &&
+                (incoming.revents & SSL_POLL_EVENT_ISB)) return h3_fail(c, 0x103);
+            break; /* Process occupied slots before accepting another batch. */
         }
         if(!_dns_egress_io_allowed(s))return -1;
         SSL *ssl = SSL_accept_stream(s->ssl, SSL_ACCEPT_STREAM_NO_BLOCK);
@@ -276,6 +281,9 @@ int _dns_http3_control_buffered(struct dns_server_info *s)
     /* Parsing can stop at the per-turn budget after SSL data has been consumed.
      * Such work lives in our buffers, not in SSL_poll's readiness state. */
     if (c->bytes >= 16384 || c->transitions >= 64) return 1;
+    if (SSL_get_accept_stream_queue_len(s->ssl)) {
+        for (size_t i = 0; i < H3_SLOTS; i++) if (!c->peer[i].ssl) return 1;
+    }
     SSL_POLL_ITEM items[H3_SLOTS + 1];
     size_t count = 0, ready = 0;
     const struct timeval zero = {0};

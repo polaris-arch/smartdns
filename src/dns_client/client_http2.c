@@ -507,7 +507,7 @@ int _dns_client_send_buffered_http2_requests(struct dns_server_info *server_info
 		}
 
 		if (send_ret == DNS_CLIENT_HTTP2_STREAM_SEND_RETRY_LATER) {
-			return 0;
+			return 1;
 		}
 
 		if (send_ret == DNS_CLIENT_HTTP2_STREAM_SEND_CONN_ERROR) {
@@ -672,8 +672,9 @@ int _dns_client_http2_process_write(struct dns_server_info *server_info)
     if (_dns_http2_cancel_pending_owner(server_info) < 0) return -1;
 	struct http2_ctx *http2_ctx = NULL;
 
-	/* Send buffered requests */
-	if (_dns_client_send_buffered_http2_requests(server_info) != 0) {
+	/* Send buffered requests; a positive result waits for peer or policy progress. */
+	int send_ret = _dns_client_send_buffered_http2_requests(server_info);
+	if (send_ret < 0) {
 		return -1;
 	}
 
@@ -691,7 +692,26 @@ int _dns_client_http2_process_write(struct dns_server_info *server_info)
         http2_ctx_put(http2_ctx); return -1;
     }
 
-	if (_dns_client_http2_mod_epoll_events(server_info, _dns_client_http2_ctx_events(server_info, http2_ctx)) != 0) {
+	int events = _dns_client_http2_ctx_events(server_info, http2_ctx);
+#ifdef TEST
+    extern void dns_client_http2_test_before_mod(struct dns_server_info *) __attribute__((weak));
+    if (dns_client_http2_test_before_mod) dns_client_http2_test_before_mod(server_info);
+#endif
+	/* Serialize the final interest update with producers. Preserve the existing
+	 * admission wait: a blocked endpoint must not spin on writable TCP. */
+	pthread_mutex_lock(&server_info->lock);
+	if (send_ret == 0 && !server_info->http2_policy_blocked) {
+		struct dns_conn_stream *queued;
+		list_for_each_entry(queued, &server_info->conn_stream_list, server_list) {
+			if (queued->query && !queued->query->terminal && !queued->http2_stream && queued->send_buff.len > 0) {
+				events |= EPOLLOUT;
+				break;
+			}
+		}
+	}
+	int ret = _dns_client_http2_mod_epoll_events(server_info, events);
+	pthread_mutex_unlock(&server_info->lock);
+	if (ret != 0) {
 		http2_ctx_put(http2_ctx);
 		return -1;
 	}
@@ -715,6 +735,8 @@ static int _dns_client_http2_process_stream_one(struct dns_server_info *server_i
 	if (http2_stream == NULL || conn_stream->query == NULL) {
 		return 1;
 	}
+
+	if (http2_stream_is_reset(http2_stream)) return -1;
 
 	/* Check HTTP status code first */
 	int status = http2_stream_get_status(http2_stream);
@@ -747,12 +769,10 @@ static int _dns_client_http2_process_stream_one(struct dns_server_info *server_i
 			continue;
 		}
 
-		if (response_len < 0 && errno == EAGAIN) {
-			break;
-		}
 		break;
 	}
 
+	if (response_len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
 	if (!http2_stream_is_end(http2_stream)) {
 		return 0;
 	}

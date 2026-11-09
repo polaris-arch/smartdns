@@ -58,6 +58,7 @@ LDFLAGS += -Wl,--wrap=time,--wrap=fork,--wrap=waitpid,--wrap=kill,--wrap=close,-
 LDFLAGS += $(ZLIB_LDFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
 LDFLAGS += -Wl,--wrap=pthread_create,--wrap=_dns_client_socket_ssl_send_ext
+LDFLAGS += -Wl,--wrap=epoll_create1,--wrap=eventfd,--wrap=pthread_join
 LDFLAGS += -Wl,--wrap=sendmsg,--wrap=sendmmsg,--wrap=sendto
 
 .PHONY: all clean test $(SMARTDNS_TEST_LIB)
