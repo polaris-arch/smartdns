@@ -215,6 +215,63 @@ TEST_F(QuicLifecycle, CriticalControlFinIsAConnectionError) {
     ASSERT_EQ(SSL_stream_conclude(control,0),1);
     EXPECT_TRUE(Until([&] { return _dns_http3_control_poll(&endpoint)<0; }));
 }
+TEST_F(QuicLifecycle, UnknownStreamsDoNotRejectTheNextControlBatch) {
+    Connect(true); ASSERT_EQ(_dns_http3_control_poll(&endpoint),0);
+    for (int i = 0; i < 9; i++) {
+        SSL *unknown = PeerStream(true); ASSERT_NE(unknown,nullptr);
+        ASSERT_TRUE(Send(unknown,{0x21}));
+    }
+    SSL *control = PeerStream(true); ASSERT_NE(control,nullptr);
+    ASSERT_TRUE(Send(control,{0,4,0,7,1,0}));
+    ASSERT_TRUE(Until([&] { return SSL_get_accept_stream_queue_len(endpoint.ssl) >= 10; }));
+    ASSERT_EQ(_dns_http3_control_poll(&endpoint),0);
+    EXPECT_TRUE(_dns_http3_control_pending(&endpoint));
+    EXPECT_TRUE(Until([&] {
+        if (_dns_http3_control_poll(&endpoint)<0) return true;
+        return !_dns_http3_request_allowed(&endpoint,nullptr);
+    }));
+    EXPECT_EQ(_dns_http3_control_poll(&endpoint),0);
+    EXPECT_FALSE(_dns_http3_request_allowed(&endpoint,nullptr));
+}
+TEST_F(QuicLifecycle, FragmentedUnknownTypesAreProcessedBeforeAcceptingMoreStreams) {
+    Connect(true); ASSERT_EQ(_dns_http3_control_poll(&endpoint),0);
+    std::vector<SSL *> unknown;
+    for (int i = 0; i < 8; i++) {
+        SSL *stream = PeerStream(true); ASSERT_NE(stream,nullptr);
+        unknown.push_back(stream);
+        ASSERT_TRUE(Send(stream,{0x40})); // first byte of legal, nonminimal type 0x21
+    }
+    ASSERT_TRUE(Until([&] { return SSL_get_accept_stream_queue_len(endpoint.ssl) >= 8; }));
+    ASSERT_EQ(_dns_http3_control_poll(&endpoint),0);
+    EXPECT_FALSE(_dns_http3_control_pending(&endpoint));
+    SSL *control = PeerStream(true); ASSERT_NE(control,nullptr);
+    ASSERT_TRUE(Send(control,{0,4,0,7,1,0}));
+    ASSERT_TRUE(Until([&] { return SSL_get_accept_stream_queue_len(endpoint.ssl) >= 1; }));
+    ASSERT_EQ(_dns_http3_control_poll(&endpoint),0);
+    EXPECT_FALSE(_dns_http3_control_pending(&endpoint));
+    EXPECT_TRUE(Until([&] { return _dns_client_quic_timeout(&endpoint,100) > 0; }));
+    for (SSL *stream : unknown) ASSERT_TRUE(Send(stream,{0x21}));
+    ASSERT_EQ(_dns_http3_control_poll(&endpoint),0);
+    EXPECT_TRUE(Until([&] {
+        if (_dns_http3_control_poll(&endpoint)<0) return true;
+        return !_dns_http3_request_allowed(&endpoint,nullptr);
+    }));
+    EXPECT_EQ(_dns_http3_control_poll(&endpoint),0);
+    EXPECT_FALSE(_dns_http3_request_allowed(&endpoint,nullptr));
+}
+TEST_F(QuicLifecycle, UnexpectedBidirectionalStreamStillFailsWithFullControlSlots) {
+    Connect(true); ASSERT_EQ(_dns_http3_control_poll(&endpoint),0);
+    for (int i = 0; i < 8; i++) {
+        SSL *stream = PeerStream(true); ASSERT_NE(stream,nullptr);
+        ASSERT_TRUE(Send(stream,{0x40}));
+    }
+    ASSERT_TRUE(Until([&] { return SSL_get_accept_stream_queue_len(endpoint.ssl) >= 8; }));
+    ASSERT_EQ(_dns_http3_control_poll(&endpoint),0);
+    SSL *unexpected = PeerStream(false); ASSERT_NE(unexpected,nullptr);
+    ASSERT_TRUE(Send(unexpected,{0}));
+    ASSERT_TRUE(Until([&] { return SSL_get_accept_stream_queue_len(endpoint.ssl) >= 1; }));
+    EXPECT_LT(_dns_http3_control_poll(&endpoint),0);
+}
 TEST_F(QuicLifecycle, ResetIsProcessedWithoutKernelReadability) {
     Connect(false); auto *r=Request(); ASSERT_NE(r,nullptr);
     SSL *s=AcceptRequest(); ASSERT_NE(s,nullptr);

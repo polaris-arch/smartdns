@@ -170,7 +170,13 @@ static int h3_poll(struct dns_server_info *s)
         unsigned slot;
         for (slot = 0; slot < H3_SLOTS && c->peer[slot].ssl; slot++) {}
         if (slot == H3_SLOTS) {
-            if (SSL_get_accept_stream_queue_len(s->ssl)) return h3_fail(c, 0x107);
+            /* Process occupied slots before accepting the next batch. Unknown
+             * stream types can be discarded without failing a valid peer. */
+            SSL_POLL_ITEM incoming = {.desc = SSL_as_poll_descriptor(s->ssl), .events = SSL_POLL_EVENT_ISB};
+            size_t ready = 0;
+            const struct timeval zero = {0};
+            if (SSL_poll(&incoming, 1, sizeof(incoming), &zero, SSL_POLL_FLAG_NO_HANDLE_EVENTS, &ready) == 1 &&
+                (incoming.revents & SSL_POLL_EVENT_ISB)) return h3_fail(c, 0x103);
             break;
         }
         SSL *peer = SSL_accept_stream(s->ssl, SSL_ACCEPT_STREAM_NO_BLOCK);
@@ -201,6 +207,9 @@ static int h3_poll(struct dns_server_info *s)
     }
     if (c->transitions >= 64) {
         for (unsigned i = 0; i < H3_SLOTS; i++) if (c->peer[i].used) c->pending = 1;
+    }
+    if (SSL_get_accept_stream_queue_len(s->ssl)) {
+        for (unsigned i = 0; i < H3_SLOTS; i++) if (!c->peer[i].ssl) c->pending = 1;
     }
     c->rotate = (c->rotate + 1) % H3_SLOTS;
     return c->sent == sizeof(settings) ? 0 : 1;
@@ -249,6 +258,9 @@ int _dns_http3_control_pending(struct dns_server_info *s)
         items[count++] = (SSL_POLL_ITEM){.desc = SSL_as_poll_descriptor(s->ssl), .events = SSL_POLL_EVENT_OSU};
     } else {
         if (c->fatal || c->pending) return 1;
+        if (SSL_get_accept_stream_queue_len(s->ssl)) {
+            for (unsigned i = 0; i < H3_SLOTS; i++) if (!c->peer[i].ssl) return 1;
+        }
         items[count++] = (SSL_POLL_ITEM){.desc = SSL_as_poll_descriptor(c->local),
             .events = SSL_POLL_EVENT_EW | (c->sent < 7 ? SSL_POLL_EVENT_W : 0)};
         for (unsigned i = 0; i < H3_SLOTS; i++) if (c->peer[i].ssl) {

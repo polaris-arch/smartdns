@@ -741,14 +741,10 @@ static int _dns_client_http2_process_stream_one(struct dns_server_info *server_i
 			continue;
 		}
 
-		if (response_len < 0 && errno == EAGAIN) {
-			break;
-		}
 		break;
 	}
 
 	if (response_len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
-	if (http2_stream_is_reset(http2_stream)) return -1;
 
 	if (!http2_stream_is_end(http2_stream)) {
 		return 0;

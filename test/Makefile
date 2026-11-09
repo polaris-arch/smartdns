@@ -54,7 +54,7 @@ CXXFLAGS += $(ZLIB_CXXFLAGS)
 LDFLAGS += -lssl -lcrypto -lpthread -ldl -lgtest -lstdc++ -lm -rdynamic
 LDFLAGS += $(ZLIB_LDFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
-LDFLAGS += -Wl,--wrap=time,--wrap=fork,--wrap=waitpid,--wrap=kill,--wrap=close,--wrap=dns_cache_save,--wrap=_exit,--wrap=strdup,--wrap=pthread_create
+LDFLAGS += -Wl,--wrap=time,--wrap=fork,--wrap=waitpid,--wrap=kill,--wrap=close,--wrap=dns_cache_save,--wrap=_exit,--wrap=strdup,--wrap=pthread_create,--wrap=epoll_create1,--wrap=eventfd,--wrap=pthread_join
 
 .PHONY: all clean test $(SMARTDNS_TEST_LIB)
 

@@ -1,0 +1,407 @@
+[
+  {
+    "name": "ui-statistics",
+    "branch": "fix/ui-statistics",
+    "sha": "a39ff4d3680c226b5ddc02c2e8d83f912be2ebfe",
+    "title": "fix(ui): accumulate dropped requests and expire historical statistics",
+    "items": [
+      1,
+      2
+    ],
+    "test_filter": "data_stats::regression_tests",
+    "paths": [
+      "plugin/smartdns-ui/src/data_stats.rs"
+    ],
+    "pr": 2486,
+    "previous_head": "d72ab946acdaaf84cba96d5296a77334bdfc1f35",
+    "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
+    "tree": "47683f29706d42d35e3eeb8b7eac5828027c25b8",
+    "required_tests": [],
+    "required_failures": [],
+    "negative_filter": "data_stats::regression_tests"
+  },
+  {
+    "name": "config-context",
+    "branch": "fix/config-context",
+    "sha": "05c989d93cb652154b432a53e91e9c347c9730cf",
+    "title": "fix(config): restore directive source context on every exit",
+    "items": [
+      3
+    ],
+    "test_filter": "LibConf.*",
+    "paths": [
+      "src/lib/conf.c",
+      "test/cases/test-lib-conf.cc"
+    ],
+    "pr": 2487,
+    "previous_head": "1b950ce74dc8fc0aa5fd6eea082194c00396a9bb",
+    "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
+    "tree": "75663bfa7e44db5e71db1e8f6378854ec3ee2b3c",
+    "required_tests": [
+      "LibConf.CallbackAndHandlerFailuresRetainOwnedTopContext",
+      "LibConf.CompletedThreadDoesNotLeaveBorrowedFilename",
+      "LibConf.DefaultTlsCertificatesStayBesideTheTopConfiguration",
+      "LibConf.LoadDoesNotKeepPreviousFile",
+      "LibConf.NestedIncludeRestoresOuterFilenameAndLineOnSuccessAndFailure",
+      "LibConf.TooLongTopPathDoesNotOverwriteOwnedContext",
+      "LibConf.UnknownChildDirectiveRestoresParentLocation"
+    ],
+    "required_failures": [
+      "LibConf.CompletedThreadDoesNotLeaveBorrowedFilename",
+      "LibConf.UnknownChildDirectiveRestoresParentLocation"
+    ],
+    "negative_filter": "LibConf.CompletedThreadDoesNotLeaveBorrowedFilename:LibConf.UnknownChildDirectiveRestoresParentLocation"
+  },
+  {
+    "name": "cache-checkpoint",
+    "branch": "fix/cache-checkpoint",
+    "sha": "b81ba66e397ae37dd8730eae3b7f7c0814cd5fda",
+    "title": "fix(cache): defer periodic checkpoints while requests are active",
+    "items": [
+      4
+    ],
+    "test_filter": "CacheCheckpoint.*",
+    "paths": [
+      "src/dns_server/cache.c",
+      "test/Makefile",
+      "test/cases/test-cache-checkpoint.cc"
+    ],
+    "pr": 2488,
+    "previous_head": "39d93ec4ed0edee999df22aa59548dd62abe443c",
+    "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
+    "tree": "f4ba0d4eb9ae64c30402403d35a5d0fef05f88af",
+    "required_tests": [
+      "CacheCheckpoint.BusyServerDefersWithoutChangingCheckpointTime",
+      "CacheCheckpoint.ChildBranchClosesDescriptorsSavesAndExitsWithoutRealFork",
+      "CacheCheckpoint.CompletedChildReapedBeforeNextDueSave",
+      "CacheCheckpoint.DisabledAndNotDueNeverFork",
+      "CacheCheckpoint.DueIdleServerForksOneSaver",
+      "CacheCheckpoint.RunningChildPreventsDuplicateSaverAndHasBoundedKill"
+    ],
+    "required_failures": [
+      "CacheCheckpoint.DueIdleServerForksOneSaver",
+      "CacheCheckpoint.BusyServerDefersWithoutChangingCheckpointTime"
+    ],
+    "negative_filter": "CacheCheckpoint.*"
+  },
+  {
+    "name": "ping-startup",
+    "branch": "fix/ping-startup",
+    "sha": "05dab57c26b00c05affd14f2a554ad488d22b189",
+    "title": "fix(ping): publish probes before sending their first packet",
+    "items": [
+      5
+    ],
+    "test_filter": "Ping.*",
+    "paths": [
+      "src/dns_server/dualstack.c",
+      "src/fast_ping/fast_ping.c",
+      "test/cases/test-ping.cc"
+    ],
+    "pr": 2489,
+    "previous_head": "ee5df3c1722cf9f08e646411c979c3e91449a3c0",
+    "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
+    "tree": "8c50be5e0c8bbacec88c8c3953ff48cbf2409a9e",
+    "required_tests": [
+      "Ping.Ipv6ReadinessCallerRetainsItsStopReferenceAfterEarlyEnd",
+      "Ping.failed_start_rolls_back_registered_fake",
+      "Ping.fake_end_callback_stops_during_start",
+      "Ping.fake_first_reply_before_start_returns",
+      "Ping.fake_icmp",
+      "Ping.icmp",
+      "Ping.tcp",
+      "Ping.tcp_syn",
+      "Ping.tcp_syn_concurrent",
+      "Ping.tcp_syn_first_reply_before_start_returns",
+      "Ping.tcp_syn_v6",
+      "Ping.tcp_syn_v6_first_reply_before_start_returns"
+    ],
+    "required_failures": [
+      "Ping.fake_first_reply_before_start_returns"
+    ],
+    "negative_filter": "Ping.fake_first_reply_before_start_returns:Ping.fake_end_callback_stops_during_start"
+  },
+  {
+    "name": "hpack-state",
+    "branch": "fix/hpack-state",
+    "sha": "98ac249a3126454f8d0a13773c97e1a08f56c24d",
+    "title": "fix(http2): synchronize HPACK capacity changes and reject corrupted contexts",
+    "items": [
+      10,
+      11,
+      12
+    ],
+    "test_filter": "HeaderCompression.*:LIBHTTP2.*",
+    "paths": [
+      "src/http_parse/hpack.c",
+      "src/http_parse/hpack.h",
+      "src/http_parse/http2.c",
+      "test/Makefile",
+      "test/cases/test-hpack-state.cc",
+      "test/cases/test-lib-http2.cc"
+    ],
+    "previous_sha": "fc74bf93ad792d4f4c10d1b873b1a2b16d69bb6c",
+    "pr": 2490,
+    "previous_head": "a206a526c89d82d6561a53348a9b1bd06c8b1211",
+    "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
+    "tree": "4c1ae60d1292fc695c498bab669f05b0dd32a21d",
+    "required_tests": [
+      "HeaderCompression.DynamicInsertionFailureIsNotReportedAsSuccess",
+      "HeaderCompression.EncoderSettingsShrinkAndGrowSynchronizeNextHeaderBlock",
+      "LIBHTTP2.ContinuationWithoutHeadersFailsProtocol",
+      "LIBHTTP2.DataAfterEndStreamFailsProtocol",
+      "LIBHTTP2.DataAfterLocallyClosedStreamDoesNotFailConnection",
+      "LIBHTTP2.DataOnIdleStreamFailsProtocol",
+      "LIBHTTP2.DisconnectStopsAllBioCalls",
+      "LIBHTTP2.EarlyStreamCreation",
+      "LIBHTTP2.FullyReadEndedRequestIsNotReportedReadableAgain",
+      "LIBHTTP2.HeadersInterruptedByDataFailsProtocol",
+      "LIBHTTP2.HpackDecodeIndexedDynamicNameSurvivesEviction",
+      "LIBHTTP2.HpackDecodesHuffmanString",
+      "LIBHTTP2.HpackDynamicTableSharedAcrossInterleavedStreams",
+      "LIBHTTP2.HpackDynamicTableSizeUpdateMustPrecedeHeaders",
+      "LIBHTTP2.HpackMultipleInitialSizeUpdatesRefreshTable",
+      "LIBHTTP2.HpackRejectsDynamicTableSizeAboveLimit",
+      "LIBHTTP2.HpackRejectsInvalidHuffmanPadding",
+      "LIBHTTP2.HpackRejectsOverflowingHuffmanStringLength",
+      "LIBHTTP2.HpackRejectsOverflowingLiteralStringLength",
+      "LIBHTTP2.HpackResizeEvictsDynamicEntriesBeforeReuse",
+      "LIBHTTP2.HpackShrunkTableRejectsEvictedDynamicIndex",
+      "LIBHTTP2.Integrated",
+      "LIBHTTP2.InvalidCompressedEndedRequestIsNotReportedReadableAgain",
+      "LIBHTTP2.InvalidPingLengthFailsProtocol",
+      "LIBHTTP2.MultiStream",
+      "LIBHTTP2.OversizedDecoderTableClosesTheConnectionWithCompressionError",
+      "LIBHTTP2.PeerMaxConcurrentStreamsDoesNotOverrideServerInboundLimit",
+      "LIBHTTP2.PeerMaxConcurrentStreamsLimitsLocallyInitiatedStreams",
+      "LIBHTTP2.PollReturnsResponseBeforeGoawayEof",
+      "LIBHTTP2.ReferenceCountingContextError",
+      "LIBHTTP2.ReferenceCountingNormal",
+      "LIBHTTP2.RefusedHeadersStillUpdateHpackDecoder",
+      "LIBHTTP2.RequestHostHeaderOverridesAuthority",
+      "LIBHTTP2.ResponseDataFragmentsKeepStreamOpenUntilEndStream",
+      "LIBHTTP2.ResponseEndStreamBeforeContentLengthResetsStreamOnly",
+      "LIBHTTP2.ResponseHeadersContinuation",
+      "LIBHTTP2.RstStreamOnConnectionStreamFailsProtocol",
+      "LIBHTTP2.ServerLoopTerminationOnDisconnect",
+      "LIBHTTP2.ServerRejectsEnablePushSetting",
+      "LIBHTTP2.SettingsAckWithPayloadFailsProtocol",
+      "LIBHTTP2.SettingsEnablePushInvalidValueFailsProtocol",
+      "LIBHTTP2.SettingsHeaderTableSizeEvictsResponseEncoderEntries",
+      "LIBHTTP2.SettingsMaxHeaderListSizeLimitsResponseHeaders",
+      "LIBHTTP2.SettingsOnNonZeroStreamFailsProtocol",
+      "LIBHTTP2.StreamClose",
+      "LIBHTTP2.StreamNewAfterGoawayFails",
+      "LIBHTTP2.StressTest",
+      "LIBHTTP2.UnsupportedContentEncodingReadsRawBody",
+      "LIBHTTP2.WindowUpdateZeroIncrementFailsProtocol",
+      "LIBHTTP2.WriteBodyReturnsPayloadLengthForMultiFrameBody"
+    ],
+    "required_failures": [
+      "LIBHTTP2.SettingsHeaderTableSizeEvictsResponseEncoderEntries"
+    ],
+    "negative_filter": "LIBHTTP2.SettingsHeaderTableSizeEvictsResponseEncoderEntries:LIBHTTP2.OversizedDecoderTableClosesTheConnectionWithCompressionError:LIBHTTP2.SettingsMaxHeaderListSizeLimitsResponseHeaders"
+  },
+  {
+    "name": "qpack-decoding",
+    "branch": "fix/qpack-decoding",
+    "sha": "a4094e32aee8b6d2fa2069a9028ea0909c8b0b8a",
+    "title": "fix(http3): validate QPACK literals, indices and Huffman padding",
+    "items": [
+      13,
+      14,
+      15
+    ],
+    "test_filter": "HeaderCompression.*",
+    "paths": [
+      "src/http_parse/http3_parse.c",
+      "src/http_parse/qpack.c",
+      "test/cases/test-qpack-decoding.cc"
+    ],
+    "pr": 2491,
+    "previous_head": "4c33dec29f944e7068d74f7c3aa6fd77147a64bf",
+    "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
+    "tree": "845400692df72762846f033bc9c7a8c1b28012f9",
+    "required_tests": [
+      "HeaderCompression.BothHuffmanDecodersRejectEosAndInvalidPadding",
+      "HeaderCompression.EveryOctetUsesTheSameCompleteRfcHuffmanCode",
+      "HeaderCompression.QpackIntegersCannotWrapToValidStaticIndices",
+      "HeaderCompression.QpackLiteralNameAndValueHaveIndependentHuffmanFlags",
+      "HeaderCompression.QpackStaticIndicesNeverNarrowFromLargeIntegers",
+      "HeaderCompression.StaticOnlyQpackAllowsPositiveMultibyteBase"
+    ],
+    "required_failures": [
+      "HeaderCompression.QpackLiteralNameAndValueHaveIndependentHuffmanFlags"
+    ],
+    "negative_filter": "HeaderCompression.*"
+  },
+  {
+    "name": "thread-startup",
+    "branch": "fix/thread-startup",
+    "sha": "859c9de73da7c3168af401a8b0ab430809aa4ca2",
+    "title": "fix: use default thread attributes and report pthread creation errors",
+    "items": [
+      16
+    ],
+    "test_filter": "ThreadStartup.*",
+    "paths": [
+      "src/dns_client/dns_client.c",
+      "src/fast_ping/fast_ping.c",
+      "src/tlog.c",
+      "test/Makefile",
+      "test/cases/test-server.cc",
+      "test/cases/test-thread-startup.cc"
+    ],
+    "previous_sha": "27f9777917d4b27af2f61c50e2bceb92e8be1579",
+    "pr": 2492,
+    "previous_head": "fe531eb607efb398fbab80874cf345a76fd7ec74",
+    "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
+    "tree": "527035701c91802a26c34d917d8d853cf3e05cc5",
+    "required_tests": [
+      "ThreadStartup.ClientEpollFailureCanRetry",
+      "ThreadStartup.ClientThreadFailureCanRetryWithoutLeakingGroups",
+      "ThreadStartup.ClientWakeupFailureJoinsWorkerAndCanRetry",
+      "ThreadStartup.LoggerReportsPthreadErrorInsteadOfUnrelatedErrno",
+      "ThreadStartup.PingThreadFailureUsesDefaultAttributesAndCanRetry"
+    ],
+    "required_failures": [
+      "ThreadStartup.LoggerReportsPthreadErrorInsteadOfUnrelatedErrno",
+      "ThreadStartup.ClientThreadFailureCanRetryWithoutLeakingGroups"
+    ],
+    "negative_filter": "ThreadStartup.LoggerReportsPthreadErrorInsteadOfUnrelatedErrno:ThreadStartup.ClientThreadFailureCanRetryWithoutLeakingGroups"
+  },
+  {
+    "name": "http2-cancellation",
+    "branch": "fix/http2-cancellation",
+    "sha": "8987a134572e1abde85ea63c2e7242cc21902de9",
+    "title": "fix(http2): cancel abandoned streams without flushing pending bodies",
+    "items": [
+      26
+    ],
+    "paths": [
+      "src/dns_client/client_http2.c",
+      "src/dns_client/conn_stream.c",
+      "src/dns_client/conn_stream.h",
+      "src/dns_client/query.c",
+      "src/http_parse/http2.c",
+      "src/include/smartdns/http2.h",
+      "test/cases/test-http2-cancellation.cc",
+      "test/cases/test-http2.cc"
+    ],
+    "pr": 2493,
+    "previous_head": "b57a2e45c3804629d11bdec3f8f510bf48c62e1c",
+    "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
+    "tree": "a240b0bc364c9e21352cd00728133d29774c0b49",
+    "test_filter": "Http2Cancellation.*:HTTP2.CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit",
+    "required_tests": [
+      "HTTP2.CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit",
+      "Http2Cancellation.AbortDiscardsUnscheduledBodyAndReleasesCapacity",
+      "Http2Cancellation.CompletedResponseSurvivesFollowingNoErrorReset",
+      "Http2Cancellation.CompletedServerRequestStillHonorsPeerCancellation",
+      "Http2Cancellation.DetachedStreamHasExactlyOneClosingOwner",
+      "Http2Cancellation.IdleAbortDoesNotResetAnUnopenedStream",
+      "Http2Cancellation.NormalCloseStillFlushesAfterWindowUpdate",
+      "Http2Cancellation.QueryCancellationDetachesEndpointOwnership",
+      "Http2Cancellation.ReceivedResetDoesNotGenerateAnotherReset",
+      "Http2Cancellation.ResetIsDistinctFromFinishedBodyAndSurvivesContextTeardown"
+    ],
+    "required_failures": [
+      "HTTP2.CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit",
+      "Http2Cancellation.AbortDiscardsUnscheduledBodyAndReleasesCapacity"
+    ],
+    "negative_filter": "Http2Cancellation.*:HTTP2.CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit"
+  },
+  {
+    "name": "quic-http3-lifecycle",
+    "branch": "fix/quic-http3-lifecycle",
+    "sha": "170f2decc4669117382be789b6cb7a642cac5c31",
+    "title": "fix(quic): drive SDK readiness and handle HTTP/3 control streams",
+    "items": [
+      27,
+      28
+    ],
+    "paths": [
+      "src/dns_client/client_http3.c",
+      "src/dns_client/client_http3_control.c",
+      "src/dns_client/client_http3_control.h",
+      "src/dns_client/client_quic.c",
+      "src/dns_client/client_quic.h",
+      "src/dns_client/client_socket.c",
+      "src/dns_client/dns_client.c",
+      "src/dns_client/dns_client.h",
+      "src/http_parse/http3_parse.c",
+      "src/include/smartdns/http_parse.h",
+      "test/Makefile",
+      "test/cases/test-http3-control.cc",
+      "test/cases/test-quic-end-to-end.cc",
+      "test/cases/test-quic-lifecycle.cc"
+    ],
+    "pr": 2494,
+    "previous_head": "af6f2a6dcf725cd40157e37a08c535cc9e3cdaf5",
+    "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
+    "tree": "cfd8eba6cc2bb2b54151696eba56ab77e9eb5984",
+    "test_filter": "Http3Control.*:Http3RequestFraming.*:QuicLifecycle.*:QuicEndToEnd.*",
+    "required_tests": [
+      "Http3Control.DecoderCancellationUsesOnlyQuicStreamIdentifiers",
+      "Http3Control.DuplicateCriticalStreamsAndPushRejected",
+      "Http3Control.GoawayStopsNewAndMustNotIncrease",
+      "Http3Control.MissingRepeatedAndDuplicateUnknownSettingsFail",
+      "Http3Control.SettingsAtEverySplitAndLegalNonminimalVarints",
+      "Http3Control.StaticEncoderAcceptsOnlyLegalDecoderCancellation",
+      "Http3Control.UnknownFramesSkipIncrementally",
+      "Http3Control.ZeroCapacityRejectsEveryEncoderInstruction",
+      "Http3RequestFraming.RejectSettingsOnRequestStream",
+      "QuicEndToEnd.HttpsHttp3QueryRequiresClientSettingsAndReusesTheConnection",
+      "QuicEndToEnd.ValidDoqAnswerIsNotDeliveredUntilFin",
+      "QuicLifecycle.CallbackCanCancelAnotherStreamInTheSameSnapshot",
+      "QuicLifecycle.CompleteDoqPayloadWaitsForNormalFin",
+      "QuicLifecycle.CriticalControlFinIsAConnectionError",
+      "QuicLifecycle.DrainedGoawayRetiresTheConnectionForRetry",
+      "QuicLifecycle.FragmentedPeerControlAndGoawayDrainStartedRequests",
+      "QuicLifecycle.FragmentedUnknownTypesAreProcessedBeforeAcceptingMoreStreams",
+      "QuicLifecycle.HardReadErrorRetiresTheStream",
+      "QuicLifecycle.LocalControlStartsWithSettingsAndRemainsOpen",
+      "QuicLifecycle.PartialControlPrefixDoesNotStayReady",
+      "QuicLifecycle.ResetIsProcessedWithoutKernelReadability",
+      "QuicLifecycle.StopSendingAloneRetiresTheWriteSide",
+      "QuicLifecycle.UnexpectedBidirectionalStreamStillFailsWithFullControlSlots",
+      "QuicLifecycle.UnknownStreamsDoNotRejectTheNextControlBatch"
+    ],
+    "required_failures": [
+      "QuicEndToEnd.HttpsHttp3QueryRequiresClientSettingsAndReusesTheConnection",
+      "QuicEndToEnd.ValidDoqAnswerIsNotDeliveredUntilFin"
+    ],
+    "negative_filter": "QuicEndToEnd.*:QuicLifecycle.ResetIsProcessedWithoutKernelReadability:QuicLifecycle.CompleteDoqPayloadWaitsForNormalFin"
+  },
+  {
+    "name": "cache-persisted-metadata",
+    "branch": "fix/cache-persisted-metadata",
+    "sha": "a5985d9d14208f0e29c255c5cdfd621ce4addc7d",
+    "test_filter": "Cache.*Persisted*:Cache.BrokenRecordFramingStopsBeforeUntrustedPayload:Cache.ValidLargeTtl*:Cache.FuturePersisted*:Cache.TtlConsumers*",
+    "pr": 2495,
+    "previous_head": "67deb37925846d87c3b5c058e1d06e8a7e7507bd",
+    "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
+    "tree": "58c1e0c6396ba1bf8350b3980bbec590ba347439",
+    "paths": [
+      "src/dns_cache.c",
+      "src/dns_server/cache.c",
+      "test/cases/test-cache.cc"
+    ],
+    "required_tests": [
+      "Cache.BrokenRecordFramingStopsBeforeUntrustedPayload",
+      "Cache.FuturePersistedTimesAreDiscardedWithoutRenewingTtl",
+      "Cache.InvalidPersistedRecordDoesNotDiscardValidNeighbors",
+      "Cache.PersistedExpiryHonorsServeExpiredWindow",
+      "Cache.TtlConsumersDoNotOverflowAtRepresentableLimits",
+      "Cache.ValidLargeTtlSurvivesPrefetchPersistenceAndOfflineReload",
+      "Cache.ValidPersistedCounterBoundsDoNotResetRecordTimes"
+    ],
+    "required_failures": [
+      "Cache.ValidLargeTtlSurvivesPrefetchPersistenceAndOfflineReload",
+      "Cache.InvalidPersistedRecordDoesNotDiscardValidNeighbors",
+      "Cache.FuturePersistedTimesAreDiscardedWithoutRenewingTtl",
+      "Cache.PersistedExpiryHonorsServeExpiredWindow"
+    ],
+    "negative_filter": "Cache.ValidLargeTtlSurvivesPrefetchPersistenceAndOfflineReload:Cache.InvalidPersistedRecordDoesNotDiscardValidNeighbors:Cache.FuturePersistedTimesAreDiscardedWithoutRenewingTtl:Cache.PersistedExpiryHonorsServeExpiredWindow"
+  }
+]

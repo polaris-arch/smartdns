@@ -736,12 +736,6 @@ int dns_client_init(void)
 	atomic_set(&client.dns_server_prohibit_num, 0);
 	atomic_set(&client.run_period, 0);
 
-	epollfd = epoll_create1(EPOLL_CLOEXEC);
-	if (epollfd < 0) {
-		tlog(TLOG_ERROR, "create epoll failed, %s\n", strerror(errno));
-		goto errout;
-	}
-
 	pthread_mutex_init(&client.server_list_lock, NULL);
 	INIT_LIST_HEAD(&client.dns_server_list);
 
@@ -749,6 +743,11 @@ int dns_client_init(void)
 	hash_init(client.domain_map);
 	hash_init(client.group);
 	INIT_LIST_HEAD(&client.dns_request_list);
+	epollfd = epoll_create1(EPOLL_CLOEXEC);
+	if (epollfd < 0) {
+		tlog(TLOG_ERROR, "create epoll failed, %s\n", strerror(errno));
+		goto errout;
+	}
 
 	if (dns_client_add_group(DNS_SERVER_GROUP_DEFAULT) != 0) {
 		tlog(TLOG_ERROR, "add default server group failed.");
@@ -767,6 +766,7 @@ int dns_client_init(void)
 	/* start work task */
 	ret = pthread_create(&client.tid, NULL, _dns_client_work, NULL);
 	if (ret != 0) {
+		client.tid = 0;
 		tlog(TLOG_ERROR, "create client work thread failed, %s\n", strerror(ret));
 		goto errout;
 	}
@@ -782,23 +782,30 @@ int dns_client_init(void)
 
 	return 0;
 errout:
+	atomic_set(&client.run, 0);
 	if (client.tid) {
 		void *retval = NULL;
-		atomic_set(&client.run, 0);
 		pthread_join(client.tid, &retval);
 		client.tid = 0;
+		epollfd = -1; /* The worker closes its epoll descriptor before returning. */
 	}
+	_dns_client_remove_all_pending_servers();
+	_dns_client_server_remove_all();
+	_dns_client_group_remove_all();
 
-	if (epollfd > 0) {
+	if (epollfd >= 0) {
 		close(epollfd);
 	}
 
-	if (fd_wakeup > 0) {
+	if (fd_wakeup >= 0) {
 		close(fd_wakeup);
 	}
 
 	pthread_mutex_destroy(&client.server_list_lock);
 	pthread_mutex_destroy(&client.domain_map_lock);
+	client.epoll_fd = -1;
+	client.fd_wakeup = -1;
+	client.default_group = NULL;
 
 	return -1;
 }

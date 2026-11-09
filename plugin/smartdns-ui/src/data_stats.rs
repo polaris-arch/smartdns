@@ -558,7 +558,7 @@ mod regression_tests {
         data.add_request_drop(u64::MAX);
         data.add_request_drop(1);
         assert_eq!(data.get_request_drop(), u64::MAX);
-        // Exercise the actual 32-bit fallback algorithm on atomic-64 hosts too.
+        // Exercise the mutex fallback algorithm on atomic-64 hosts too.
         let fallback = Mutex::new(0);
         add_locked_drop_count(&fallback, 3);
         add_locked_drop_count(&fallback, 7);
