@@ -74,3 +74,4 @@ clean:
 	$(MAKE) -C $(SMARTDNS_SRC_DIR) clean
 
 LDFLAGS += -Wl,--wrap=_dns_client_socket_ssl_recv_ext,--wrap=_dns_client_recv
+LDFLAGS += -Wl,--wrap=http2_stream_set_ex_data

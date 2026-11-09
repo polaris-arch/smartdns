@@ -4,6 +4,9 @@
 #include "smartdns/http2.h"
 #include "smartdns/util.h"
 #include "gtest/gtest.h"
+#include "dns_client/dns_client.h"
+#undef min
+#undef max
 #include <arpa/inet.h>
 #include <algorithm>
 #include <atomic>
@@ -27,6 +30,20 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+
+namespace {
+std::atomic<bool> observe_h2_publication{false};
+std::atomic<int> h2_publications{0}, h2_external_publications{0};
+}
+extern "C" void __real_http2_stream_set_ex_data(http2_stream *, void *);
+extern "C" void __wrap_http2_stream_set_ex_data(http2_stream *stream, void *data)
+{
+    if (data && observe_h2_publication.load()) {
+        h2_publications++;
+        if (!pthread_equal(pthread_self(), client.tid)) h2_external_publications++;
+    }
+    __real_http2_stream_set_ex_data(stream, data);
+}
 
 namespace
 {
@@ -478,6 +495,32 @@ class LimitedHTTP2DoHUpstream
 	std::string last_error_;
 };
 
+TEST(HTTP2, ConnectedDohRequestsPublishOwnershipOnTheClientWorker)
+{
+    LimitedHTTP2DoHUpstream upstream;
+    ASSERT_TRUE(upstream.Start(63054, 8, "192.0.2.19")) << upstream.LastError();
+    smartdns::Server server(smartdns::Server::CREATE_MODE_THREAD);
+    ASSERT_TRUE(server.Start(R"(bind 127.0.0.1:60053
+server https://127.0.0.1:63054/dns-query -no-check-certificate -alpn h2
+cache-size 0
+speed-check-mode none
+dualstack-ip-selection no
+)"));
+    h2_publications = h2_external_publications = 0;
+    observe_h2_publication = true;
+    Defer { observe_h2_publication = false; };
+    // First connection and already-connected sends exercise both old entry paths.
+    for (const char *name : {"first.ownership.test", "second.ownership.test", "third.ownership.test"}) {
+        smartdns::Client query;
+        ASSERT_TRUE(query.Query(name, 60053));
+        EXPECT_EQ(query.GetStatus(), "NOERROR");
+        ASSERT_EQ(query.GetAnswerNum(), 1);
+        EXPECT_EQ(query.GetAnswer()[0].GetData(), "192.0.2.19");
+    }
+    EXPECT_EQ(h2_publications.load(), 3);
+    EXPECT_EQ(h2_external_publications.load(), 0);
+}
+
 TEST(HTTP2, CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit)
 {
     auto wait = [](const std::function<bool()> &ready, int milliseconds = 3000) {
@@ -510,9 +553,9 @@ dualstack-ip-selection no
     EXPECT_EQ(client.GetAnswer()[0].GetData(), "192.0.2.20");
     EXPECT_EQ(h2.BodyBytes(), 0);
     // The ordinary query retry/end path must retire the unfinished H2 request.
-    EXPECT_TRUE(wait([&] { return h2.ResetCount() == 1; }));
     h2.ReleaseWindow();
     ASSERT_TRUE(wait([&] { return h2.WindowRestored(); }));
+    EXPECT_TRUE(wait([&] { return h2.ResetCount() == 1; }));
     EXPECT_FALSE(wait([&] { return h2.BodyBytes() != 0; }, 500));
     ASSERT_TRUE(client.Query("replacement.h2.test +time=4 +tries=1", 60053));
     EXPECT_EQ(client.GetStatus(), "NOERROR");

@@ -105,16 +105,10 @@ impl DataStatsItem {
         {
             // Observational counter only: saturation prevents a full counter wrapping
             // back to a misleading zero. Match the non-atomic implementation.
-            let mut value = self.request_dropped.load(Ordering::Relaxed);
-            loop {
-                match self.request_dropped.compare_exchange_weak(
-                    value, value.saturating_add(count),
-                    Ordering::Relaxed, Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(current) => value = current,
-                }
-            }
+            let _ = self.request_dropped.fetch_update(
+                Ordering::Relaxed, Ordering::Relaxed,
+                |value| Some(value.saturating_add(count)),
+            );
         }
 
         #[cfg(not(target_has_atomic = "64"))]

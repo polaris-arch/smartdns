@@ -85,11 +85,11 @@ def xml_check(path, candidate, negative=False):
 
 def ui_inverse(path):
     text = path.read_text()
-    start = text.index('            let mut value = self.request_dropped.load(Ordering::Relaxed);')
+    start = text.index('            let _ = self.request_dropped.fetch_update(')
     end = text.index('\n        }', start)
     text = text[:start] + '            self.request_dropped.fetch_and(count, Ordering::Relaxed);' + text[end:]
     assert text.count('*value = value.saturating_add(count);') == 1
-    text = text.replace('*value = value.saturating_add(count);', '*value &= count;')
+    text = text.replace('*value = value.saturating_add(count);', '*value += count;')
     for days in (30, 90):
         assert text.count(f'now.saturating_sub({days} * DAY_MS)') == 1
         text = text.replace(f'now.saturating_sub({days} * DAY_MS)', f'{days} * DAY_MS')

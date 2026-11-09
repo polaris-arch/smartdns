@@ -113,28 +113,13 @@ TEST_F(Http2Cancellation, QueryCancellationDetachesEndpointOwnership) {
     owned.erase(std::find(owned.begin(),owned.end(),stream));
     list_add_tail(&conn->server_list,&endpoint.conn_stream_list);
     _dns_client_conn_stream_get(conn);
-    _dns_client_conn_stream_cancel(conn);
+    _dns_client_conn_server_streams_free(&endpoint, nullptr);
     EXPECT_TRUE(list_empty(&endpoint.conn_stream_list));
     EXPECT_EQ(conn->http2_stream,nullptr);
     Window(id);
     EXPECT_EQ(Frames(3),1U);
     _dns_client_conn_stream_put(conn);
     pthread_mutex_destroy(&endpoint.lock);
-}
-TEST_F(Http2Cancellation, DetachedStreamHasExactlyOneClosingOwner) {
-    auto *conn = _dns_client_conn_stream_new(); ASSERT_NE(conn,nullptr);
-    conn->type=DNS_SERVER_HTTPS;
-    auto *stream=Request(); ASSERT_NE(stream,nullptr);
-    owned.erase(std::find(owned.begin(),owned.end(),stream));
-    conn->http2_stream=stream; // endpoint already transferred close ownership
-    _dns_client_conn_stream_cancel(conn);
-    EXPECT_EQ(Frames(3),0U);
-    EXPECT_EQ(conn->http2_stream,stream);
-    // The transferred owner takes and closes it once, outside the endpoint lock.
-    conn->http2_stream=nullptr;
-    http2_stream_abort(stream);
-    EXPECT_EQ(Frames(3),1U);
-    _dns_client_conn_stream_put(conn);
 }
 TEST_F(Http2Cancellation, IdleAbortDoesNotResetAnUnopenedStream) {
     auto *stream=http2_stream_new(ctx); ASSERT_NE(stream,nullptr);

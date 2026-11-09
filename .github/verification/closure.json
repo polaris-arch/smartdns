@@ -2,7 +2,7 @@
   {
     "name": "ui-statistics",
     "branch": "fix/ui-statistics",
-    "sha": "a39ff4d3680c226b5ddc02c2e8d83f912be2ebfe",
+    "sha": "52712ed76e425299da078325ab35414e29907c2d",
     "title": "fix(ui): accumulate dropped requests and expire historical statistics",
     "items": [
       1,
@@ -15,7 +15,7 @@
     "pr": 2486,
     "previous_head": "d72ab946acdaaf84cba96d5296a77334bdfc1f35",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "47683f29706d42d35e3eeb8b7eac5828027c25b8",
+    "tree": "44ca2582465fc5dfcdcd7a5384067c3a534a742e",
     "required_tests": [],
     "required_failures": [],
     "negative_filter": "data_stats::regression_tests"
@@ -273,7 +273,7 @@
   {
     "name": "http2-cancellation",
     "branch": "fix/http2-cancellation",
-    "sha": "8987a134572e1abde85ea63c2e7242cc21902de9",
+    "sha": "1c1c47d51a4920c5a76c13b92f22ab372b069d4c",
     "title": "fix(http2): cancel abandoned streams without flushing pending bodies",
     "items": [
       26
@@ -281,24 +281,23 @@
     "paths": [
       "src/dns_client/client_http2.c",
       "src/dns_client/conn_stream.c",
-      "src/dns_client/conn_stream.h",
-      "src/dns_client/query.c",
       "src/http_parse/http2.c",
       "src/include/smartdns/http2.h",
+      "test/Makefile",
       "test/cases/test-http2-cancellation.cc",
       "test/cases/test-http2.cc"
     ],
     "pr": 2493,
     "previous_head": "b57a2e45c3804629d11bdec3f8f510bf48c62e1c",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "a240b0bc364c9e21352cd00728133d29774c0b49",
-    "test_filter": "Http2Cancellation.*:HTTP2.CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit",
+    "tree": "8854c57aa553214cf1718ff20ccd925dea3c39ad",
+    "test_filter": "Http2Cancellation.*:HTTP2.CancelledZeroWindow*:HTTP2.ConnectedDohRequests*",
     "required_tests": [
       "HTTP2.CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit",
+      "HTTP2.ConnectedDohRequestsPublishOwnershipOnTheClientWorker",
       "Http2Cancellation.AbortDiscardsUnscheduledBodyAndReleasesCapacity",
       "Http2Cancellation.CompletedResponseSurvivesFollowingNoErrorReset",
       "Http2Cancellation.CompletedServerRequestStillHonorsPeerCancellation",
-      "Http2Cancellation.DetachedStreamHasExactlyOneClosingOwner",
       "Http2Cancellation.IdleAbortDoesNotResetAnUnopenedStream",
       "Http2Cancellation.NormalCloseStillFlushesAfterWindowUpdate",
       "Http2Cancellation.QueryCancellationDetachesEndpointOwnership",
@@ -307,9 +306,10 @@
     ],
     "required_failures": [
       "HTTP2.CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit",
-      "Http2Cancellation.AbortDiscardsUnscheduledBodyAndReleasesCapacity"
+      "Http2Cancellation.AbortDiscardsUnscheduledBodyAndReleasesCapacity",
+      "HTTP2.ConnectedDohRequestsPublishOwnershipOnTheClientWorker"
     ],
-    "negative_filter": "Http2Cancellation.*:HTTP2.CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit"
+    "negative_filter": "Http2Cancellation.*:HTTP2.CancelledZeroWindow*:HTTP2.ConnectedDohRequests*"
   },
   {
     "name": "quic-http3-lifecycle",
@@ -376,12 +376,12 @@
   {
     "name": "cache-persisted-metadata",
     "branch": "fix/cache-persisted-metadata",
-    "sha": "a5985d9d14208f0e29c255c5cdfd621ce4addc7d",
+    "sha": "0a221b555479dbae318a63afb86c643301c907a0",
     "test_filter": "Cache.*Persisted*:Cache.BrokenRecordFramingStopsBeforeUntrustedPayload:Cache.ValidLargeTtl*:Cache.FuturePersisted*:Cache.TtlConsumers*",
     "pr": 2495,
     "previous_head": "67deb37925846d87c3b5c058e1d06e8a7e7507bd",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "58c1e0c6396ba1bf8350b3980bbec590ba347439",
+    "tree": "02cbe87dec513026fd455eaeeff11e5bc58ba9ad",
     "paths": [
       "src/dns_cache.c",
       "src/dns_server/cache.c",

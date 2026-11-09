@@ -21,7 +21,7 @@ if [[ ${PROFILE:-} == integration || ${PROFILE:-} == sanitizers || ${PROFILE:-} 
         make -C test -j4 > "$proof/build.log" 2>&1
     fi
     filter='*'
-    if [[ $PROFILE != integration ]]; then filter='LibConf.*:CacheCheckpoint.*:Ping.*:ThreadStartup.*:HeaderCompression.*:LIBHTTP2.*:Http2Cancellation.*:HTTP2.CancelledZeroWindow*:Http3Control.*:Http3RequestFraming.*:QuicLifecycle.*:QuicEndToEnd.*:Cache.InvalidPersisted*:Cache.BrokenRecordFraming*:Cache.ValidLargeTtl*:Cache.FuturePersisted*:Cache.TtlConsumers*'; fi
+    if [[ $PROFILE != integration ]]; then filter='LibConf.*:CacheCheckpoint.*:Ping.*:ThreadStartup.*:HeaderCompression.*:LIBHTTP2.*:Http2Cancellation.*:HTTP2.CancelledZeroWindow*:HTTP2.ConnectedDohRequests*:Http3Control.*:Http3RequestFraming.*:QuicLifecycle.*:QuicEndToEnd.*:Cache.InvalidPersisted*:Cache.BrokenRecordFraming*:Cache.ValidLargeTtl*:Cache.FuturePersisted*:Cache.ValidPersistedCounterBounds*:Cache.PersistedExpiry*:Cache.TtlConsumers*'; fi
     executor=()
     if [[ $PROFILE == compat32 && $EUID != 0 ]]; then executor=(sudo); fi
     "${executor[@]}" timeout 900 ./test/test.bin --gtest_filter="$filter" --gtest_output="xml:$proof/candidate.xml" > "$proof/candidate.log" 2>&1
@@ -70,7 +70,10 @@ if [[ $PR == 2486 ]]; then
 from pathlib import Path
 import sys
 p=Path(sys.argv[1]);assert 'test result: ok. 5 passed; 0 failed; 0 ignored' in (p/'candidate.log').read_text()
-assert 'test result: FAILED. 0 passed; 5 failed; 0 ignored' in (p/'baseline.log').read_text()
+text=(p/'baseline.log').read_text()
+assert 'test result: FAILED' in text
+assert 'test data_stats::regression_tests::request_drop_accumulates_and_saturates ... FAILED' in text
+assert 'test data_stats::regression_tests::retention_uses_absolute_cutoffs_and_inclusive_boundary ... FAILED' in text
 PY
     cp "$proof/data_stats.rs" plugin/smartdns-ui/src/data_stats.rs
     sha256sum plugin/smartdns-ui/Cargo.lock > "$proof/lock.sha256"

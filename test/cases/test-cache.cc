@@ -870,9 +870,22 @@ TEST_F(Cache, PersistedExpiryHonorsServeExpiredWindow)
         record.info.insert_time = record.info.replace_time = time(nullptr) - test.age;
         memcpy(changed.data() + records[0].offset, &record, sizeof(record));
         ASSERT_TRUE(write_cache_bytes(file, changed));
-        smartdns::Server server;
+        time_t before_load = time(nullptr);
+        smartdns::Server server(smartdns::Server::CREATE_MODE_THREAD);
         auto reload = conf + (test.serve ? "serve-expired yes\nserve-expired-ttl 120\n" : "");
         ASSERT_TRUE(server.Start(reload));
+        dns_cache_key key{record.info.domain, record.info.qtype, record.info.dns_group_name, record.info.query_flag};
+        auto *loaded = dns_cache_lookup(&key);
+        if (test.retain) {
+            ASSERT_NE(loaded, nullptr);
+            // Observe the scheduled timer, not the original persisted timeout field.
+            EXPECT_GT(loaded->timer.expires, static_cast<unsigned long>(time(nullptr)));
+            EXPECT_LE(loaded->timer.expires, static_cast<unsigned long>(before_load +
+                600 + (test.serve ? 120 : 0) - test.age));
+        } else {
+            EXPECT_EQ(loaded, nullptr);
+        }
+        dns_cache_release(loaded);
         if (test.retain) {
             smartdns::Client client;
             ASSERT_TRUE(client.Query("expiry.metadata.test", 60053));
@@ -883,7 +896,7 @@ TEST_F(Cache, PersistedExpiryHonorsServeExpiredWindow)
         ASSERT_EQ(retained.size(), test.retain ? 1U : 0U);
         if (test.retain) {
             EXPECT_EQ(retained[0].record.info.insert_time, record.info.insert_time);
-            EXPECT_LE(retained[0].record.info.timeout, 600 + (test.serve ? 120 : 0) - test.age);
+            EXPECT_EQ(retained[0].record.info.timeout, record.info.timeout);
         }
     }
 }
