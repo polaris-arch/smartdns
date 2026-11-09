@@ -124,7 +124,7 @@
   {
     "name": "hpack-state",
     "branch": "fix/hpack-state",
-    "sha": "4269980d7489a5d215a8f9af1c7fcff67447eee4",
+    "sha": "b55f35ffeb8220ba454468f322612f3d7113dae1",
     "title": "fix(http2): synchronize HPACK capacity changes and reject corrupted contexts",
     "items": [
       10,
@@ -142,9 +142,9 @@
     ],
     "previous_sha": "fc74bf93ad792d4f4c10d1b873b1a2b16d69bb6c",
     "pr": 2490,
-    "previous_head": "a206a526c89d82d6561a53348a9b1bd06c8b1211",
+    "previous_head": "4269980d7489a5d215a8f9af1c7fcff67447eee4",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "4385bbd1c34de16abe3054730ea68b1bf90043ed",
+    "tree": "8dd3874148fed7558bc7483f97b3eb3b80f6e232",
     "required_tests": [
       "HeaderCompression.DynamicInsertionFailureIsNotReportedAsSuccess",
       "HeaderCompression.EncoderSettingsShrinkAndGrowSynchronizeNextHeaderBlock",

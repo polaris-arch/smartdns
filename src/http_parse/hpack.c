@@ -609,7 +609,7 @@ void hpack_init_context(struct hpack_context *hpack)
 	hpack->max_dynamic_table_size = 65536; /* Default size */
 	hpack->entry_count = 0;
 	hpack->pending_size_update = 0;
-	hpack->pending_min_size = hpack->pending_final_size = 0;
+	hpack->pending_min_size = 0;
 }
 
 void hpack_free_context(struct hpack_context *hpack)
@@ -833,7 +833,6 @@ void hpack_set_encoder_table_size(struct hpack_context *hpack, size_t new_size)
 	if (new_size == hpack->max_dynamic_table_size) return;
 	if (!hpack->pending_size_update || new_size < hpack->pending_min_size)
 		hpack->pending_min_size = new_size;
-	hpack->pending_final_size = new_size;
 	hpack->pending_size_update = 1;
 	hpack_resize_dynamic_table(hpack, new_size);
 }
@@ -842,7 +841,7 @@ int hpack_encode_header(struct hpack_context *hpack, const char *name, const cha
 {
 	int offset = 0;
 	if (hpack->pending_size_update) {
-		size_t sizes[] = {hpack->pending_min_size, hpack->pending_final_size};
+		size_t sizes[] = {hpack->pending_min_size, hpack->max_dynamic_table_size};
 		int count = sizes[0] == sizes[1] ? 1 : 2;
 		for (int i = 0; i < count; i++) {
 			if (offset >= buf_size) return -1;
