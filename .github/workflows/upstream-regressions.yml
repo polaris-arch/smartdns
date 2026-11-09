@@ -68,7 +68,7 @@ jobs:
       - run: |
           sudo apt-get update -qq
           sudo apt-get install -y libclang-dev libssl-dev libgtest-dev dnsutils zlib1g-dev
-          PR=2486 PROOF="$RUNNER_TEMP/evidence" bash .github/verification/closure.sh
+          PR=2486 UI_COMBINED=1 PROOF="$RUNNER_TEMP/evidence" bash .github/verification/closure.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:

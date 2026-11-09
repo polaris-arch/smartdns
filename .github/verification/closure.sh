@@ -46,6 +46,11 @@ t=next(t for t in json.load(open(sys.argv[1])) if t['pr']==int(sys.argv[2]))
 for key,value in [('CANDIDATE',t['sha']),('BASE',t['base']),('FILTER',t['test_filter']),('NEGATIVE_FILTER',t.get('negative_filter',t['test_filter']))]:print(key+'='+shlex.quote(str(value)))
 PY
 )"
+if [[ $PR == 2486 && ( -n ${CARGO_BUILD_TARGET:-} || ${UI_COMBINED:-0} == 1 ) ]]; then
+    CANDIDATE=$(git rev-parse HEAD)
+    printf '%s\n' 'combined-UI: UI statistics plus cache native-time ABI compatibility; isolated UI-statistics evidence remains bound to its unchanged topic SHA' > "$proof/source-scope.txt"
+    cp "$manifest" "$proof/component-candidates.json"
+fi
 root=/tmp/closure-candidate
 git worktree add --detach "$root" "$CANDIDATE"
 git rev-parse "$CANDIDATE" "$CANDIDATE^{tree}" "$BASE" > "$proof/source.txt"
@@ -60,6 +65,14 @@ if [[ $PR == 2486 ]]; then
     cp plugin/smartdns-ui/src/data_stats.rs "$proof/data_stats.rs"
     (cd plugin/smartdns-ui && cargo test --locked --lib "$FILTER" -- --test-threads=1) > "$proof/candidate.log" 2>&1
     (cd plugin/smartdns-ui && cargo test --locked --lib -- --test-threads=1) > "$proof/full-library.log" 2>&1
+    if [[ ${UI_COMBINED:-0} == 1 || -n ${CARGO_BUILD_TARGET:-} ]]; then
+        python3 - "$proof/full-library.log" <<'PY'
+import sys
+text=open(sys.argv[1]).read()
+assert 'test smartdns::tests::cache_callback_preserves_native_timestamp_width ... ok' in text
+assert 'test result: ok. 7 passed; 0 failed; 0 ignored' in text
+PY
+    fi
     python3 "$driver" inverse-ui plugin/smartdns-ui/src/data_stats.rs
     set +e
     (cd plugin/smartdns-ui && cargo test --locked --lib "$FILTER" -- --test-threads=1) > "$proof/baseline.log" 2>&1

@@ -318,7 +318,7 @@
   {
     "name": "quic-http3-lifecycle",
     "branch": "fix/quic-http3-lifecycle",
-    "sha": "8a60506f57347dfdf89d3fb60be8dea6045c48e2",
+    "sha": "bd2ee9736f72a6866bb880f3c693e57f91bd09f3",
     "title": "fix(quic): drive SDK readiness and handle HTTP/3 control streams",
     "items": [
       27,
@@ -343,12 +343,13 @@
     "pr": 2494,
     "previous_head": "af6f2a6dcf725cd40157e37a08c535cc9e3cdaf5",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "e510557cdd979d580e2c3df6875f1584b66b4b9b",
+    "tree": "578ecac54569ff161784759f92ac03dd0350eb37",
     "test_filter": "Http3Control.*:Http3RequestFraming.*:QuicLifecycle.*:QuicEndToEnd.*",
     "required_tests": [
       "Http3Control.DecoderCancellationUsesOnlyQuicStreamIdentifiers",
       "Http3Control.DuplicateCriticalStreamsAndPushRejected",
       "Http3Control.GoawayStopsNewAndMustNotIncrease",
+      "Http3Control.MaximumSettingsPayloadFitsWithLongestFrameHeader",
       "Http3Control.MissingRepeatedAndDuplicateUnknownSettingsFail",
       "Http3Control.SettingsAtEverySplitAndLegalNonminimalVarints",
       "Http3Control.StaticEncoderAcceptsOnlyLegalDecoderCancellation",
@@ -380,13 +381,14 @@
   {
     "name": "cache-persisted-metadata",
     "branch": "fix/cache-persisted-metadata",
-    "sha": "0a221b555479dbae318a63afb86c643301c907a0",
+    "sha": "5f9af8758aacefc3286c76c1d5fa263bf17fda05",
     "test_filter": "Cache.*Persisted*:Cache.BrokenRecordFramingStopsBeforeUntrustedPayload:Cache.ValidLargeTtl*:Cache.FuturePersisted*:Cache.TtlConsumers*",
     "pr": 2495,
     "previous_head": "67deb37925846d87c3b5c058e1d06e8a7e7507bd",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "02cbe87dec513026fd455eaeeff11e5bc58ba9ad",
+    "tree": "276da0588588845cf1c4731ab8822666d83bb75c",
     "paths": [
+      "plugin/smartdns-ui/src/smartdns.rs",
       "src/dns_cache.c",
       "src/dns_server/cache.c",
       "test/cases/test-cache.cc"

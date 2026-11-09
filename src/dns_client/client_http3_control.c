@@ -6,7 +6,8 @@
 #include <string.h>
 #if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
 #define H3_SLOTS 8
-#define H3_BUFFER 8192
+/* Maximum accepted SETTINGS payload plus two eight-byte frame varints. */
+#define H3_BUFFER (4096 + 16)
 struct h3_peer_stream {
     SSL *ssl;
     unsigned char data[H3_BUFFER];
