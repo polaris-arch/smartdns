@@ -2537,3 +2537,41 @@ TEST_F(LIBHTTP2, StressTest)
 	server_thread.join();
 	client_thread.join();
 }
+
+TEST_F(LIBHTTP2, PeerTableGrowthStaysWithinLocalEncoderLimit)
+{
+	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
+	ASSERT_NE(ctx, nullptr);
+	StartClientWithServerSettings(ctx);
+	uint8_t wire[2048];
+	while (read(server_sock, wire, sizeof(wire)) > 0) {}
+	/* SETTINGS limits our encoder, not the peer's HPACK encoder. */
+	const uint8_t shrink_then_grow[] = {
+		0, 1, 0, 0, 0, 0,
+		0, 1, 0xff, 0xff, 0xff, 0xff,
+	};
+	WriteServerFrame(4, 0, 0, shrink_then_grow, sizeof(shrink_then_grow));
+	int result = http2_ctx_poll(ctx, NULL, 0, NULL);
+	ASSERT_TRUE(result == 0 || result == HTTP2_ERR_EAGAIN);
+	while (read(server_sock, wire, sizeof(wire)) > 0) {}
+	struct http2_stream *stream = http2_stream_new(ctx);
+	ASSERT_NE(stream, nullptr);
+	ASSERT_EQ(http2_stream_set_request(stream, "GET", "/", "https", NULL), 0);
+	ssize_t length = read(server_sock, wire, sizeof(wire));
+	ASSERT_GE(length, 14);
+	ASSERT_EQ(wire[3], 1); // HEADERS
+	/* Minimum 0, then local maximum 65536; never the peer's UINT32_MAX. */
+	const uint8_t updates[] = {0x20, 0x3f, 0xe1, 0xff, 0x03};
+	EXPECT_EQ(memcmp(wire + 9, updates, sizeof(updates)), 0);
+	hpack_context decoder;
+	hpack_init_context(&decoder);
+	int fields = 0;
+	unsigned payload = (wire[0] << 16) | (wire[1] << 8) | wire[2];
+	ASSERT_LE(payload + 9, (unsigned)length);
+	EXPECT_EQ(hpack_decode_headers(&decoder, wire + 9, payload, HpackCountHeader, &fields), 0);
+	EXPECT_GT(fields, 0);
+	EXPECT_EQ(decoder.max_dynamic_table_size, (size_t)HPACK_MAX_DYNAMIC_TABLE_SIZE);
+	hpack_free_context(&decoder);
+	http2_stream_close(stream);
+	http2_ctx_close(ctx);
+}

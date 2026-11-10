@@ -30,6 +30,38 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include "dns_client/dns_client.h"
+#undef min
+#undef max
+
+namespace {
+std::atomic<bool> pause_h2_publication{false};
+std::atomic<http2_stream *> pending_h2_publication{nullptr};
+std::atomic<bool> early_h2_reply_consumed{false};
+}
+extern "C" void __real_http2_stream_set_ex_data(http2_stream *, void *);
+extern "C" void __wrap_http2_stream_set_ex_data(http2_stream *stream, void *data)
+{
+    __real_http2_stream_set_ex_data(stream, data);
+    if (!data || !pause_h2_publication.load() || pthread_equal(pthread_self(), client.tid)) return;
+    /* The old connected send has put a real request on the wire but has not
+     * published query/endpoint ownership. Let its reader finish a fast reply
+     * before this producer resumes. No packet or response is fabricated. */
+    early_h2_reply_consumed = false;
+    pending_h2_publication = stream;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!early_h2_reply_consumed.load() && std::chrono::steady_clock::now() < deadline)
+        poll(nullptr, 0, 1);
+    pending_h2_publication = nullptr;
+}
+extern "C" void __real_http2_stream_close(http2_stream *);
+extern "C" void __wrap_http2_stream_close(http2_stream *stream)
+{
+    bool pending = stream && stream == pending_h2_publication.load() && pthread_equal(pthread_self(), client.tid);
+    __real_http2_stream_close(stream);
+    if (pending) early_h2_reply_consumed = true;
+}
+
 
 namespace
 {
@@ -2744,4 +2776,29 @@ TEST(HTTP2, ScopedTlsIoPreservesUnrelatedAndCallerOwnedSignals)
 			EXPECT_EQ(WTERMSIG(status), SIGPIPE) << "scenario=" << scenario;
 		}
 	}
+}
+
+TEST(HTTP2, ConnectedDohRequestsPreserveFastReplyBeforePublication)
+{
+    LimitedHTTP2DoHUpstream upstream;
+    ASSERT_TRUE(upstream.Start(63054, 8, "192.0.2.19")) << upstream.LastError();
+    smartdns::Server server(smartdns::Server::CREATE_MODE_THREAD);
+    ASSERT_TRUE(server.Start(R"(bind 127.0.0.1:60053
+server https://127.0.0.1:63054/dns-query -no-check-certificate -alpn h2
+cache-size 0
+speed-check-mode none
+dualstack-ip-selection no
+)"));
+    Defer { pause_h2_publication = false; pending_h2_publication = nullptr; };
+    // Establish the connection before forcing the connected-path interleaving.
+    for (const char *name : {"first.ownership.test", "second.ownership.test"}) {
+        pause_h2_publication = upstream.RequestCount() != 0;
+        smartdns::Client query;
+        ASSERT_TRUE(query.Query(std::string(name) + " +time=4", 60053));
+        EXPECT_EQ(query.GetStatus(), "NOERROR");
+        ASSERT_EQ(query.GetAnswerNum(), 1);
+        EXPECT_EQ(query.GetAnswer()[0].GetData(), "192.0.2.19");
+    }
+    // A valid first response must not be discarded and recovered by retransmit.
+    EXPECT_EQ(upstream.RequestCount(), 2);
 }
