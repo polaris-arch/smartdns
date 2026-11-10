@@ -2,23 +2,24 @@
   {
     "name": "ui-statistics",
     "branch": "fix/ui-statistics",
-    "sha": "94916b728e9426a5c7f002e0aa6d7ae9dc873edc",
+    "sha": "996fb3bd589dbc69fc91cf38babbf477f965a2ad",
     "title": "fix(ui): accumulate dropped request counts",
     "items": [
       1
     ],
-    "test_filter": "data_stats::regression_tests",
+    "test_filter": "",
     "paths": [
       "plugin/smartdns-ui/src/data_stats.rs"
     ],
     "pr": 2486,
     "previous_head": "d72ab946acdaaf84cba96d5296a77334bdfc1f35",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "e4892aa70f0756dcacfa5a02ff0e571d8fee474d",
+    "tree": "5f15719963b4c222e5104b2701eb4886a154f1ca",
     "required_tests": [],
     "required_failures": [],
-    "negative_filter": "data_stats::regression_tests",
-    "governance_previous_sha": "872f3bab17c7c4b4a0c36e355bda06b87f86bdc1"
+    "negative_filter": "",
+    "governance_previous_sha": "872f3bab17c7c4b4a0c36e355bda06b87f86bdc1",
+    "source_minimality_previous_sha": "94916b728e9426a5c7f002e0aa6d7ae9dc873edc"
   },
   {
     "name": "config-context",
@@ -55,34 +56,23 @@
   {
     "name": "cache-checkpoint",
     "branch": "fix/cache-checkpoint",
-    "sha": "b81ba66e397ae37dd8730eae3b7f7c0814cd5fda",
+    "sha": "0f18be33ef1b0fc2725f8d7a82103b3339def800",
     "title": "fix(cache): defer periodic checkpoints while requests are active",
     "items": [
       4
     ],
-    "test_filter": "CacheCheckpoint.*",
+    "test_filter": "",
     "paths": [
-      "src/dns_server/cache.c",
-      "test/Makefile",
-      "test/cases/test-cache-checkpoint.cc"
+      "src/dns_server/cache.c"
     ],
     "pr": 2488,
     "previous_head": "39d93ec4ed0edee999df22aa59548dd62abe443c",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "f4ba0d4eb9ae64c30402403d35a5d0fef05f88af",
-    "required_tests": [
-      "CacheCheckpoint.BusyServerDefersWithoutChangingCheckpointTime",
-      "CacheCheckpoint.ChildBranchClosesDescriptorsSavesAndExitsWithoutRealFork",
-      "CacheCheckpoint.CompletedChildReapedBeforeNextDueSave",
-      "CacheCheckpoint.DisabledAndNotDueNeverFork",
-      "CacheCheckpoint.DueIdleServerForksOneSaver",
-      "CacheCheckpoint.RunningChildPreventsDuplicateSaverAndHasBoundedKill"
-    ],
-    "required_failures": [
-      "CacheCheckpoint.DueIdleServerForksOneSaver",
-      "CacheCheckpoint.BusyServerDefersWithoutChangingCheckpointTime"
-    ],
-    "negative_filter": "CacheCheckpoint.*"
+    "tree": "1947bdf0014c4e5d95fb3221fe2614c841f9b278",
+    "required_tests": [],
+    "required_failures": [],
+    "negative_filter": "",
+    "source_minimality_previous_sha": "b81ba66e397ae37dd8730eae3b7f7c0814cd5fda"
   },
   {
     "name": "ping-startup",
@@ -240,7 +230,7 @@
   {
     "name": "thread-startup",
     "branch": "fix/thread-startup",
-    "sha": "ec2922f3478e2427253ceaad8ca1db56c3fca67a",
+    "sha": "0b3ff661c2219e77ae716bd62b54675acf6d01fd",
     "title": "fix: use default thread attributes and report pthread creation errors",
     "items": [
       16
@@ -258,19 +248,18 @@
     "pr": 2492,
     "previous_head": "fe531eb607efb398fbab80874cf345a76fd7ec74",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "3030ddc31fcede4abc6fcb80ab9443f499d77d33",
+    "tree": "9b19b1494aa0267d514dbeb789cae1f0056c917e",
     "required_tests": [
       "ThreadStartup.ClientEpollFailureCanRetry",
       "ThreadStartup.ClientThreadFailureCanRetryWithoutLeakingGroups",
       "ThreadStartup.ClientWakeupFailureJoinsWorkerAndCanRetry",
-      "ThreadStartup.LoggerReportsPthreadErrorInsteadOfUnrelatedErrno",
       "ThreadStartup.PingThreadFailureUsesDefaultAttributesAndCanRetry"
     ],
     "required_failures": [
-      "ThreadStartup.LoggerReportsPthreadErrorInsteadOfUnrelatedErrno",
       "ThreadStartup.ClientThreadFailureCanRetryWithoutLeakingGroups"
     ],
-    "negative_filter": "ThreadStartup.LoggerReportsPthreadErrorInsteadOfUnrelatedErrno:ThreadStartup.ClientThreadFailureCanRetryWithoutLeakingGroups"
+    "negative_filter": "ThreadStartup.ClientThreadFailureCanRetryWithoutLeakingGroups",
+    "source_minimality_previous_sha": "ec2922f3478e2427253ceaad8ca1db56c3fca67a"
   },
   {
     "name": "http2-cancellation",

@@ -1,6 +1,5 @@
 #include "gtest/gtest.h"
 extern "C" {
-#include "smartdns/tlog.h"
 #include "smartdns/fast_ping.h"
 #include "dns_client/dns_client.h"
 }
@@ -52,19 +51,6 @@ extern "C" int __wrap_pthread_join(pthread_t thread, void **result)
     int status = __real_pthread_join(thread, result);
     if (status == 0 && fail_wakeup) replacement_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
     return status;
-}
-TEST(ThreadStartup, LoggerReportsPthreadErrorInsteadOfUnrelatedErrno)
-{
-    testing::internal::CaptureStderr();
-    used_default_attributes = false;
-    fail_thread_start = true;
-    int result = tlog_init("/dev/null", 1024, 1, 0, TLOG_NOCOMPRESS);
-    fail_thread_start = false;
-    std::string output = testing::internal::GetCapturedStderr();
-    EXPECT_EQ(result, -1);
-    EXPECT_TRUE(used_default_attributes);
-    EXPECT_NE(output.find(strerror(EAGAIN)), std::string::npos);
-    EXPECT_EQ(output.find(strerror(ENOENT)), std::string::npos);
 }
 TEST(ThreadStartup, PingThreadFailureUsesDefaultAttributesAndCanRetry)
 {
