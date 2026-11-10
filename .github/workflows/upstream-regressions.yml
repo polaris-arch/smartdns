@@ -6,6 +6,7 @@ permissions:
   contents: read
 jobs:
   topics:
+    if: false # public recipes qualified in 42793518084
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -104,6 +105,7 @@ jobs:
           retention-days: 14
 
   abi-reproduction:
+    if: false # ABI recipes qualified in 42793518084
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:

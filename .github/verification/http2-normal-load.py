@@ -25,9 +25,9 @@ TEST(HTTP2, NormalLoadObservation)
 for side in ['before','after']:
  root=Path('/tmp/public-h2-load-'+side);subprocess.run(['git','worktree','add','--detach',str(root),head],check=True)
  if side=='before':subprocess.run(['git','restore','--source=HEAD^','--','src','test/cases/test-http2-cancellation.cc'],cwd=root,check=True)
- p=root/'test/server.h';t=p.read_text();assert t.count('bool IsRunning();')==1;p.write_text(t.replace('bool IsRunning();','bool IsRunning();\n\tpid_t ProcessId() const { return pid_; }'))
- p=root/'test/cases/test-http2.cc';t=p.read_text();old='struct pollfd pfd = {fd, POLLIN | POLLOUT, 0};\n\t\t\t\tpoll(&pfd, 1, 10);';assert t.count(old)==1
- t=t.replace(old,'struct pollfd pfd = {fd, (short)(POLLIN | (http2_ctx_want_write(ctx) ? POLLOUT : 0)), 0};\n\t\t\t\tpoll(&pfd, 1, SSL_pending(conn.ssl) ? 0 : 10);')
+ p=root/'test/server.h';t=p.read_text();assert t.count('int GetWaitStatus();')==1;p.write_text(t.replace('int GetWaitStatus();','int GetWaitStatus();\n\tpid_t ProcessId() const { return pid_; }',1))
+ p=root/'test/cases/test-http2.cc';t=p.read_text();old='struct pollfd pfd = {fd, POLLIN | POLLOUT, 0};\n\t\t\tpoll(&pfd, 1, 10);\n\n\t\t\tstruct http2_poll_item items[16] = {};';assert t.count(old)==1
+ t=t.replace(old,'struct pollfd pfd = {fd, (short)(POLLIN | (http2_ctx_want_write(ctx) ? POLLOUT : 0)), 0};\n\t\t\tpoll(&pfd, 1, SSL_pending(conn.ssl) ? 0 : 10);\n\n\t\t\tstruct http2_poll_item items[16] = {};')
  p.write_text('#include <fstream>\n'+t+fixture)
  with (proof/(side+'-build.log')).open('w') as log:subprocess.run(['make','-C','test','-j4'],cwd=root,stdout=log,stderr=subprocess.STDOUT,check=True)
  (proof/(side+'-harness.diff')).write_bytes(subprocess.check_output(['git','diff','--binary'],cwd=root))
