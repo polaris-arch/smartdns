@@ -1,4 +1,7 @@
 /* Parser-only fixtures: no sockets, DNS lookups, or server startup. */
+extern "C" {
+#include "smartdns/lib/conf.h"
+}
 #include "gtest/gtest.h"
 #include "dns_conf/server.h"
 #include "dns_conf/dns_conf_group.h"
@@ -15,6 +18,8 @@ protected:
     int previous_count = 0;
     dns_conf_group_info *previous_group = nullptr;
     void SetUp() override {
+        const config_item items[] = {{nullptr, nullptr, nullptr}};
+        ASSERT_EQ(load_conf("/dev/null", items, nullptr), 0);
         previous_servers.assign(std::begin(dns_conf.servers), std::end(dns_conf.servers));
         previous_count = dns_conf.server_num;
         previous_group = dns_conf_current_group_info;

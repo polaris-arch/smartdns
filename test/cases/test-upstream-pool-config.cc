@@ -1,4 +1,7 @@
 /* Bounded parser correctness only; no sockets, public DNS or performance tests. */
+extern "C" {
+#include "smartdns/lib/conf.h"
+}
 #include "gtest/gtest.h"
 extern "C" {
 #include "dns_conf/server.h"
@@ -19,6 +22,8 @@ protected:
     dns_conf_group_info *previous = nullptr;
     struct dns_group_table saved_groups{};
     void SetUp() override {
+        const config_item items[] = {{nullptr, nullptr, nullptr}};
+        ASSERT_EQ(load_conf("/dev/null", items, nullptr), 0);
         saved.resize(sizeof(dns_conf)); std::memcpy(saved.data(), &dns_conf, sizeof(dns_conf));
         std::memset(&dns_conf, 0, sizeof(dns_conf));
         previous = dns_conf_current_group_info; dns_conf_current_group_info = nullptr;
