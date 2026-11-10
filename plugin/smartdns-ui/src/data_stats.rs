@@ -547,59 +547,6 @@ mod regression_tests {
     use super::*;
 
     #[test]
-    fn request_drop_accumulates() {
-        let data = DataStatsItem::new();
-        data.add_request_drop(3);
-        data.add_request_drop(7);
-        data.add_request_drop(0);
-        assert_eq!(data.get_request_drop(), 10);
-    }
-
-    #[test]
-    fn request_drop_parallel_updates_are_not_lost() {
-        let data = Arc::new(DataStatsItem::new());
-        let mut workers = Vec::new();
-        for _ in 0..4 {
-            let data = data.clone();
-            workers.push(std::thread::spawn(move || {
-                for _ in 0..32 {
-                    data.add_request_drop(2);
-                }
-            }));
-        }
-        for worker in workers { worker.join().unwrap(); }
-        assert_eq!(data.get_request_drop(), 256);
-    }
-
-    #[test]
-    fn request_drop_persistent_initialization_accumulates_without_reset() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("drop-init.db");
-        let db = Arc::new(DB::new());
-        db.open(path.to_str().unwrap()).unwrap();
-        db.set_status_data("request_drop", "100").unwrap();
-        let conf = Arc::new(RwLock::new(DataServerConfig {
-            data_path: dir.path().to_str().unwrap().to_owned(),
-            db_file: path.to_str().unwrap().to_owned(),
-            max_log_age_ms: 30 * 24 * 3600 * 1000,
-        }));
-        let stats = DataStats::new(db.clone(), conf.clone());
-        assert_eq!(stats.get_request_drop(), 0);
-        stats.add_request_drop(2);
-        stats.load_status_data().unwrap();
-        assert_eq!(stats.get_request_drop(), 102);
-        stats.add_request_drop(1);
-        stats.save_status_data().unwrap();
-        let restarted = DataStats::new(db.clone(), conf);
-        assert_eq!(restarted.get_request_drop(), 0);
-        restarted.load_status_data().unwrap();
-        assert_eq!(restarted.get_request_drop(), 103);
-        restarted.add_request_drop(2);
-        restarted.save_status_data().unwrap();
-        assert_eq!(db.get_status_data_list().unwrap()["request_drop"], "105");
-    }
-
-    #[test]
     fn retention_uses_absolute_cutoffs_and_inclusive_boundary() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("retention.db");

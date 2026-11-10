@@ -21,6 +21,9 @@
 
 #include "dns_conf/server.h"
 #include "smartdns/util.h"
+extern "C" {
+#include "smartdns/lib/conf.h"
+}
 
 class ConfServer : public ::testing::Test
 {
@@ -29,6 +32,9 @@ class ConfServer : public ::testing::Test
 	virtual void SetUp()
 	{
 		saved_server_num = dns_conf.server_num;
+		/* Direct directive calls still require an initialized parser context. */
+		const config_item items[] = {{nullptr, nullptr, nullptr}};
+		ASSERT_EQ(load_conf("/dev/null", items, nullptr), 0);
 	}
 	virtual void TearDown()
 	{
