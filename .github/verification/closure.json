@@ -275,7 +275,7 @@
   {
     "name": "http2-cancellation",
     "branch": "fix/http2-cancellation",
-    "sha": "be9f4130b90669d5518c1cb59b8d8444eb307851",
+    "sha": "5b63e8e2455cac148fa08bfac69a9a9e928d4fab",
     "title": "fix(http2): cancel abandoned streams without flushing pending bodies",
     "items": [
       26
@@ -293,11 +293,11 @@
     "pr": 2493,
     "previous_head": "b57a2e45c3804629d11bdec3f8f510bf48c62e1c",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "60648bc42499bc9976427290ca1a2e3484a88b29",
+    "tree": "9d42ce8ecfbba688073e8e6022d0461d5b657691",
     "test_filter": "Http2Cancellation.*:Http2Scheduling.*:HTTP2.CancelledZeroWindow*:HTTP2.ConnectedDohRequests*",
     "required_tests": [
       "HTTP2.CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit",
-      "HTTP2.ConnectedDohRequestsPublishOwnershipOnTheClientWorker",
+      "HTTP2.ConnectedDohRequestsPreserveFastReplyBeforePublication",
       "Http2Cancellation.AbortDiscardsUnscheduledBodyAndReleasesCapacity",
       "Http2Cancellation.CompletedResponseSurvivesFollowingNoErrorReset",
       "Http2Cancellation.CompletedServerRequestStillHonorsPeerCancellation",
@@ -313,9 +313,10 @@
     "required_failures": [
       "HTTP2.CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit",
       "Http2Cancellation.AbortDiscardsUnscheduledBodyAndReleasesCapacity",
-      "HTTP2.ConnectedDohRequestsPublishOwnershipOnTheClientWorker"
+      "HTTP2.ConnectedDohRequestsPreserveFastReplyBeforePublication"
     ],
-    "negative_filter": "Http2Cancellation.*:HTTP2.CancelledZeroWindow*:HTTP2.ConnectedDohRequests*"
+    "negative_filter": "Http2Cancellation.*:HTTP2.CancelledZeroWindow*:HTTP2.ConnectedDohRequests*",
+    "governance_previous_sha": "be9f4130b90669d5518c1cb59b8d8444eb307851"
   },
   {
     "name": "quic-http3-lifecycle",

@@ -32,17 +32,31 @@
 #include <vector>
 
 namespace {
-std::atomic<bool> observe_h2_publication{false};
-std::atomic<int> h2_publications{0}, h2_external_publications{0};
+std::atomic<bool> pause_h2_publication{false};
+std::atomic<http2_stream *> pending_h2_publication{nullptr};
+std::atomic<bool> early_h2_reply_consumed{false};
 }
 extern "C" void __real_http2_stream_set_ex_data(http2_stream *, void *);
 extern "C" void __wrap_http2_stream_set_ex_data(http2_stream *stream, void *data)
 {
-    if (data && observe_h2_publication.load()) {
-        h2_publications++;
-        if (!pthread_equal(pthread_self(), client.tid)) h2_external_publications++;
-    }
     __real_http2_stream_set_ex_data(stream, data);
+    if (!data || !pause_h2_publication.load() || pthread_equal(pthread_self(), client.tid)) return;
+    /* The old connected send has put a real request on the wire but has not
+     * published query/endpoint ownership. Let its reader finish a fast reply
+     * before this producer resumes. No packet or response is fabricated. */
+    early_h2_reply_consumed = false;
+    pending_h2_publication = stream;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!early_h2_reply_consumed.load() && std::chrono::steady_clock::now() < deadline)
+        poll(nullptr, 0, 1);
+    pending_h2_publication = nullptr;
+}
+extern "C" void __real_http2_stream_close(http2_stream *);
+extern "C" void __wrap_http2_stream_close(http2_stream *stream)
+{
+    bool pending = stream && stream == pending_h2_publication.load() && pthread_equal(pthread_self(), client.tid);
+    __real_http2_stream_close(stream);
+    if (pending) early_h2_reply_consumed = true;
 }
 
 namespace
@@ -496,7 +510,7 @@ class LimitedHTTP2DoHUpstream
 	std::string last_error_;
 };
 
-TEST(HTTP2, ConnectedDohRequestsPublishOwnershipOnTheClientWorker)
+TEST(HTTP2, ConnectedDohRequestsPreserveFastReplyBeforePublication)
 {
     LimitedHTTP2DoHUpstream upstream;
     ASSERT_TRUE(upstream.Start(63054, 8, "192.0.2.19")) << upstream.LastError();
@@ -507,19 +521,18 @@ cache-size 0
 speed-check-mode none
 dualstack-ip-selection no
 )"));
-    h2_publications = h2_external_publications = 0;
-    observe_h2_publication = true;
-    Defer { observe_h2_publication = false; };
-    // First connection and already-connected sends exercise both old entry paths.
-    for (const char *name : {"first.ownership.test", "second.ownership.test", "third.ownership.test"}) {
+    Defer { pause_h2_publication = false; pending_h2_publication = nullptr; };
+    // Establish the connection before forcing the connected-path interleaving.
+    for (const char *name : {"first.ownership.test", "second.ownership.test"}) {
+        pause_h2_publication = upstream.RequestCount() != 0;
         smartdns::Client query;
-        ASSERT_TRUE(query.Query(name, 60053));
+        ASSERT_TRUE(query.Query(std::string(name) + " +time=4", 60053));
         EXPECT_EQ(query.GetStatus(), "NOERROR");
         ASSERT_EQ(query.GetAnswerNum(), 1);
         EXPECT_EQ(query.GetAnswer()[0].GetData(), "192.0.2.19");
     }
-    EXPECT_EQ(h2_publications.load(), 3);
-    EXPECT_EQ(h2_external_publications.load(), 0);
+    // A valid first response must not be discarded and recovered by retransmit.
+    EXPECT_EQ(upstream.RequestCount(), 2);
 }
 
 TEST(HTTP2, CancelledZeroWindowDnsQueryDoesNotResumeAfterCredit)
