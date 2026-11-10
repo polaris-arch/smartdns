@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pr: [2493]
+        pr: [2489, 2490, 2491, 2492, 2493, 2494, 2495]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -21,7 +21,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/evidence"
           docker pull debian:trixie
           docker image inspect debian:trixie --format '{{json .RepoDigests}}' > "$RUNNER_TEMP/evidence/image.json"
-          docker run --rm -v "$PWD:/work" -v "$RUNNER_TEMP/evidence:/evidence" -w /work -e PR=${{ matrix.pr }} -e PROOF=/evidence debian:trixie bash -c '
+          docker run --rm -v "$PWD:/work" -v "$RUNNER_TEMP/evidence:/evidence" -w /work -e PUBLIC_REPRO=1 -e PR=${{ matrix.pr }} -e PROOF=/evidence debian:trixie bash -c '
             apt-get update -qq && apt-get install -y build-essential git libssl-dev libgtest-dev dnsutils zlib1g-dev python3 ca-certificates &&
             bash .github/verification/closure.sh'
       - uses: actions/upload-artifact@v4
@@ -31,6 +31,7 @@ jobs:
           path: ${{ runner.temp }}/evidence
           retention-days: 14
   combined:
+    if: false # production unchanged; public recipes qualify independent source
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -99,5 +100,62 @@ jobs:
         if: always()
         with:
           name: closure-compat32
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+
+  abi-reproduction:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        bits: ['64', '32']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.bits == '32' && 'i686-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}
+      - name: Execute public ABI recipe
+        env:
+          PR: 2495
+          ABI_BITS: ${{ matrix.bits }}
+          PROOF: ${{ runner.temp }}/evidence
+        run: |
+          sudo apt-get update -qq
+          if [[ $ABI_BITS == 32 ]]; then
+            sudo dpkg --add-architecture i386
+            sudo apt-get update -qq
+            sudo apt-get install -y g++-multilib libclang-dev libssl-dev:amd64 libssl-dev:i386
+          else
+            sudo apt-get install -y libclang-dev libssl-dev
+          fi
+          python3 .github/verification/public-reproduce.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-abi-${{ matrix.bits }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+
+  normal-http2-load:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Paired normal DNS-over-H2 load
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          docker run --rm -v "$PWD:/work" -v "$RUNNER_TEMP/evidence:/evidence" -w /work -e PROOF=/evidence debian:trixie bash -c '
+            apt-get update -qq && apt-get install -y build-essential git libssl-dev libgtest-dev dnsutils zlib1g-dev python3 ca-certificates &&
+            git config --global --add safe.directory /work && python3 .github/verification/http2-normal-load.py'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: normal-http2-load
           path: ${{ runner.temp }}/evidence
           retention-days: 14

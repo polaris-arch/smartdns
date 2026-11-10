@@ -7,6 +7,10 @@ proof=${PROOF:?}
 mkdir -p "$proof"
 trap 'find "$proof" -name "*.log" -type f -exec gzip -f {} \;' EXIT
 git config --global --add safe.directory "$repo"
+if [[ ${PUBLIC_REPRO:-0} == 1 ]]; then
+    python3 .github/verification/public-reproduce.py
+    exit
+fi
 openssl version -a > "$proof/openssl.txt"
 dpkg-query -W gcc g++ libssl-dev libc6 libgtest-dev zlib1g-dev > "$proof/packages.txt"
 if [[ ${PROFILE:-} == integration || ${PROFILE:-} == sanitizers || ${PROFILE:-} == compat32 ]]; then
