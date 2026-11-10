@@ -40,9 +40,15 @@ registered={}
 for side,root in roots.items():
  test_sources[side]={str(p.relative_to(root)):hashlib.file_digest(p.open('rb'),'sha256').hexdigest() for p in (root/'test').rglob('*') if p.is_file() and (p.suffix in ('.cc','.h') or p.name=='Makefile')}
  registered[side]=subprocess.check_output([str(root/'test/test.bin'),'--gtest_list_tests'],cwd=root,text=True)
-assert test_sources['before']==test_sources['after'] and registered['before']==registered['after']
 (proof/'test-source-manifest.json').write_text(json.dumps(test_sources,indent=2)+'\n')
-(proof/'registered-tests.txt').write_text(registered['before'])
+for side,text in registered.items(): (proof/(side+'-registered-tests.txt')).write_text(text)
+# GTest prints unstreamable ProtocolConfig objects (four std::strings) as raw
+# bytes in # GetParam comments, including process-dependent addresses.
+# Preserve raw lists and compare the complete suite/test identifiers instead.
+names={side:[line.split('#',1)[0].rstrip() for line in text.splitlines() if line.strip()] for side,text in registered.items()}
+(proof/'registered-identifiers.json').write_text(json.dumps(names,indent=2)+'\n')
+assert test_sources['before']==test_sources['after'] and names['before']==names['after']
+
 
 def resources(pid):
  t=Path('/proc',str(pid),'stat').read_text().rsplit(')',1)[1].split();status=Path('/proc',str(pid),'status').read_text().splitlines();rss=next(int(l.split()[1]) for l in status if l.startswith('VmRSS:'));return (int(t[11])+int(t[12]))/os.sysconf('SC_CLK_TCK'),rss,int(t[19])
