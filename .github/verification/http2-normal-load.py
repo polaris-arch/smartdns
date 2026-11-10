@@ -24,7 +24,8 @@ TEST(HTTP2, NormalLoadObservation)
 '''
 for side in ['before','after']:
  root=Path('/tmp/public-h2-load-'+side);subprocess.run(['git','worktree','add','--detach',str(root),head],check=True)
- if side=='before':subprocess.run(['git','restore','--source=HEAD^','--','src','test/cases/test-http2-cancellation.cc'],cwd=root,check=True)
+ if side=='before':subprocess.run(['git','restore','--source=HEAD^','--','src'],cwd=root,check=True)
+ subprocess.run(['git','restore','--source=HEAD^','--','test/cases/test-http2-cancellation.cc'],cwd=root,check=True)
  p=root/'test/server.h';t=p.read_text();assert t.count('int GetWaitStatus();')==1;p.write_text(t.replace('int GetWaitStatus();','int GetWaitStatus();\n\tpid_t ProcessId() const { return pid_; }',1))
  p=root/'test/cases/test-http2.cc';t=p.read_text();old='struct pollfd pfd = {fd, POLLIN | POLLOUT, 0};\n\t\t\tpoll(&pfd, 1, 10);\n\n\t\t\tstruct http2_poll_item items[16] = {};';assert t.count(old)==1
  t=t.replace(old,'struct pollfd pfd = {fd, (short)(POLLIN | (http2_ctx_want_write(ctx) ? POLLOUT : 0)), 0};\n\t\t\tpoll(&pfd, 1, SSL_pending(conn.ssl) ? 0 : 10);\n\n\t\t\tstruct http2_poll_item items[16] = {};')
@@ -33,6 +34,15 @@ for side in ['before','after']:
  (proof/(side+'-harness.diff')).write_bytes(subprocess.check_output(['git','diff','--binary'],cwd=root))
  (proof/(side+'-binary.sha256')).write_text(hashlib.file_digest((root/'test/test.bin').open('rb'),'sha256').hexdigest())
  roots[side]=root
+
+test_sources={}
+registered={}
+for side,root in roots.items():
+ test_sources[side]={str(p.relative_to(root)):hashlib.file_digest(p.open('rb'),'sha256').hexdigest() for p in (root/'test').rglob('*') if p.is_file() and (p.suffix in ('.cc','.h') or p.name=='Makefile')}
+ registered[side]=subprocess.check_output([str(root/'test/test.bin'),'--gtest_list_tests'],cwd=root,text=True)
+assert test_sources['before']==test_sources['after'] and registered['before']==registered['after']
+(proof/'test-source-manifest.json').write_text(json.dumps(test_sources,indent=2)+'\n')
+(proof/'registered-tests.txt').write_text(registered['before'])
 
 def resources(pid):
  t=Path('/proc',str(pid),'stat').read_text().rsplit(')',1)[1].split();status=Path('/proc',str(pid),'status').read_text().splitlines();rss=next(int(l.split()[1]) for l in status if l.startswith('VmRSS:'));return (int(t[11])+int(t[12]))/os.sysconf('SC_CLK_TCK'),rss,int(t[19])
@@ -70,7 +80,7 @@ def load(pid,limit,rate,duration,tag):
  return {'planned':planned,'sent':sent,'success':len(lat),'invalid':bad,'timeout':timeout,'capacity_missed_slots':cap,'late_slots':late,'target_qps':rate,'send_qps':sent/duration,'completion_qps':len(lat)/elapsed,'resource_interval_seconds':elapsed,'target_load_met':planned==sent and cap==0,'seconds':duration,'elapsed_with_drain':elapsed,'inflight_limit':limit,'p50_ms':lat[int((len(lat)-1)*.5)] if lat else None,'p95_ms':lat[int((len(lat)-1)*.95)] if lat else None,'p99_ms':lat[int((len(lat)-1)*.99)] if lat else None,'resolver_cpu_seconds':cpu1-cpu0,'cpu_us_per_success':(cpu1-cpu0)*1e6/len(lat) if lat else None,'resolver_rss_kib_start':rss0,'resolver_rss_kib_max':max(rss),'resolver_rss_kib_end':rss[-1],'pid_starttime':birth}
 
 rows=[]
-for limit,rate in [(1,10)]:
+for limit,rate in [(1,10),(16,500)]:
  for roundno in range(3):
   order=['before','after'] if roundno%2==0 else ['after','before']
   for side in order:
@@ -89,6 +99,6 @@ for limit,rate in [(1,10)]:
     except subprocess.TimeoutExpired:proc.terminate();rc=proc.wait(timeout=5)
     log.close()
    assert rc==0,(side,roundno,rc)
-(proof/'method.json').write_text(json.dumps({'head':head,'parent':subprocess.check_output(['git','rev-parse',head+'^'],text=True).strip(),'normal_load_only':True,'peer_poll_fix_symmetric':True,'performance_resources':'forked resolver child only; peer excluded','no_fault_injection':True,'warmup_seconds':3,'measurement_seconds':20,'rounds_per_workload':3,'order':'AB,BA,AB','claim':'bounded observation only; no benefit or statistical equivalence claim'},indent=2)+'\n')
+(proof/'method.json').write_text(json.dumps({'head':head,'parent':subprocess.check_output(['git','rev-parse',head+'^'],text=True).strip(),'normal_load_only':True,'peer_poll_fix_symmetric':True,'same_test_sources_and_registered_tests':True,'cancellation_test_hooks_absent_on_both_sides':True,'performance_resources':'forked resolver child only; peer excluded','no_fault_injection':True,'warmup_seconds':3,'measurement_seconds':20,'rounds_per_workload':3,'order':'AB,BA,AB','claim':'bounded observation only; no benefit or statistical equivalence claim'},indent=2)+'\n')
 
 assert all(r["target_load_met"] for r in rows), "requested load not attained; samples cannot establish non-degradation"
