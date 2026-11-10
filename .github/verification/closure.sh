@@ -24,6 +24,7 @@ if [[ ${PROFILE:-} == integration || ${PROFILE:-} == sanitizers || ${PROFILE:-} 
     if [[ $PROFILE != integration ]]; then filter='LibConf.*:CacheCheckpoint.*:Ping.*:ThreadStartup.*:HeaderCompression.*:LIBHTTP2.*:Http2Cancellation.*:Http2Scheduling.*:HTTP2.CancelledZeroWindow*:HTTP2.ConnectedDohRequests*:Http3Control.*:Http3RequestFraming.*:QuicLifecycle.*:QuicEndToEnd.*:Cache.InvalidPersisted*:Cache.BrokenRecordFraming*:Cache.ValidLargeTtl*:Cache.FuturePersisted*:Cache.ValidPersistedCounterBounds*:Cache.PersistedExpiry*:Cache.TtlConsumers*'; fi
     executor=()
     if [[ $PROFILE == compat32 && $EUID != 0 ]]; then executor=(sudo); fi
+    ./test/test.bin --gtest_list_tests > "$proof/compiled-tests.txt"
     "${executor[@]}" timeout 900 ./test/test.bin --gtest_filter="$filter" --gtest_output="xml:$proof/candidate.xml" > "$proof/candidate.log" 2>&1
     python3 - "$proof/candidate.xml" "$manifest" "$PROFILE" <<'PY'
 import json,sys,xml.etree.ElementTree as E
@@ -58,19 +59,40 @@ git diff --check "$BASE" "$CANDIDATE"
 if [[ $PR == 2486 ]]; then
     cd "$root"
     make -C src -j4 WITH_ZLIB=0 EXTRA_CFLAGS=-fPIC libsmartdns-test.a > "$proof/native-build.log" 2>&1
+    # Match the compiler/flags used for the native library; compare with bindgen's
+    # actual Rust type below rather than inferring time_t from CPU bitness.
+    cat > "$proof/time-abi.c" <<'C'
+#include <stdint.h>
+#include <stdio.h>
+#include <time.h>
+int main(void) {
+    printf("cache callback ABI: pointer_bytes=%zu time_t_bytes=%zu time_t_max=%jd\n",
+        sizeof(void *), sizeof(time_t), (intmax_t)(sizeof(time_t) == 4 ? INT32_MAX : INT64_MAX));
+    return 0;
+}
+C
+    read -r -a abi_cc <<< "${CC:-cc}"
+    read -r -a abi_flags <<< "${CFLAGS:-}"
+    "${abi_cc[@]}" "${abi_flags[@]}" "$proof/time-abi.c" -o "$proof/time-abi"
+    "$proof/time-abi" > "$proof/time-abi.txt"
+    "${abi_cc[@]}" "${abi_flags[@]}" -dM -E -include time.h -x c /dev/null > "$proof/time-abi-macros.txt"
+    "${abi_cc[@]}" -print-sysroot > "$proof/sysroot.txt"
+    printf 'CC=%s\nCFLAGS=%s\nBINDGEN_EXTRA_CLANG_ARGS=%s\nCARGO_BUILD_TARGET=%s\n' \
+        "${CC:-cc}" "${CFLAGS:-}" "${BINDGEN_EXTRA_CLANG_ARGS:-}" "${CARGO_BUILD_TARGET:-}" > "$proof/abi-flags.txt"
     cp "$repo/.github/verification/closure.Cargo.lock" plugin/smartdns-ui/Cargo.lock
     rustc --version > "$proof/rust.txt"
     cargo --version >> "$proof/rust.txt"
     if [[ -n ${CARGO_BUILD_TARGET:-} ]]; then rustc --print cfg --target "$CARGO_BUILD_TARGET" > "$proof/rust-cfg.txt"; else rustc --print cfg > "$proof/rust-cfg.txt"; fi
     cp plugin/smartdns-ui/src/data_stats.rs "$proof/data_stats.rs"
     (cd plugin/smartdns-ui && cargo test --locked --lib "$FILTER" -- --test-threads=1) > "$proof/candidate.log" 2>&1
-    (cd plugin/smartdns-ui && cargo test --locked --lib -- --test-threads=1) > "$proof/full-library.log" 2>&1
+    (cd plugin/smartdns-ui && cargo test --locked --lib -- --test-threads=1 --nocapture) > "$proof/full-library.log" 2>&1
     if [[ ${UI_COMBINED:-0} == 1 || -n ${CARGO_BUILD_TARGET:-} ]]; then
-        python3 - "$proof/full-library.log" <<'PY'
+        python3 - "$proof/full-library.log" "$proof/time-abi.txt" <<'PY'
 import sys
 text=open(sys.argv[1]).read()
-assert 'test smartdns::tests::cache_callback_preserves_native_timestamp_width ... ok' in text
-assert 'test result: ok. 6 passed; 0 failed; 0 ignored' in text
+assert 'smartdns::tests::cache_callback_preserves_native_timestamp_width' in text
+assert open(sys.argv[2]).read().strip() in text, 'C and bindgen time_t ABI differ'
+assert 'test result: ok. 5 passed; 0 failed; 0 ignored' in text
 PY
     fi
     python3 "$driver" inverse-ui plugin/smartdns-ui/src/data_stats.rs
@@ -82,15 +104,14 @@ PY
     python3 - "$proof" <<'PY'
 from pathlib import Path
 import sys
-p=Path(sys.argv[1]);assert 'test result: ok. 4 passed; 0 failed; 0 ignored' in (p/'candidate.log').read_text()
+p=Path(sys.argv[1]);assert 'test result: ok. 3 passed; 0 failed; 0 ignored' in (p/'candidate.log').read_text()
 text=(p/'baseline.log').read_text()
 assert 'test result: FAILED' in text
 failures=text.rsplit('\nfailures:\n',1)[1].split('\n\ntest result:',1)[0].splitlines()
 failures={line.strip() for line in failures}
 assert failures == {'data_stats::regression_tests::'+name for name in [
-    'request_drop_accumulates_and_saturates',
+    'request_drop_accumulates',
     'request_drop_parallel_updates_are_not_lost',
-    'request_drop_parallel_saturation_does_not_wrap',
     'request_drop_persistent_initialization_accumulates_without_reset',
 ]}
 PY

@@ -2,8 +2,8 @@
   {
     "name": "ui-statistics",
     "branch": "fix/ui-statistics",
-    "sha": "872f3bab17c7c4b4a0c36e355bda06b87f86bdc1",
-    "title": "fix(ui): accumulate dropped requests without counter wrap",
+    "sha": "94916b728e9426a5c7f002e0aa6d7ae9dc873edc",
+    "title": "fix(ui): accumulate dropped request counts",
     "items": [
       1
     ],
@@ -14,10 +14,11 @@
     "pr": 2486,
     "previous_head": "d72ab946acdaaf84cba96d5296a77334bdfc1f35",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "a229bc06cac7ca16e6204e27386e4c8347fed6d9",
+    "tree": "e4892aa70f0756dcacfa5a02ff0e571d8fee474d",
     "required_tests": [],
     "required_failures": [],
-    "negative_filter": "data_stats::regression_tests"
+    "negative_filter": "data_stats::regression_tests",
+    "governance_previous_sha": "872f3bab17c7c4b4a0c36e355bda06b87f86bdc1"
   },
   {
     "name": "config-context",
@@ -123,7 +124,7 @@
   {
     "name": "hpack-state",
     "branch": "fix/hpack-state",
-    "sha": "b55f35ffeb8220ba454468f322612f3d7113dae1",
+    "sha": "1978967034778782c7982812f0a0977f94094162",
     "title": "fix(http2): synchronize HPACK capacity changes and reject corrupted contexts",
     "items": [
       10,
@@ -143,7 +144,7 @@
     "pr": 2490,
     "previous_head": "4269980d7489a5d215a8f9af1c7fcff67447eee4",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "8dd3874148fed7558bc7483f97b3eb3b80f6e232",
+    "tree": "3370c40017d3fdbfbd3f26e6404cd0b62f2ab300",
     "required_tests": [
       "HeaderCompression.DynamicInsertionFailureIsNotReportedAsSuccess",
       "HeaderCompression.EncoderSettingsShrinkAndGrowSynchronizeNextHeaderBlock",
@@ -194,12 +195,14 @@
       "LIBHTTP2.StressTest",
       "LIBHTTP2.UnsupportedContentEncodingReadsRawBody",
       "LIBHTTP2.WindowUpdateZeroIncrementFailsProtocol",
-      "LIBHTTP2.WriteBodyReturnsPayloadLengthForMultiFrameBody"
+      "LIBHTTP2.WriteBodyReturnsPayloadLengthForMultiFrameBody",
+      "LIBHTTP2.PeerTableGrowthStaysWithinLocalEncoderLimit"
     ],
     "required_failures": [
       "LIBHTTP2.SettingsHeaderTableSizeEvictsResponseEncoderEntries"
     ],
-    "negative_filter": "LIBHTTP2.SettingsHeaderTableSizeEvictsResponseEncoderEntries:LIBHTTP2.OversizedDecoderTableClosesTheConnectionWithCompressionError:LIBHTTP2.SettingsMaxHeaderListSizeLimitsResponseHeaders"
+    "negative_filter": "LIBHTTP2.SettingsHeaderTableSizeEvictsResponseEncoderEntries:LIBHTTP2.OversizedDecoderTableClosesTheConnectionWithCompressionError:LIBHTTP2.SettingsMaxHeaderListSizeLimitsResponseHeaders",
+    "governance_previous_sha": "b55f35ffeb8220ba454468f322612f3d7113dae1"
   },
   {
     "name": "qpack-decoding",
@@ -380,12 +383,12 @@
   {
     "name": "cache-persisted-metadata",
     "branch": "fix/cache-persisted-metadata",
-    "sha": "5f9af8758aacefc3286c76c1d5fa263bf17fda05",
+    "sha": "a2485845b31eb7c3b747b0dced01fccc7013c66d",
     "test_filter": "Cache.*Persisted*:Cache.BrokenRecordFramingStopsBeforeUntrustedPayload:Cache.ValidLargeTtl*:Cache.FuturePersisted*:Cache.TtlConsumers*",
     "pr": 2495,
     "previous_head": "67deb37925846d87c3b5c058e1d06e8a7e7507bd",
     "base": "320061d07c3d559a2fa734b2b4bc2891c86f4422",
-    "tree": "276da0588588845cf1c4731ab8822666d83bb75c",
+    "tree": "9e605ad02f8ff5952f586a41eb7e938d4db701cb",
     "paths": [
       "plugin/smartdns-ui/src/smartdns.rs",
       "src/dns_cache.c",
@@ -407,6 +410,8 @@
       "Cache.FuturePersistedTimesAreDiscardedWithoutRenewingTtl",
       "Cache.PersistedExpiryHonorsServeExpiredWindow"
     ],
-    "negative_filter": "Cache.ValidLargeTtlSurvivesPrefetchPersistenceAndOfflineReload:Cache.InvalidPersistedRecordDoesNotDiscardValidNeighbors:Cache.FuturePersistedTimesAreDiscardedWithoutRenewingTtl:Cache.PersistedExpiryHonorsServeExpiredWindow"
+    "negative_filter": "Cache.ValidLargeTtlSurvivesPrefetchPersistenceAndOfflineReload:Cache.InvalidPersistedRecordDoesNotDiscardValidNeighbors:Cache.FuturePersistedTimesAreDiscardedWithoutRenewingTtl:Cache.PersistedExpiryHonorsServeExpiredWindow",
+    "title": "fix(cache): preserve valid records and bound lifetime arithmetic",
+    "governance_previous_sha": "5f9af8758aacefc3286c76c1d5fa263bf17fda05"
   }
 ]

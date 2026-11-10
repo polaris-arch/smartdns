@@ -816,8 +816,8 @@ static int _http2_send_headers_frame(struct http2_ctx *ctx, uint32_t stream_id, 
 	ret = 0;
 
 cleanup:
-	/* Header encoding mutates shared HPACK state before bytes are queued.
-	 * A failed block cannot be retried on this compression context. */
+	/* Encoding or partial queuing can desynchronize shared HPACK state.
+	 * Retire the context rather than roll back an incomplete block. */
 	if (ret < 0) ctx->status = HTTP2_ERR_PROTOCOL;
 	free(header_block);
 	return ret;

@@ -1048,6 +1048,9 @@ mod tests {
 
     #[test]
     fn cache_callback_preserves_native_timestamp_width() {
+        eprintln!("cache callback ABI: pointer_bytes={} time_t_bytes={} time_t_max={}",
+            std::mem::size_of::<*const c_void>(), std::mem::size_of::<smartdns_c::time_t>(),
+            smartdns_c::time_t::MAX);
         let callback: smartdns_c::dns_cache_foreach_cb = Some(cache_foreach_cb);
         let name = CString::new("timestamp.test").unwrap();
         let mut domains = Vec::<CachedDomainInfo>::new();

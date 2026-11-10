@@ -85,11 +85,9 @@ def xml_check(path, candidate, negative=False):
 
 def ui_inverse(path):
     text = path.read_text()
-    start = text.index('            let _ = self.request_dropped.fetch_update(')
-    end = text.index('\n        }', start)
-    text = text[:start] + '            self.request_dropped.fetch_and(count, Ordering::Relaxed);' + text[end:]
-    assert text.count('*value = value.saturating_add(count);') == 1
-    text = text.replace('*value = value.saturating_add(count);', '*value += count;')
+    old = 'self.request_dropped.fetch_add(count, Ordering::Relaxed);'
+    assert text.count(old) == 1
+    text = text.replace(old, 'self.request_dropped.fetch_and(count, Ordering::Relaxed);')
     path.write_text(text)
 
 

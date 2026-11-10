@@ -55,12 +55,6 @@ struct DataStatsItem {
     request_dropped: Arc<Mutex<u64>>,
 }
 
-#[cfg(any(test, not(target_has_atomic = "64")))]
-fn add_locked_drop_count(counter: &Mutex<u64>, count: u64) {
-    let mut value = counter.lock().unwrap();
-    *value = value.saturating_add(count);
-}
-
 impl DataStatsItem {
     pub fn new() -> Self {
         #[cfg(target_has_atomic = "64")]
@@ -101,19 +95,13 @@ impl DataStatsItem {
     pub fn add_request_drop(&self, count: u64) {
         #[cfg(target_has_atomic = "64")]
         {
-            // Observational counter only: saturation prevents a full counter wrapping
-            // back to a misleading zero. Match the non-atomic implementation.
-            // Keep compatibility with toolchains predating try_update (Rust 1.95).
-            #[allow(deprecated)]
-            let _ = self.request_dropped.fetch_update(
-                Ordering::Relaxed, Ordering::Relaxed,
-                |value| Some(value.saturating_add(count)),
-            );
+            self.request_dropped.fetch_add(count, Ordering::Relaxed);
         }
 
         #[cfg(not(target_has_atomic = "64"))]
         {
-            add_locked_drop_count(&self.request_dropped, count);
+            let mut dropped = self.request_dropped.lock().unwrap();
+            *dropped += count;
         }
     }
 
@@ -539,67 +527,28 @@ mod regression_tests {
     use super::*;
 
     #[test]
-    fn request_drop_accumulates_and_saturates() {
+    fn request_drop_accumulates() {
         let data = DataStatsItem::new();
         data.add_request_drop(3);
         data.add_request_drop(7);
         data.add_request_drop(0);
         assert_eq!(data.get_request_drop(), 10);
-        data.add_request_drop(u64::MAX);
-        data.add_request_drop(1);
-        assert_eq!(data.get_request_drop(), u64::MAX);
-        // Exercise the mutex fallback algorithm on atomic-64 hosts too.
-        let fallback = Mutex::new(0);
-        add_locked_drop_count(&fallback, 3);
-        add_locked_drop_count(&fallback, 7);
-        assert_eq!(*fallback.lock().unwrap(), 10);
-        add_locked_drop_count(&fallback, u64::MAX);
-        add_locked_drop_count(&fallback, 1);
-        assert_eq!(*fallback.lock().unwrap(), u64::MAX);
     }
 
     #[test]
     fn request_drop_parallel_updates_are_not_lost() {
         let data = Arc::new(DataStatsItem::new());
-        let fallback = Arc::new(Mutex::new(0));
         let mut workers = Vec::new();
         for _ in 0..4 {
             let data = data.clone();
-            let fallback = fallback.clone();
             workers.push(std::thread::spawn(move || {
                 for _ in 0..32 {
                     data.add_request_drop(2);
-                    add_locked_drop_count(&fallback, 2);
                 }
             }));
         }
         for worker in workers { worker.join().unwrap(); }
         assert_eq!(data.get_request_drop(), 256);
-        assert_eq!(*fallback.lock().unwrap(), 256);
-    }
-
-    #[test]
-    fn request_drop_parallel_saturation_does_not_wrap() {
-        let data = Arc::new(DataStatsItem::new());
-        let fallback = Arc::new(Mutex::new(u64::MAX - 128));
-        data.add_request_drop(u64::MAX - 128);
-        let barrier = Arc::new(std::sync::Barrier::new(8));
-        let mut workers = Vec::new();
-        for _ in 0..8 {
-            let data = data.clone();
-            let fallback = fallback.clone();
-            let barrier = barrier.clone();
-            workers.push(std::thread::spawn(move || {
-                barrier.wait();
-                for _ in 0..32 {
-                    data.add_request_drop(2);
-                    add_locked_drop_count(&fallback, 2);
-                }
-            }));
-        }
-        for worker in workers { worker.join().unwrap(); }
-        assert_eq!(data.get_request_drop(), u64::MAX);
-        assert_eq!(*fallback.lock().unwrap(), u64::MAX);
     }
 
     #[test]
@@ -608,7 +557,7 @@ mod regression_tests {
         let path = dir.path().join("drop-init.db");
         let db = Arc::new(DB::new());
         db.open(path.to_str().unwrap()).unwrap();
-        db.set_status_data("request_drop", &(u64::MAX - 4).to_string()).unwrap();
+        db.set_status_data("request_drop", "100").unwrap();
         let conf = Arc::new(RwLock::new(DataServerConfig {
             data_path: dir.path().to_str().unwrap().to_owned(),
             db_file: path.to_str().unwrap().to_owned(),
@@ -618,15 +567,15 @@ mod regression_tests {
         assert_eq!(stats.get_request_drop(), 0);
         stats.add_request_drop(2);
         stats.load_status_data().unwrap();
-        assert_eq!(stats.get_request_drop(), u64::MAX - 2);
+        assert_eq!(stats.get_request_drop(), 102);
         stats.add_request_drop(1);
         stats.save_status_data().unwrap();
         let restarted = DataStats::new(db.clone(), conf);
         assert_eq!(restarted.get_request_drop(), 0);
         restarted.load_status_data().unwrap();
-        assert_eq!(restarted.get_request_drop(), u64::MAX - 1);
+        assert_eq!(restarted.get_request_drop(), 103);
         restarted.add_request_drop(2);
         restarted.save_status_data().unwrap();
-        assert_eq!(db.get_status_data_list().unwrap()["request_drop"], u64::MAX.to_string());
+        assert_eq!(db.get_status_data_list().unwrap()["request_drop"], "105");
     }
 }
