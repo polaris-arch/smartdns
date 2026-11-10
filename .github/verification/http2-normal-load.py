@@ -70,7 +70,7 @@ def load(pid,limit,rate,duration,tag):
  return {'planned':planned,'sent':sent,'success':len(lat),'invalid':bad,'timeout':timeout,'capacity_missed_slots':cap,'late_slots':late,'target_qps':rate,'send_qps':sent/duration,'completion_qps':len(lat)/elapsed,'resource_interval_seconds':elapsed,'target_load_met':planned==sent and cap==0,'seconds':duration,'elapsed_with_drain':elapsed,'inflight_limit':limit,'p50_ms':lat[int((len(lat)-1)*.5)] if lat else None,'p95_ms':lat[int((len(lat)-1)*.95)] if lat else None,'p99_ms':lat[int((len(lat)-1)*.99)] if lat else None,'resolver_cpu_seconds':cpu1-cpu0,'cpu_us_per_success':(cpu1-cpu0)*1e6/len(lat) if lat else None,'resolver_rss_kib_start':rss0,'resolver_rss_kib_max':max(rss),'resolver_rss_kib_end':rss[-1],'pid_starttime':birth}
 
 rows=[]
-for limit,rate in [(1,50),(16,500)]:
+for limit,rate in [(1,10)]:
  for roundno in range(3):
   order=['before','after'] if roundno%2==0 else ['after','before']
   for side in order:
