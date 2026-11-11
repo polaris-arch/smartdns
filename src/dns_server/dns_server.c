@@ -178,18 +178,9 @@ static int dns_server_resolve_callback(const char *domain, dns_result_type rtype
 				context.do_ipset = 1;
 				context.reply_ttl = _dns_server_get_reply_ttl(request, ttl);
 				context.cache_ttl = _dns_server_get_conf_ttl(request, ttl);
-				request->ip_ttl = context.cache_ttl;
 					/* The reply owns its IP values; keep background candidates alive. */
 					context.no_check_add_ip = 1;
 				_dns_server_reply_passthrough(&context);
-				request->cname[0] = 0;
-				request->has_ip = 0;
-				request->has_cname = 0;
-				request->has_ping_result = 0;
-				request->has_soa = 0;
-				request->has_ptr = 0;
-				request->ping_time = -1;
-				request->ip_ttl = 0;
 			}
 		}
 

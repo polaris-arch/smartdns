@@ -55,7 +55,7 @@ CXXFLAGS += $(ZLIB_CXXFLAGS)
 LDFLAGS += -lssl -lcrypto -lpthread -ldl -lgtest -lstdc++ -lm -rdynamic
 LDFLAGS += $(ZLIB_LDFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
-LDFLAGS += -Wl,--wrap=strdup -Wl,--wrap=calloc -Wl,--wrap=_dns_ip_address_get
+LDFLAGS += -Wl,--wrap=strdup -Wl,--wrap=calloc -Wl,--wrap=_dns_ip_address_get,--wrap=_dns_server_request_release
 LDFLAGS += -Wl,--wrap=pthread_create,--wrap=_dns_client_socket_ssl_send_ext
 LDFLAGS += -Wl,--wrap=epoll_create1,--wrap=eventfd,--wrap=pthread_join
 LDFLAGS += -Wl,--wrap=sendmsg,--wrap=sendmmsg,--wrap=sendto

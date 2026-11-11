@@ -23,6 +23,9 @@ struct {
 	std::mutex lock;
 	std::condition_variable ready;
 	bool armed = false, resume = false, timed_out = false;
+	bool completed_case = false, completed = false;
+	int measured_rtt = 0;
+	std::thread::id worker;
 	dns_request *request = nullptr;
 	dns_ip_address *node = nullptr;
 } lookup;
@@ -38,23 +41,45 @@ extern "C" dns_ip_address *__wrap__dns_ip_address_get(dns_request *request, unsi
 		_dns_server_request_get(request);
 		lookup.request = request;
 		lookup.node = node;
+		lookup.worker = std::this_thread::get_id();
 		lookup.ready.notify_all();
-		lookup.timed_out = !lookup.ready.wait_for(lock, std::chrono::seconds(5), [] { return lookup.resume; });
+		if (!lookup.completed_case)
+			lookup.timed_out = !lookup.ready.wait_for(lock, std::chrono::seconds(5), [] { return lookup.resume; });
 	}
 	return node;
+}
+
+extern "C" void __real__dns_server_request_release(dns_request *);
+extern "C" void __wrap__dns_server_request_release(dns_request *request)
+{
+	{
+		std::lock_guard<std::mutex> lock(lookup.lock);
+		// The notify worker releases its ping reference after publishing the RTT.
+		if (lookup.armed && lookup.completed_case && !lookup.completed && request == lookup.request &&
+			std::this_thread::get_id() == lookup.worker && request->has_ping_result && lookup.node->ping_time > 0) {
+			EXPECT_EQ(atomic_read(&request->notified), 0);
+			lookup.measured_rtt = request->ping_time;
+			lookup.completed = true;
+			lookup.ready.notify_all();
+		}
+	}
+	__real__dns_server_request_release(request);
 }
 
 TEST(FastestResponseLifetime, FirstReplyKeepsOutstandingSpeedCheckNodes)
 {
 	for (int type : {DNS_T_A, DNS_T_AAAA}) {
+	  for (bool completed : {false, true}) {
 		SCOPED_TRACE(type);
+		SCOPED_TRACE(completed);
 		const char *x = type == DNS_T_A ? "192.0.2.20" : "2001:db8::20";
 		const char *y = type == DNS_T_A ? "192.0.2.254" : "2001:db8::ffff";
-		const char *z = type == DNS_T_A ? "192.0.2.30" : "2001:db8::30";
+		const char *z = completed ? x : (type == DNS_T_A ? "192.0.2.30" : "2001:db8::30");
 		{
 			std::lock_guard<std::mutex> lock(lookup.lock);
 			lookup.armed = true; lookup.resume = lookup.timed_out = false;
 			lookup.request = nullptr; lookup.node = nullptr;
+			lookup.completed_case = completed; lookup.completed = false; lookup.measured_rtt = 0;
 		}
 		smartdns::MockServer first, second;
 		smartdns::Server resolver(smartdns::Server::CREATE_MODE_THREAD);
@@ -70,8 +95,8 @@ TEST(FastestResponseLifetime, FirstReplyKeepsOutstandingSpeedCheckNodes)
 		ASSERT_TRUE(first.Start("udp://127.0.0.1:62153", [&](auto *r) {
 			if (r->qtype != type) return smartdns::SERVER_REQUEST_SOA;
 			if (r->domain == "retained.example") {
-				smartdns::MockServer::AddIP(r, r->domain.c_str(), x);
-				smartdns::MockServer::AddIP(r, r->domain.c_str(), y);
+				smartdns::MockServer::AddIP(r, r->domain.c_str(), x, 73);
+				smartdns::MockServer::AddIP(r, r->domain.c_str(), y, 73);
 			} else smartdns::MockServer::AddIP(r, r->domain.c_str(), z);
 			return smartdns::SERVER_REQUEST_OK;
 		}));
@@ -79,21 +104,24 @@ TEST(FastestResponseLifetime, FirstReplyKeepsOutstandingSpeedCheckNodes)
 			if (r->qtype != type) return smartdns::SERVER_REQUEST_SOA;
 			if (r->domain == "retained.example") {
 				std::unique_lock<std::mutex> lock(lookup.lock);
-				if (!lookup.ready.wait_for(lock, std::chrono::seconds(5), [] { return lookup.request != nullptr; }))
+				if (!lookup.ready.wait_for(lock, std::chrono::seconds(5), [] {
+					return lookup.completed_case ? lookup.completed : lookup.request != nullptr;
+				}))
 					return smartdns::SERVER_REQUEST_SOA;
 			}
-			smartdns::MockServer::AddIP(r, r->domain.c_str(), z);
+			smartdns::MockServer::AddIP(r, r->domain.c_str(), z, 109);
 			return smartdns::SERVER_REQUEST_OK;
 		}));
-		resolver.MockPing(PING_TYPE_ICMP, x, 60, 1);
-		resolver.MockPing(PING_TYPE_ICMP, z, 60, 1);
+		resolver.MockPing(PING_TYPE_ICMP, x, 60, completed ? 100 : 1);
+		if (!completed) resolver.MockPing(PING_TYPE_ICMP, z, 60, 1);
 		ASSERT_TRUE(resolver.Start(std::string("bind [::]:60053\nserver 127.0.0.1:62153\n") +
 			"server 127.0.0.1:62253\nresponse-mode fastest-response\ndualstack-ip-selection no\n"
-			"speed-check-mode ping\nignore-ip " + y + "\n"));
+			"rr-ttl-min 1\nrr-ttl-max 600\nspeed-check-mode ping\nignore-ip " + y + "\n"));
 		smartdns::Client client;
 		ASSERT_TRUE(client.Query(std::string("retained.example ") + (type == DNS_T_A ? "A" : "AAAA"), 60053));
 		ASSERT_EQ(client.GetAnswerNum(), 1);
 		EXPECT_EQ(client.GetAnswer()[0].GetData(), z);
+		EXPECT_GT(client.GetAnswer()[0].GetTTL(), 0);
 		// A new upstream completion proves the earlier first-reply callback has returned.
 		ASSERT_TRUE(client.Query(std::string("barrier.example ") + (type == DNS_T_A ? "A" : "AAAA"), 60053));
 		dns_request *held;
@@ -106,7 +134,13 @@ TEST(FastestResponseLifetime, FirstReplyKeepsOutstandingSpeedCheckNodes)
 		unsigned char address[16] = {};
 		ASSERT_EQ(inet_pton(type == DNS_T_A ? AF_INET : AF_INET6, x, address), 1);
 		EXPECT_EQ(__real__dns_ip_address_get(held, address, static_cast<dns_type_t>(type)), node);
-		EXPECT_EQ(atomic_read(&held->ip_map_num), 2);
+		EXPECT_EQ(atomic_read(&held->ip_map_num), completed ? 1 : 2);
+		EXPECT_EQ(held->ip_ttl, 73);
+		if (completed) {
+			EXPECT_EQ(held->ping_time, lookup.measured_rtt);
+			EXPECT_GT(held->ping_time, 0);
+			EXPECT_TRUE(held->has_ping_result);
+		}
 		{
 			std::lock_guard<std::mutex> lock(lookup.lock);
 			lookup.resume = true;
@@ -117,6 +151,7 @@ TEST(FastestResponseLifetime, FirstReplyKeepsOutstandingSpeedCheckNodes)
 		ASSERT_EQ(atomic_read(&held->refcnt), 1);
 		EXPECT_EQ(__real__dns_ip_address_get(held, address, static_cast<dns_type_t>(type)), node);
 		EXPECT_GT(node->ping_time, 0);
+	  }
 	}
 }
 
@@ -124,16 +159,20 @@ TEST(FastestResponseLifetime, ReplyOwnsBoundedAddressValuesWithoutChangingCandid
 {
 	for (int type : {DNS_T_A, DNS_T_AAAA}) {
 		for (bool skip_map : {false, true}) {
-			SCOPED_TRACE(type); SCOPED_TRACE(skip_map);
+			SCOPED_TRACE(type);
+			SCOPED_TRACE(skip_map);
 			dns_conf_group conf{};
 			dns_request request{};
 			request.conf = &conf; request.qtype = static_cast<dns_type_t>(type);
 			strcpy(request.domain, "values.example");
 			ASSERT_EQ(pthread_mutex_init(&request.ip_map_lock, nullptr), 0);
-			hash_init(request.ip_map);
 			Defer {
-				dns_ip_address *node; hlist_node *tmp; unsigned bucket;
-				hash_for_each_safe(request.ip_map, bucket, tmp, node, node) { hash_del(&node->node); free(node); }
+				for (auto &bucket : request.ip_map) {
+					while (bucket.first) {
+						auto *node = hlist_entry(bucket.first, dns_ip_address, node);
+						hlist_del(&node->node); free(node);
+					}
+				}
 				pthread_mutex_destroy(&request.ip_map_lock);
 			};
 			unsigned char previous[16] = {0}; previous[0] = 0x11;
