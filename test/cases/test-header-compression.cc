@@ -4,6 +4,7 @@ extern "C" {
 #include "http_parse/qpack.h"
 #include "smartdns/http_parse.h"
 }
+#include <cerrno>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -197,5 +198,46 @@ TEST(HeaderCompression, QpackStaticIndicesNeverNarrowFromLargeIntegers) {
         Integer(payload,(uint64_t(1)<<32)+25,representation==0xc0?6:4,representation);
         if (representation==0x50) { payload.push_back(3); payload.insert(payload.end(),{'2','0','0'}); }
         EXPECT_LT(ParseH3(payload),0);
+    }
+}
+
+namespace {
+thread_local int fail_hpack_strdup;
+}
+// Test-only control shared with HTTP/2 failure-path tests.
+void FailHpackStrdupAfter(int calls) { fail_hpack_strdup = calls; }
+extern "C" char *__real_strdup(const char *);
+extern "C" char *__wrap_strdup(const char *s)
+{
+    if (fail_hpack_strdup > 0 && --fail_hpack_strdup == 0) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+    return __real_strdup(s);
+}
+TEST(HeaderCompression, DynamicInsertionFailureIsNotReportedAsSuccess)
+{
+    for (int failed_copy : {1, 2}) {
+        hpack_context ctx{};
+        hpack_init_context(&ctx);
+        unsigned char encoded[128];
+        fail_hpack_strdup = failed_copy;
+        int result = hpack_encode_header(&ctx, "x-test", "value", encoded, sizeof(encoded));
+        fail_hpack_strdup = 0;
+        EXPECT_LT(result, 0);
+        EXPECT_EQ(ctx.entry_count, 0);
+        hpack_free_context(&ctx);
+
+        // Literal with incremental indexing: x-test: value.
+        const unsigned char block[] = {0x40,6,'x','-','t','e','s','t',5,'v','a','l','u','e'};
+        int count = 0;
+        hpack_init_context(&ctx);
+        fail_hpack_strdup = failed_copy;
+        result = hpack_decode_headers(&ctx, block, sizeof(block), Count, &count);
+        fail_hpack_strdup = 0;
+        EXPECT_LT(result, 0);
+        EXPECT_EQ(count, 0);
+        EXPECT_EQ(ctx.entry_count, 0);
+        hpack_free_context(&ctx);
     }
 }
