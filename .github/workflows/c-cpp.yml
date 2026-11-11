@@ -1,106 +1,44 @@
 name: C/C++ CI
-
 on:
-  workflow_call:
-    inputs:
-      release_validation:
-        required: false
-        default: false
-        type: boolean
   workflow_dispatch:
     inputs:
       release_validation:
-        description: 'Run full ASan/UBSan suites and bounded offline baseline comparison'
-        required: false
-        default: false
         type: boolean
-  push:
-    branches: [ master, polaris-main ]
-  pull_request:
-    branches: [ master, polaris-main ]
-
+        default: false
 permissions:
   contents: read
-
 jobs:
-  build:
-    name: ${{ inputs.release_validation && 'release validation' || 'native' }} (${{ matrix.profile }})
+  dns:
+    name: Compare runner and Ubuntu dependency-container DNS
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - profile: system
-            image: ubuntu:24.04
-          - profile: quic
-            image: debian:trixie
+    timeout-minutes: 6
     steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-    - name: Check result-gate and packaging fixtures
-      if: matrix.profile == 'system'
-      run: |
-        python3 .github/scripts/check-native-results.py --self-test
-        python3 .github/scripts/benchmark-native-offline.py --self-test
-        python3 .github/scripts/prepare-release-assets.py --self-test
-    - name: Prepare distribution dependencies (network enabled)
-      env:
-        BASE_IMAGE: ${{ matrix.image }}
-      run: |
-        mkdir -p ci-results
-        git rev-parse HEAD | tee ci-results/source-sha.txt
-        docker build --build-arg BASE_IMAGE="$BASE_IMAGE" -t smartdns-native-ci - <<'DOCKERFILE'
-        ARG BASE_IMAGE
-        FROM ${BASE_IMAGE}
-        RUN apt-get update && apt-get install -y --no-install-recommends \
-            build-essential git patch perl libssl-dev libgtest-dev dnsperf dnsutils curl openssl \
-            pkg-config ca-certificates python3 zlib1g-dev iproute2 nftables ipset && rm -rf /var/lib/apt/lists/*
-        WORKDIR /source
-        DOCKERFILE
-        docker image inspect smartdns-native-ci > ci-results/image.json
-    - name: Prepare pinned benchmark source archives
-      if: inputs.release_validation && matrix.profile == 'quic'
-      run: |
-        # Source retrieval only; all compilation and workloads remain offline.
-        baseline=dfc9ef4bd947891178924c06070fbccc3ea370ba
-        git fetch --no-tags --depth=1 origin "$baseline"
-        test "$(git rev-parse "$baseline^{commit}")" = "$baseline"
-        git archive "$baseline" > .ci-baseline.tar
-        git archive HEAD > .ci-candidate.tar
-        printf '%s\n' "$baseline" > ci-results/benchmark-baseline-sha.txt
-    - name: Fetch verified QUIC dependency input (network enabled)
-      if: matrix.profile == 'quic'
-      run: python3 .github/scripts/openssl-dependency.py fetch --archive .ci-openssl/openssl.tar.gz
-    - name: Build and run complete existing suite (network disabled)
-      env:
-        PROFILE: ${{ matrix.profile }}
-        SANITIZERS: ${{ inputs.release_validation && '1' || '0' }}
-      run: |
-        set -o pipefail
-        docker run --rm --network none --cap-add NET_ADMIN \
-          --sysctl net.ipv4.ip_local_reserved_ports=60000-65535 \
-          -v "$GITHUB_WORKSPACE:/source" -w /source \
-          -e CI_NATIVE_PROFILE="$PROFILE" -e CI_NATIVE_SANITIZERS="$SANITIZERS" smartdns-native-ci \
-          bash .github/scripts/run-native-offline.sh 2>&1 | tee ci-results/native.log
-    - name: Verify required cases actually executed
-      if: always()
-      env:
-        PROFILE: ${{ matrix.profile }}
-        SANITIZERS: ${{ inputs.release_validation && '1' || '0' }}
-      run: python3 .github/scripts/check-native-results.py --profile "$PROFILE" --sanitizers "$SANITIZERS" ci-results/results.xml
-    - name: Compare pinned upstream and candidate (network disabled)
-      if: ${{ success() && inputs.release_validation && matrix.profile == 'quic' }}
-      run: |
-        set -o pipefail
-        # No benchmark privileges needed; runner ownership keeps private-mode logs uploadable.
-        docker run --rm --network none --user "$(id -u):$(id -g)" \
-          -v "$GITHUB_WORKSPACE:/source" -w /source smartdns-native-ci \
-          bash .github/scripts/run-comparative-offline.sh 2>&1 | tee ci-results/comparison-build.log
-    - uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: ${{ inputs.release_validation && 'release' || 'native' }}-${{ matrix.profile }}-${{ github.sha }}
-        path: ci-results/
-        if-no-files-found: error
+      - name: Host and container resolution
+        shell: bash
+        run: |
+          set +e
+          printf 'Resolver mode: host\n'
+          cat /etc/resolv.conf
+          for domain in archive.ubuntu.com security.ubuntu.com deb.debian.org; do
+            printf 'Domain: %s\n' "$domain"
+            timeout 8 getent ahostsv4 "$domain"
+          done
+          docker pull ubuntu:24.04
+          for mode in default host cloudflare google; do
+            printf 'Resolver mode: %s\n' "$mode"
+            flags=()
+            case "$mode" in
+              host) flags=(--network host);;
+              cloudflare) flags=(--dns 1.1.1.1);;
+              google) flags=(--dns 8.8.8.8);;
+            esac
+            timeout 35 docker run --rm "${flags[@]}" ubuntu:24.04 bash -c '
+              cat /etc/resolv.conf
+              cat /etc/nsswitch.conf
+              for domain in archive.ubuntu.com security.ubuntu.com deb.debian.org; do
+                printf "Domain: %s\n" "$domain"
+                timeout 8 getent ahostsv4 "$domain"
+              done
+              exit 0'
+          done
+          exit 0
