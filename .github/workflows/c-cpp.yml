@@ -51,6 +51,9 @@ jobs:
       run: |
         mkdir -p ci-results
         git rev-parse HEAD | tee ci-results/source-sha.txt
+        if [ "$BASE_IMAGE" = ubuntu:24.04 ]; then
+          sudo resolvectl dns "$(ip -o route show default | awk '{print $5; exit}')" 1.1.1.1 8.8.8.8
+        fi
         docker build --build-arg BASE_IMAGE="$BASE_IMAGE" -t smartdns-native-ci - <<'DOCKERFILE'
         ARG BASE_IMAGE
         FROM ${BASE_IMAGE}
