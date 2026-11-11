@@ -410,11 +410,13 @@ static int _http2_stream_add_header(struct http2_stream *stream, const char *nam
 	struct http_head_fields *fields = NULL;
 
 	if (name == NULL || value == NULL) {
+		errno = EINVAL;
 		return -1;
 	}
 
 	fields = zalloc(1, sizeof(*fields));
 	if (fields == NULL) {
+		errno = ENOMEM;
 		return -1;
 	}
 
@@ -424,6 +426,7 @@ static int _http2_stream_add_header(struct http2_stream *stream, const char *nam
 		free((void *)fields->name);
 		free((void *)fields->value);
 		free(fields);
+		errno = ENOMEM;
 		return -1;
 	}
 
@@ -432,6 +435,22 @@ static int _http2_stream_add_header(struct http2_stream *stream, const char *nam
 	hash_add(stream->header_map, &fields->node, key);
 
 	return 0;
+}
+
+/* Commit a complete header set without allocating or invalidating input strings
+ * while the replacement is still being assembled/encoded. Hash bucket links
+ * must be rebuilt: copying a hashmap would retain pointers into the staging object. */
+static void _http2_stream_replace_headers(struct http2_stream *stream, struct http2_stream *staged)
+{
+	struct http_head_fields *field;
+
+	_http2_free_headers(stream);
+	list_splice_tail_init(&staged->header_list.list, &stream->header_list.list);
+	list_for_each_entry(field, &stream->header_list.list, list)
+	{
+		hash_del(&field->node);
+		hash_add(stream->header_map, &field->node, hash_string_case(field->name));
+	}
 }
 
 static const char *_http2_stream_get_header_value(struct http2_stream *stream, const char *name)
@@ -2423,8 +2442,12 @@ int http2_stream_set_request(struct http2_stream *stream, const char *method, co
 		return -1;
 	}
 
-	/* Clear old headers */
-	_http2_free_headers(stream);
+	/* Keep the current fields intact until the complete replacement is queued.
+	 * In particular, callers may pass strings borrowed from these fields. */
+	struct http2_stream staged = {0};
+	INIT_LIST_HEAD(&staged.header_list.list);
+	hash_init(staged.header_map);
+	int ret = -1;
 
 	/* Add pseudo-headers */
 	const char *authority = ctx->server ? ctx->server : "localhost";
@@ -2445,10 +2468,12 @@ int http2_stream_set_request(struct http2_stream *stream, const char *method, co
 		}
 	}
 
-	_http2_stream_add_header(stream, ":method", method);
-	_http2_stream_add_header(stream, ":path", path);
-	_http2_stream_add_header(stream, ":scheme", scheme ? scheme : "https");
-	_http2_stream_add_header(stream, ":authority", authority);
+	if (_http2_stream_add_header(&staged, ":method", method) < 0 ||
+		_http2_stream_add_header(&staged, ":path", path) < 0 ||
+		_http2_stream_add_header(&staged, ":scheme", scheme ? scheme : "https") < 0 ||
+		_http2_stream_add_header(&staged, ":authority", authority) < 0) {
+		goto out;
+	}
 
 	/* Add additional headers from array */
 	if (headers) {
@@ -2457,23 +2482,22 @@ int http2_stream_set_request(struct http2_stream *stream, const char *method, co
 				continue;
 			}
 
-			if (headers[i].name == NULL) {
-				continue;
-			}
-
 			if (strcmp(headers[i].name, ":authority") == 0 || strcasecmp(headers[i].name, "host") == 0) {
 				continue;
 			}
 
-			_http2_stream_add_header(stream, headers[i].name, headers[i].value);
+			if (_http2_stream_add_header(&staged, headers[i].name, headers[i].value) < 0) {
+				goto out;
+			}
 		}
 	}
 
 	/* Send HEADERS frame with END_STREAM for GET/HEAD requests (no body) */
 	int end_stream = (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) ? 1 : 0;
-	int ret = _http2_send_headers_frame(ctx, stream->stream_id, stream, end_stream, 1);
+	ret = _http2_send_headers_frame(ctx, stream->stream_id, &staged, end_stream, 1);
 
 	if (ret == 0) {
+		_http2_stream_replace_headers(stream, &staged);
 		if (end_stream) {
 			stream->end_stream_sent = 1;
 		}
@@ -2482,7 +2506,14 @@ int http2_stream_set_request(struct http2_stream *stream, const char *method, co
 		}
 	}
 
-	pthread_mutex_unlock(&ctx->mutex);
+out:
+	/* No HPACK or I/O work is attempted on an incomplete header set. */
+	{
+		int saved_errno = errno;
+		_http2_free_headers(&staged);
+		pthread_mutex_unlock(&ctx->mutex);
+		errno = saved_errno;
+	}
 	return ret;
 }
 
@@ -2505,13 +2536,19 @@ int http2_stream_set_response(struct http2_stream *stream, int status, const str
 		return -1;
 	}
 
-	/* Clear old headers */
-	_http2_free_headers(stream);
+	/* Keep the current fields intact until the complete replacement is queued.
+	 * In particular, callers may pass strings borrowed from these fields. */
+	struct http2_stream staged = {0};
+	INIT_LIST_HEAD(&staged.header_list.list);
+	hash_init(staged.header_map);
+	int ret = -1;
 
 	/* Add :status pseudo-header */
 	char status_str[16];
 	snprintf(status_str, sizeof(status_str), "%d", status);
-	_http2_stream_add_header(stream, ":status", status_str);
+	if (_http2_stream_add_header(&staged, ":status", status_str) < 0) {
+		goto out;
+	}
 
 	/* Add additional headers from array */
 	if (headers && header_count > 0) {
@@ -2519,14 +2556,26 @@ int http2_stream_set_response(struct http2_stream *stream, int status, const str
 			if (headers[i].name == NULL || headers[i].value == NULL) {
 				continue;
 			}
-			_http2_stream_add_header(stream, headers[i].name, headers[i].value);
+			if (_http2_stream_add_header(&staged, headers[i].name, headers[i].value) < 0) {
+				goto out;
+			}
 		}
 	}
 
 	/* Send HEADERS frame */
-	int ret = _http2_send_headers_frame(ctx, stream->stream_id, stream, 0, 1);
+	ret = _http2_send_headers_frame(ctx, stream->stream_id, &staged, 0, 1);
+	if (ret == 0) {
+		_http2_stream_replace_headers(stream, &staged);
+	}
 
-	pthread_mutex_unlock(&ctx->mutex);
+out:
+	/* No HPACK or I/O work is attempted on an incomplete header set. */
+	{
+		int saved_errno = errno;
+		_http2_free_headers(&staged);
+		pthread_mutex_unlock(&ctx->mutex);
+		errno = saved_errno;
+	}
 	return ret;
 }
 

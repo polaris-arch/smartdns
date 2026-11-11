@@ -206,10 +206,11 @@ thread_local int fail_hpack_strdup;
 }
 // Test-only control shared with HTTP/2 failure-path tests.
 void FailHpackStrdupAfter(int calls) { fail_hpack_strdup = calls; }
+extern bool FailHttp2HeaderAllocation();
 extern "C" char *__real_strdup(const char *);
 extern "C" char *__wrap_strdup(const char *s)
 {
-    if (fail_hpack_strdup > 0 && --fail_hpack_strdup == 0) {
+    if (FailHttp2HeaderAllocation() || (fail_hpack_strdup > 0 && --fail_hpack_strdup == 0)) {
         errno = ENOMEM;
         return nullptr;
     }
