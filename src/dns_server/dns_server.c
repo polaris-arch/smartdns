@@ -179,6 +179,8 @@ static int dns_server_resolve_callback(const char *domain, dns_result_type rtype
 				context.reply_ttl = _dns_server_get_reply_ttl(request, ttl);
 				context.cache_ttl = _dns_server_get_conf_ttl(request, ttl);
 				request->ip_ttl = context.cache_ttl;
+					/* The reply owns its IP values; keep background candidates alive. */
+					context.no_check_add_ip = 1;
 				_dns_server_reply_passthrough(&context);
 				request->cname[0] = 0;
 				request->has_ip = 0;
@@ -188,19 +190,6 @@ static int dns_server_resolve_callback(const char *domain, dns_result_type rtype
 				request->has_ptr = 0;
 				request->ping_time = -1;
 				request->ip_ttl = 0;
-				/* Clear ip_map so subsequent _dns_server_process_answer() can initiate speed-checks */
-				struct dns_ip_address *addr_map = NULL;
-				struct hlist_node *tmp = NULL;
-				unsigned long bucket = 0;
-
-				pthread_mutex_lock(&request->ip_map_lock);
-				hash_for_each_safe(request->ip_map, bucket, tmp, addr_map, node)
-				{
-					hash_del(&addr_map->node);
-					free(addr_map);
-				}
-				atomic_set(&request->ip_map_num, 0);
-				pthread_mutex_unlock(&request->ip_map_lock);
 			}
 		}
 

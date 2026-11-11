@@ -159,7 +159,7 @@ struct dns_server_post_context {
 	struct dns_request *request;
 	struct dns_packet *packet;
 	int ip_num;
-	const unsigned char *ip_addr[MAX_IP_NUM];
+	unsigned char ip_addr[MAX_IP_NUM][DNS_RR_AAAA_LEN];
 	dns_type_t qtype;
 	int do_cache;
 	int do_reply;

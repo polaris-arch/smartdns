@@ -45,7 +45,7 @@ void _dns_server_post_context_init(struct dns_server_post_context *context, stru
 static void _dns_server_context_add_ip(struct dns_server_post_context *context, const unsigned char *ip_addr)
 {
 	if (context->ip_num < MAX_IP_NUM) {
-		context->ip_addr[context->ip_num] = ip_addr;
+		memcpy(context->ip_addr[context->ip_num], ip_addr, sizeof(context->ip_addr[0]));
 	}
 
 	context->ip_num++;
@@ -951,9 +951,8 @@ int _dns_server_get_answer(struct dns_server_post_context *context)
 		for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(packet, rrs)) {
 			switch (rrs->type) {
 			case DNS_T_A: {
-				unsigned char addr[4];
+				unsigned char addr[DNS_RR_AAAA_LEN] = {0};
 				char name[DNS_MAX_CNAME_LEN] = {0};
-				struct dns_ip_address *addr_map = NULL;
 
 				if (request->qtype != DNS_T_A) {
 					continue;
@@ -968,13 +967,11 @@ int _dns_server_get_answer(struct dns_server_post_context *context)
 				}
 
 				if (context->no_check_add_ip == 0 &&
-					_dns_ip_address_check_add(request, name, addr, DNS_T_A, request->ping_time, &addr_map) != 0) {
+					_dns_ip_address_check_add(request, name, addr, DNS_T_A, request->ping_time, NULL) != 0) {
 					continue;
 				}
 
-				if (addr_map != NULL) {
-					_dns_server_context_add_ip(context, addr_map->ip_addr);
-				}
+				_dns_server_context_add_ip(context, addr);
 
 				if (request->has_ip == 1) {
 					continue;
@@ -989,7 +986,6 @@ int _dns_server_get_answer(struct dns_server_post_context *context)
 			case DNS_T_AAAA: {
 				unsigned char addr[16];
 				char name[DNS_MAX_CNAME_LEN] = {0};
-				struct dns_ip_address *addr_map = NULL;
 
 				if (request->qtype != DNS_T_AAAA) {
 					/* ignore non-matched query type */
@@ -1003,13 +999,11 @@ int _dns_server_get_answer(struct dns_server_post_context *context)
 				}
 
 				if (context->no_check_add_ip == 0 &&
-					_dns_ip_address_check_add(request, name, addr, DNS_T_AAAA, request->ping_time, &addr_map) != 0) {
+					_dns_ip_address_check_add(request, name, addr, DNS_T_AAAA, request->ping_time, NULL) != 0) {
 					continue;
 				}
 
-				if (addr_map != NULL) {
-					_dns_server_context_add_ip(context, addr_map->ip_addr);
-				}
+				_dns_server_context_add_ip(context, addr);
 
 				if (request->has_ip == 1) {
 					continue;
