@@ -42,3 +42,13 @@ jobs:
               exit 0'
           done
           exit 0
+      - name: Validate public resolver override for dependency setup
+        shell: bash
+        run: |
+          set -euo pipefail
+          ci_dns_iface=$(ip -o route show default | awk '{print $5; exit}')
+          sudo resolvectl dns "$ci_dns_iface" 1.1.1.1 8.8.8.8
+          cat /run/systemd/resolve/resolv.conf
+          getent ahostsv4 archive.ubuntu.com
+          getent ahostsv4 security.ubuntu.com
+          docker run --rm ubuntu:24.04 bash -ec 'cat /etc/resolv.conf; getent ahostsv4 archive.ubuntu.com; getent ahostsv4 security.ubuntu.com; apt-get update'
