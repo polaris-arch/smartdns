@@ -179,7 +179,7 @@ static int dns_server_resolve_callback(const char *domain, dns_result_type rtype
 				context.reply_ttl = _dns_server_get_reply_ttl(request, ttl);
 				context.cache_ttl = _dns_server_get_conf_ttl(request, ttl);
 					/* The reply owns its IP values; keep background candidates alive. */
-					context.no_check_add_ip = 1;
+					context.no_check_add_ip = request->passthrough != 2;
 				_dns_server_reply_passthrough(&context);
 			}
 		}

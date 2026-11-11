@@ -16,6 +16,7 @@ extern "C" {
 #include <cstdlib>
 #include <unistd.h>
 #include <mutex>
+#include <set>
 #include <vector>
 
 namespace {
@@ -152,6 +153,40 @@ TEST(FastestResponseLifetime, FirstReplyKeepsOutstandingSpeedCheckNodes)
 		EXPECT_EQ(__real__dns_ip_address_get(held, address, static_cast<dns_type_t>(type)), node);
 		EXPECT_GT(node->ping_time, 0);
 	  }
+	}
+}
+
+TEST(FastestResponseLifetime, NoSpeedAliasKeepsAllAddressesInFirstReplyAndCache)
+{
+	for (int type : {DNS_T_A, DNS_T_AAAA}) {
+		SCOPED_TRACE(type);
+		const char *x = type == DNS_T_A ? "192.0.2.20" : "2001:db8::20";
+		const char *y = type == DNS_T_A ? "192.0.2.30" : "2001:db8::30";
+		std::atomic<unsigned> upstream_calls{0};
+		smartdns::MockServer upstream;
+		smartdns::Server resolver;
+		ASSERT_TRUE(upstream.Start("udp://127.0.0.1:62153", [&](auto *r) {
+			if (r->domain != "target.example" || r->qtype != type) return smartdns::SERVER_REQUEST_SOA;
+			upstream_calls++;
+			smartdns::MockServer::AddIP(r, r->domain.c_str(), x, 73);
+			smartdns::MockServer::AddIP(r, r->domain.c_str(), y, 73);
+			return smartdns::SERVER_REQUEST_OK;
+		}));
+		ASSERT_TRUE(resolver.Start("bind [::]:60053\nserver 127.0.0.1:62153\n"
+			"response-mode fastest-response\nspeed-check-mode none\ndualstack-ip-selection no\n"
+			"cname /alias.example/target.example\n"));
+		smartdns::Client client;
+		for (int query = 0; query < 2; query++) {
+			SCOPED_TRACE(query);
+			ASSERT_TRUE(client.Query(std::string("alias.example ") + (type == DNS_T_A ? "A" : "AAAA"), 60053));
+			EXPECT_EQ(client.GetStatus(), "NOERROR");
+			std::set<std::string> addresses;
+			for (auto rr : client.GetAnswer()) {
+				if (rr.GetType() == (type == DNS_T_A ? "A" : "AAAA")) addresses.insert(rr.GetData());
+			}
+			EXPECT_EQ(addresses, (std::set<std::string>{x, y}));
+		}
+		EXPECT_EQ(upstream_calls.load(), 1U);
 	}
 }
 
