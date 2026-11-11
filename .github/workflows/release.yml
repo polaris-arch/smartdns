@@ -98,6 +98,7 @@ jobs:
       # 5. Install system dependencies
       - name: Install System Dependencies
         run: |
+          sudo resolvectl dns "$(ip -o route show default | awk '{print $5; exit}')" 1.1.1.1 8.8.8.8
           sudo apt-get update
           sudo apt-get install -y libgtest-dev dnsperf jq wget unzip tar make gcc clang libclang-dev patch perl
           
