@@ -142,22 +142,22 @@ jobs:
           path: ${{ runner.temp }}/evidence
           retention-days: 14
 
-  normal-http2-load:
+  protocol-diagnosis:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Paired normal DNS-over-H2 load
+      - name: Compare reset-stream compression-state handling
         run: |
           mkdir -p "$RUNNER_TEMP/evidence"
           docker run --rm -v "$PWD:/work" -v "$RUNNER_TEMP/evidence:/evidence" -w /work -e PROOF=/evidence debian:trixie bash -c '
             apt-get update -qq && apt-get install -y build-essential git libssl-dev libgtest-dev dnsutils zlib1g-dev python3 ca-certificates &&
-            git config --global --add safe.directory /work && python3 .github/verification/http2-normal-load.py'
+            git config --global --add safe.directory /work && python3 .github/verification/http2-diagnose.py'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: normal-http2-load
+          name: protocol-diagnosis
           path: ${{ runner.temp }}/evidence
           retention-days: 14
