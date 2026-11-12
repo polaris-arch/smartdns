@@ -186,6 +186,15 @@ impl DataServerControl {
             dns_log!(LogLevel::DEBUG, "data server exit.");
         });
 
+        // Building the query index on a large existing log takes tens of
+        // seconds; plugin start runs inside smartdns init, so it must not wait.
+        let db = self.data_server.db.clone();
+        rt.spawn_blocking(move || {
+            if let Err(e) = db.prepare_query_index() {
+                dns_log!(LogLevel::WARN, "query index not prepared: {}", e);
+            }
+        });
+
         *self.is_run.lock().unwrap() = true;
         *self.server_thread.lock().unwrap() = Some(server_thread);
         Ok(())

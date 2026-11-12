@@ -459,6 +459,10 @@ impl DataStats {
         if let Err(e) = ret {
             dns_log!(LogLevel::WARN, "refresh domain top list error: {}", e);
         }
+
+        if let Err(e) = self.db.maintain_query_index() {
+            dns_log!(LogLevel::WARN, "maintain query index error: {}", e);
+        }
         let _ = self
             .db
             .delete_hourly_query_count_before_timestamp(now.saturating_sub(30 * DAY_MS));

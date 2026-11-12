@@ -376,6 +376,73 @@ fn test_rest_api_delete_domain_by_id() {
 }
 
 #[test]
+fn test_rest_api_delete_missing_rows_return_not_found() {
+    let mut server = common::TestServer::new();
+    server.set_log_level(LogLevel::INFO);
+    assert!(server.start().is_ok());
+
+    for i in 0..16 {
+        let mut request = TestDnsRequest::new();
+        request.domain = format!("{}.com", i);
+        request.id = i as u16;
+        assert!(server.send_test_dnsrequest(request).is_ok());
+    }
+
+    let mut client = common::TestClient::new(&server.get_host());
+    assert!(client.login("admin", "password").is_ok());
+
+    let (code, _) = client.delete("/api/client/999999").unwrap();
+    assert_eq!(code, 404);
+
+    // Nothing was logged before the epoch's first millisecond.
+    let (code, _) = client.delete("/api/domain?timestamp_before=1").unwrap();
+    assert_eq!(code, 404);
+
+    let (code, body) = client.get("/api/domain/count").unwrap();
+    assert_eq!(code, 200);
+    assert_eq!(http_api_msg::api_msg_parse_count(&body).unwrap(), 16);
+}
+
+#[test]
+fn test_rest_api_change_password_keeps_old_password_when_store_fails() {
+    let mut server = common::TestServer::new();
+    server.set_log_level(LogLevel::INFO);
+    assert!(server.start().is_ok());
+
+    let mut client = common::TestClient::new(&server.get_host());
+    assert!(client.login("admin", "password").is_ok());
+
+    // A trigger makes the password write fail inside SQLite, without touching
+    // the plugin: the change must then be rejected and leave nothing behind.
+    let db = rusqlite::Connection::open(format!("{}/smartdns.db", server.get_workdir())).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER deny_password BEFORE INSERT ON config \
+         WHEN NEW.key = 'smartdns-ui.password' BEGIN SELECT RAISE(ABORT, 'denied'); END;",
+    )
+    .unwrap();
+    let password_msg = http_api_msg::api_msg_gen_auth_password_change("password", "newpassword");
+    let (code, _) = client
+        .put("/api/auth/password", password_msg.as_str())
+        .unwrap();
+    assert_eq!(code, 500);
+    assert!(common::TestClient::new(&server.get_host())
+        .login("admin", "newpassword")
+        .is_err());
+    assert!(common::TestClient::new(&server.get_host())
+        .login("admin", "password")
+        .is_ok());
+
+    db.execute_batch("DROP TRIGGER deny_password").unwrap();
+    let (code, _) = client
+        .put("/api/auth/password", password_msg.as_str())
+        .unwrap();
+    assert_eq!(code, 204);
+    assert!(common::TestClient::new(&server.get_host())
+        .login("admin", "newpassword")
+        .is_ok());
+}
+
+#[test]
 fn test_rest_api_server_version() {
     let mut server = common::TestServer::new();
     server.set_log_level(LogLevel::DEBUG);
