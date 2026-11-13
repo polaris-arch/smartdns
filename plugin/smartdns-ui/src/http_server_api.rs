@@ -423,40 +423,26 @@ impl API {
             );
         }
 
-        enum PasswordChange {
-            Stored,
-            Incorrect,
-            NotStored(String),
+        let mut conf = this.get_conf_mut();
+        if utils::verify_password(password_info.0.as_str(), conf.password.as_str()) != true {
+            return API::response_error(StatusCode::FORBIDDEN, "Incorrect password.");
         }
-        // Verify, update and persist under one config write lock on a blocking
-        // thread: two overlapping changes then cannot leave the stored hash
-        // older than the one in memory, and the lock never spans an await.
+
+        let hashed_password = match utils::hash_password(password_info.1.as_str(), Some(10000)) {
+            Ok(v) => v,
+            Err(e) => {
+                return API::response_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    e.to_string().as_str(),
+                );
+            }
+        };
+
         let data_server = this.get_data_server();
-        let server = this.clone();
-        let ret = API::db_blocking(&this, move || {
-            let mut conf = server.get_conf_mut();
-            if !utils::verify_password(password_info.0.as_str(), conf.password.as_str()) {
-                return Ok(PasswordChange::Incorrect);
-            }
-            let hashed_password = utils::hash_password(password_info.1.as_str(), Some(10000))
-                .map_err(|e| e.to_string())?;
-            // Persist first: a failed write leaves memory and storage on the
-            // old password instead of reverting at the next restart.
-            if let Err(e) = data_server.set_config(PASSWORD_CONFIG_KEY, hashed_password.as_str()) {
-                return Ok(PasswordChange::NotStored(e.to_string()));
-            }
-            conf.password = hashed_password;
-            Ok(PasswordChange::Stored)
-        })
-        .await;
-        match ret {
-            Ok(PasswordChange::Stored) => {}
-            Ok(PasswordChange::Incorrect) => {
-                return API::response_error(StatusCode::FORBIDDEN, "Incorrect password.");
-            }
-            Ok(PasswordChange::NotStored(e)) | Err(e) => {
-                return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.as_str());
-            }
+        conf.password = hashed_password.clone();
+        let ret = data_server.set_config(PASSWORD_CONFIG_KEY, hashed_password.as_str());
+        if let Err(e) = ret {
+            return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string().as_str());
         }
 
         this.login_attempts_reset();
@@ -564,15 +550,14 @@ impl API {
         };
 
         let data_server = this.get_data_server();
-        let ret = API::db_blocking(&this, move || {
-            data_server
-                .delete_client_by_id(id)
-                .map_err(|e| e.to_string())
-        })
-        .await;
-        let ret = match ret {
+        let ret = match data_server.delete_client_by_id(id) {
             Ok(v) => v,
-            Err(e) => return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.as_str()),
+            Err(e) => {
+                return API::response_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    e.to_string().as_str(),
+                )
+            }
         };
 
         if ret == 0 {
@@ -596,15 +581,14 @@ impl API {
         };
 
         let data_server = this.get_data_server();
-        let ret = API::db_blocking(&this, move || {
-            data_server
-                .delete_domain_by_id(id)
-                .map_err(|e| e.to_string())
-        })
-        .await;
-        let ret = match ret {
+        let ret = match data_server.delete_domain_by_id(id) {
             Ok(v) => v,
-            Err(e) => return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.as_str()),
+            Err(e) => {
+                return API::response_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    e.to_string().as_str(),
+                )
+            }
         };
 
         if ret == 0 {
@@ -746,14 +730,9 @@ impl API {
 
         let timestamp_before = timestamp_before.unwrap();
         let data_server = this.get_data_server();
-        let ret = API::db_blocking(&this, move || {
-            data_server
-                .delete_domain_before_timestamp(timestamp_before)
-                .map_err(|e| e.to_string())
-        })
-        .await;
+        let ret = data_server.delete_domain_before_timestamp(timestamp_before);
         if let Err(e) = ret {
-            return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.as_str());
+            return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string().as_str());
         }
 
         if *ret.as_ref().unwrap() == 0 {
@@ -914,13 +893,7 @@ impl API {
         let level = level.unwrap();
         dns_log_set_level(level);
         let data_server = this.get_data_server();
-        let level_text = level.to_string();
-        _ = API::db_blocking(&this, move || {
-            data_server
-                .set_config("log-level", level_text.as_str())
-                .map_err(|e| e.to_string())
-        })
-        .await;
+        _ = data_server.set_config("log-level", level.to_string().as_str());
         API::response_build(StatusCode::NO_CONTENT, "".to_string())
     }
 
@@ -995,10 +968,7 @@ impl API {
         let key = API::params_get_value(&param, "key");
 
         let data_server = this.get_data_server();
-        let settings = API::db_blocking(&this, move || {
-            data_server.get_config_list().map_err(|e| e.to_string())
-        })
-        .await;
+        let settings = data_server.get_config_list();
         if settings.is_err() {
             return API::response_error(StatusCode::NOT_FOUND, "Not found");
         }
@@ -1045,20 +1015,17 @@ impl API {
         }
 
         let settings = settings.unwrap();
-        let ret = API::db_blocking(&this, move || {
-            for (key, value) in settings {
-                if key == PASSWORD_CONFIG_KEY {
-                    continue;
-                }
-                data_server
-                    .set_config(key.as_str(), value.as_str())
-                    .map_err(|e| e.to_string())?;
+        for (key, value) in settings {
+            if key == PASSWORD_CONFIG_KEY {
+                continue;
             }
-            Ok(())
-        })
-        .await;
-        if let Err(e) = ret {
-            return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.as_str());
+            let ret = data_server.set_config(key.as_str(), value.as_str());
+            if let Err(e) = ret {
+                return API::response_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    e.to_string().as_str(),
+                );
+            }
         }
 
         API::response_build(StatusCode::NO_CONTENT, "".to_string())
@@ -1296,19 +1263,6 @@ impl API {
             Ok(response)
         } else {
             return API::response_error(StatusCode::BAD_REQUEST, "Need websocket upgrade.");
-        }
-    }
-
-    /// Runs a database call that takes the writer lock off the async workers;
-    /// that lock can be held for tens of seconds by a first query-index build.
-    async fn db_blocking<F, R>(this: &Arc<HttpServer>, func: F) -> Result<R, String>
-    where
-        F: FnOnce() -> Result<R, String> + Send + 'static,
-        R: Send + 'static,
-    {
-        match API::call_blocking(this.clone(), func).await {
-            Ok(ret) => ret,
-            Err(e) => Err(e.to_string()),
         }
     }
 

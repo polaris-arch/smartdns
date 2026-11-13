@@ -23,8 +23,6 @@ use crate::utils;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::vec;
@@ -43,12 +41,6 @@ const QUERY_INDEX_SQL: &str =
 const DOMAIN_NAME_TABLE_SQL: &str =
     "CREATE TABLE IF NOT EXISTS domain_name (domain TEXT PRIMARY KEY) WITHOUT ROWID";
 const TOP_DOMAIN_SQL: &str = "SELECT domain, COUNT(*) FROM domain WHERE timestamp >= ? GROUP BY domain ORDER BY COUNT(*) DESC LIMIT 20";
-const QUERY_INDEX_FAILED_KEY: &str = "query_index_failed_at";
-const QUERY_INDEX_RETRY_MS: u64 = 24 * 3600 * 1000;
-/// The index measured about 0.30 of the database on a 1.4e7-row log.
-const QUERY_INDEX_SIZE_RATIO: f64 = 0.35;
-/// rusqlite sets this on every connection it opens.
-const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5000;
 
 pub struct DB {
     conn: Mutex<Option<Connection>>,
@@ -58,7 +50,6 @@ pub struct DB {
     /// Set only after the index exists and the name dictionary was backfilled
     /// in this process; until then every read takes the original SQL.
     query_index_ready: AtomicBool,
-    wal_truncate_pending: AtomicBool,
     version: i32,
     query_plan: bool,
 }
@@ -240,7 +231,6 @@ impl DB {
             conn: Mutex::new(None),
             path: Mutex::new(None),
             query_index_ready: AtomicBool::new(false),
-            wal_truncate_pending: AtomicBool::new(false),
             version: 10000, /* x: major version, xx: minor version, xx: patch version */
             query_plan: std::env::var("SMARTDNS_DEBUG_SQL").is_ok(),
         }
@@ -389,7 +379,6 @@ impl DB {
 
     pub fn open(&self, path: &str) -> Result<(), Box<dyn Error>> {
         self.query_index_ready.store(false, Ordering::Release);
-        self.wal_truncate_pending.store(false, Ordering::Release);
         let ruconn: std::result::Result<Connection, rusqlite::Error> =
             Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE);
         let mut conn = self.conn.lock().unwrap();
@@ -494,99 +483,11 @@ impl DB {
         .map(|n| n > 0)
     }
 
-    fn free_bytes(path: &Path) -> Option<(u64, u64)> {
-        let dev = fs::metadata(path).ok()?.dev();
-        Some((utils::get_free_disk_space(path.to_str()?), dev))
-    }
-
-    /// SQLite's unix temp directory choice (sqlite3.c unixTempFileDir): the
-    /// first directory with write and search permission, else ".".
-    fn sqlite_temp_dir() -> std::path::PathBuf {
-        let candidates = [
-            std::env::var("SQLITE_TMPDIR").ok(),
-            std::env::var("TMPDIR").ok(),
-            Some("/var/tmp".to_string()),
-            Some("/usr/tmp".to_string()),
-            Some("/tmp".to_string()),
-        ];
-        candidates
-            .into_iter()
-            .flatten()
-            .map(std::path::PathBuf::from)
-            .find(|p| {
-                let usable = fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false);
-                let c_path = std::ffi::CString::new(p.as_os_str().as_encoded_bytes());
-                usable
-                    && c_path.is_ok_and(|c| unsafe {
-                        nix::libc::access(c.as_ptr(), nix::libc::W_OK | nix::libc::X_OK) == 0
-                    })
-            })
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-    }
-
-    /// Index pages and a WAL of about the same size grow next to the database;
-    /// sort spill files grow in the temp directory, possibly the same device.
-    fn query_index_space_fits(estimate: u64, db: (u64, u64), tmp: (u64, u64)) -> bool {
-        let (db_free, db_dev) = db;
-        let (tmp_free, tmp_dev) = tmp;
-        if tmp_dev == db_dev {
-            db_free >= estimate.saturating_mul(3)
-        } else {
-            db_free >= estimate.saturating_mul(2) && tmp_free >= estimate
-        }
-    }
-
-    fn check_query_index_space(conn: &Connection, db_path: &str) -> Result<(), String> {
-        let pages: u64 = conn
-            .query_row("PRAGMA page_count", [], |r| r.get(0))
-            .map_err(|e| e.to_string())?;
-        let page_size: u64 = conn
-            .query_row("PRAGMA page_size", [], |r| r.get(0))
-            .map_err(|e| e.to_string())?;
-        let estimate = (pages as f64 * page_size as f64 * QUERY_INDEX_SIZE_RATIO) as u64;
-        let db_dir = Path::new(db_path).parent().unwrap_or(Path::new("."));
-        let db = Self::free_bytes(db_dir).ok_or("cannot stat database directory")?;
-        let tmp = Self::free_bytes(&Self::sqlite_temp_dir()).ok_or("cannot stat temp directory")?;
-        if !Self::query_index_space_fits(estimate, db, tmp) {
-            return Err(format!(
-                "not enough space for query index: estimate {} bytes, database free {}, temp free {}",
-                estimate, db.0, tmp.0
-            ));
-        }
-        Ok(())
-    }
-
-    fn record_query_index_failure(conn: &Connection) {
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO status_data (key, value) VALUES (?, ?)",
-            [
-                QUERY_INDEX_FAILED_KEY,
-                get_utc_time_ms().to_string().as_str(),
-            ],
-        );
-    }
-
-    fn truncate_wal(&self, conn: &Connection) {
-        // A reader still inside its snapshot makes TRUNCATE report busy; the
-        // hourly maintenance retries until the file is actually reset. With no
-        // busy timeout it gives up at once instead of stalling the writer lock
-        // for rusqlite's default 5 s behind a multi-second ranking read.
-        let _ = conn.busy_timeout(std::time::Duration::ZERO);
-        let busy = conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .unwrap_or(1);
-        let _ = conn.busy_timeout(std::time::Duration::from_millis(DEFAULT_BUSY_TIMEOUT_MS));
-        self.wal_truncate_pending
-            .store(busy != 0, Ordering::Release);
-    }
-
     /// Builds the query index once (in the background, after the DNS server is
     /// up) and backfills the name dictionary on every start. Readers switch to
     /// the indexed SQL only when both are complete in this process, so a
     /// dictionary left stale by an older plugin is never trusted.
-    pub fn prepare_query_index(&self) -> Result<bool, Box<dyn Error>> {
+    pub fn prepare_query_index(&self) -> Result<(), Box<dyn Error>> {
         let guard = self.conn.lock().unwrap();
         let conn = match guard.as_ref() {
             Some(conn) => conn,
@@ -594,62 +495,27 @@ impl DB {
         };
 
         if !Self::query_index_exists(conn)? {
-            let failed_at: Option<u64> = conn
-                .query_row(
-                    "SELECT value FROM status_data WHERE key = ?",
-                    [QUERY_INDEX_FAILED_KEY],
-                    |r| r.get::<_, String>(0),
-                )
-                .ok()
-                .and_then(|v| v.parse().ok());
-            let now = get_utc_time_ms();
-            if let Some(at) = failed_at {
-                if now >= at && now - at < QUERY_INDEX_RETRY_MS {
-                    dns_log!(
-                        LogLevel::INFO,
-                        "query index build deferred after a recent failure"
-                    );
-                    return Ok(false);
-                }
-            }
-
-            let db_path = self.get_db_file_path().ok_or("db is not open")?;
-            if let Err(e) = Self::check_query_index_space(conn, &db_path) {
-                dns_log!(LogLevel::WARN, "{}", e);
-                Self::record_query_index_failure(conn);
-                return Ok(false);
-            }
-
             dns_log!(LogLevel::INFO, "building query index {}", QUERY_INDEX_NAME);
             // With temp_store=MEMORY the index sort never spills and peaks at
             // about the index size in RSS; the default spills to temp files.
             conn.execute_batch("PRAGMA temp_store = DEFAULT")?;
             let built = conn.execute_batch(QUERY_INDEX_SQL);
-            let restored = conn.execute_batch("PRAGMA temp_store = MEMORY");
-            if let Err(e) = built {
-                Self::record_query_index_failure(conn);
-                return Err(Box::new(e));
-            }
-            restored?;
-            conn.execute(
-                "DELETE FROM status_data WHERE key = ?",
-                [QUERY_INDEX_FAILED_KEY],
-            )?;
+            conn.execute_batch("PRAGMA temp_store = MEMORY")?;
+            built?;
+            // The build leaves a WAL about the size of the index behind.
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         }
 
-        // Reached only with the index present: it existed or was just built.
         conn.execute_batch(
             "INSERT OR IGNORE INTO domain_name (domain) SELECT DISTINCT domain FROM domain",
         )?;
         self.query_index_ready.store(true, Ordering::Release);
-        self.truncate_wal(conn);
         dns_log!(LogLevel::INFO, "query index ready");
-        Ok(true)
+        Ok(())
     }
 
-    /// Hourly upkeep: drop names no longer in the log and finish a WAL
-    /// truncation that a concurrent reader blocked. The NOT EXISTS probe uses
-    /// the query index, so it only runs once that index is confirmed.
+    /// Hourly upkeep: drop names no longer in the log. The NOT EXISTS probe
+    /// uses the query index, so it only runs once that index is confirmed.
     pub fn maintain_query_index(&self) -> Result<(), Box<dyn Error>> {
         if !self.query_index_ready() {
             return Ok(());
@@ -664,9 +530,6 @@ impl DB {
             (SELECT 1 FROM domain WHERE domain.domain = domain_name.domain)",
             [],
         )?;
-        if self.wal_truncate_pending.load(Ordering::Acquire) {
-            self.truncate_wal(conn);
-        }
         Ok(())
     }
 
@@ -981,7 +844,6 @@ impl DB {
             "+domain = ?"
         };
         let mut order_timestamp_first = true;
-        let mut cusor_with_timestamp = false;
 
         let mut sql_where = Vec::new();
         let mut sql_param: Vec<String> = Vec::new();
@@ -1018,11 +880,11 @@ impl DB {
                 match m.to_lowercase().as_str() {
                     "endswith" => {
                         sql_where.push("domain LIKE ?".to_string());
-                        sql_param.push(format!("{}%", v));
+                        sql_param.push(format!("%{}", v));
                     }
                     "startswith" => {
                         sql_where.push("domain LIKE ?".to_string());
-                        sql_param.push(format!("%{}", v));
+                        sql_param.push(format!("{}%", v));
                     }
                     "contains" => {
                         sql_where.push("domain LIKE ?".to_string());
@@ -1071,67 +933,37 @@ impl DB {
         }
 
         if let Some(v) = &param.timestamp_before {
-            let mut use_cursor = false;
-            if param.cursor.is_some() && (is_desc_order || is_cursor_prev) {
-                let v = param.cursor.as_ref().unwrap().id;
-                if let Some(v) = v {
-                    sql_where.push("id < ?".to_string());
-                    sql_param.push(v.to_string());
-                    use_cursor = true;
-                    order_timestamp_first = false;
-                    cusor_with_timestamp = true;
-                }
-            }
-
-            if use_cursor == false {
-                sql_where.push("timestamp <= ?".to_string());
-                sql_param.push(v.to_string());
-            }
+            sql_where.push("timestamp <= ?".to_string());
+            sql_param.push(v.to_string());
         }
 
         if let Some(v) = &param.timestamp_after {
-            let mut use_cursor = false;
-            if param.cursor.is_some() && (!is_desc_order || is_cursor_prev) {
-                let v = param.cursor.as_ref().unwrap().id;
-                if let Some(v) = v {
-                    sql_where.push("id > ?".to_string());
-                    sql_param.push(v.to_string());
-                    use_cursor = true;
-                    order_timestamp_first = false;
-                    cusor_with_timestamp = true;
-                }
-            }
-
-            if use_cursor == false {
-                sql_where.push("timestamp >= ?".to_string());
-                sql_param.push(v.to_string());
-            }
+            sql_where.push("timestamp >= ?".to_string());
+            sql_param.push(v.to_string());
         }
 
-        if !cusor_with_timestamp {
-            if let Some(v) = &param.cursor {
-                if is_cursor_prev {
-                    if let Some(id) = &v.id {
-                        if is_desc_order {
-                            sql_where.push("id > ?".to_string());
-                        } else {
-                            sql_where.push("id < ?".to_string());
-                        }
-
-                        sql_param.push(id.to_string());
-                        order_timestamp_first = false;
+        if let Some(v) = &param.cursor {
+            if is_cursor_prev {
+                if let Some(id) = &v.id {
+                    if is_desc_order {
+                        sql_where.push("id > ?".to_string());
+                    } else {
+                        sql_where.push("id < ?".to_string());
                     }
-                } else {
-                    if let Some(id) = &v.id {
-                        if is_desc_order {
-                            sql_where.push("id < ?".to_string());
-                        } else {
-                            sql_where.push("id > ?".to_string());
-                        }
 
-                        sql_param.push(id.to_string());
-                        order_timestamp_first = false;
+                    sql_param.push(id.to_string());
+                    order_timestamp_first = false;
+                }
+            } else {
+                if let Some(id) = &v.id {
+                    if is_desc_order {
+                        sql_where.push("id < ?".to_string());
+                    } else {
+                        sql_where.push("id > ?".to_string());
                     }
+
+                    sql_param.push(id.to_string());
+                    order_timestamp_first = false;
                 }
             }
         }
@@ -1894,7 +1726,6 @@ impl DB {
             None => return Ok((String::new(), String::new(), Vec::new())),
         };
         let mut order_timestamp_first = false;
-        let mut cusor_with_timestamp = false;
 
         let mut sql_where = Vec::new();
         let mut sql_param: Vec<String> = Vec::new();
@@ -1942,69 +1773,43 @@ impl DB {
         }
 
         if let Some(v) = &param.timestamp_before {
-            let mut use_cursor = false;
-            if param.cursor.is_some() && (is_desc_order || is_cursor_prev) {
-                let v = param.cursor.as_ref().unwrap().id;
-                if let Some(v) = v {
-                    sql_where.push("id < ?".to_string());
-                    sql_param.push(v.to_string());
-                    use_cursor = true;
-                    order_timestamp_first = false;
-                    cusor_with_timestamp = true;
-                }
-            }
-
-            if use_cursor == false {
-                sql_where.push("last_query_timestamp <= ?".to_string());
-                sql_param.push(v.to_string());
-            }
+            sql_where.push("last_query_timestamp <= ?".to_string());
+            sql_param.push(v.to_string());
         }
 
         if let Some(v) = &param.timestamp_after {
-            let mut use_cursor = false;
-            if param.cursor.is_some() && (!is_desc_order || is_cursor_prev) {
-                let v = param.cursor.as_ref().unwrap().id;
-                if let Some(v) = v {
-                    sql_where.push("id > ?".to_string());
-                    sql_param.push(v.to_string());
-                    use_cursor = true;
-                    order_timestamp_first = false;
-                    cusor_with_timestamp = true;
-                }
-            }
+            sql_where.push("last_query_timestamp >= ?".to_string());
+            sql_param.push(v.to_string());
+        }
 
-            if use_cursor == false {
-                sql_where.push("last_query_timestamp >= ?".to_string());
-                sql_param.push(v.to_string());
+        if let Some(v) = &param.cursor {
+            if is_cursor_prev {
+                if let Some(id) = &v.id {
+                    if is_desc_order {
+                        sql_where.push("id > ?".to_string());
+                    } else {
+                        sql_where.push("id < ?".to_string());
+                    }
+
+                    sql_param.push(id.to_string());
+                    order_timestamp_first = false;
+                }
+            } else {
+                if let Some(id) = &v.id {
+                    if is_desc_order {
+                        sql_where.push("id < ?".to_string());
+                    } else {
+                        sql_where.push("id > ?".to_string());
+                    }
+
+                    sql_param.push(id.to_string());
+                    order_timestamp_first = false;
+                }
             }
         }
 
-        if !cusor_with_timestamp {
-            if let Some(v) = &param.cursor {
-                if is_cursor_prev {
-                    if let Some(id) = &v.id {
-                        if is_desc_order {
-                            sql_where.push("id > ?".to_string());
-                        } else {
-                            sql_where.push("id < ?".to_string());
-                        }
-
-                        sql_param.push(id.to_string());
-                        order_timestamp_first = false;
-                    }
-                } else {
-                    if let Some(id) = &v.id {
-                        if is_desc_order {
-                            sql_where.push("id < ?".to_string());
-                        } else {
-                            sql_where.push("id > ?".to_string());
-                        }
-
-                        sql_param.push(id.to_string());
-                        order_timestamp_first = false;
-                    }
-                }
-            }
+        if is_cursor_prev {
+            is_desc_order = !is_desc_order;
         }
 
         if is_desc_order {
@@ -2298,7 +2103,7 @@ mod query_index_tests {
 
     fn ready_fixture(count: u64) -> Fixture {
         let f = legacy_fixture(count);
-        assert!(f.db.prepare_query_index().unwrap());
+        f.db.prepare_query_index().unwrap();
         f
     }
 
@@ -2339,7 +2144,7 @@ mod query_index_tests {
         assert!(!index_exists(&f));
         assert!(names(&f).is_empty());
 
-        assert!(f.db.prepare_query_index().unwrap());
+        f.db.prepare_query_index().unwrap();
         assert!(f.db.query_index_ready());
         assert!(index_exists(&f));
         assert_eq!(names(&f), distinct_domains(&f));
@@ -2372,7 +2177,7 @@ mod query_index_tests {
         let db = DB::new();
         db.open(&f.path).unwrap();
         assert!(!db.query_index_ready());
-        assert!(db.prepare_query_index().unwrap());
+        db.prepare_query_index().unwrap();
         let conn = Connection::open(&f.path).unwrap();
         let n: i64 = conn
             .query_row(
@@ -2385,32 +2190,7 @@ mod query_index_tests {
     }
 
     #[test]
-    fn recent_failure_defers_build_and_keeps_cleanup_off() {
-        let f = legacy_fixture(50);
-        raw(&f)
-            .execute(
-                "INSERT INTO status_data (key, value) VALUES (?, ?)",
-                [
-                    QUERY_INDEX_FAILED_KEY,
-                    get_utc_time_ms().to_string().as_str(),
-                ],
-            )
-            .unwrap();
-        raw(&f)
-            .execute(
-                "INSERT INTO domain_name (domain) VALUES ('stale.example')",
-                [],
-            )
-            .unwrap();
-        assert!(!f.db.prepare_query_index().unwrap());
-        assert!(!f.db.query_index_ready());
-        assert!(!index_exists(&f));
-        f.db.maintain_query_index().unwrap();
-        assert_eq!(names(&f), vec!["stale.example".to_string()]);
-    }
-
-    #[test]
-    fn failed_build_is_recorded_out_of_settings_and_deferred() {
+    fn failed_build_keeps_reads_on_the_original_sql() {
         let f = legacy_fixture(20);
         // A table squatting on the index name makes CREATE INDEX fail for real.
         raw(&f)
@@ -2418,24 +2198,6 @@ mod query_index_tests {
             .unwrap();
         assert!(f.db.prepare_query_index().is_err());
         assert!(!f.db.query_index_ready());
-        let conn = raw(&f);
-        let in_status: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM status_data WHERE key = ?",
-                [QUERY_INDEX_FAILED_KEY],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let in_settings: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM config WHERE key = ?",
-                [QUERY_INDEX_FAILED_KEY],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!((in_status, in_settings), (1, 0));
-        // The next start inside the retry window does not try again.
-        assert!(!f.db.prepare_query_index().unwrap());
         let temp_store: i64 =
             f.db.conn
                 .lock()
@@ -2445,27 +2207,6 @@ mod query_index_tests {
                 .query_row("PRAGMA temp_store", [], |r| r.get(0))
                 .unwrap();
         assert_eq!(temp_store, 2);
-    }
-
-    #[test]
-    fn old_failure_is_retried() {
-        let f = legacy_fixture(50);
-        let old = get_utc_time_ms() - QUERY_INDEX_RETRY_MS - 1;
-        raw(&f)
-            .execute(
-                "INSERT INTO status_data (key, value) VALUES (?, ?)",
-                [QUERY_INDEX_FAILED_KEY, old.to_string().as_str()],
-            )
-            .unwrap();
-        assert!(f.db.prepare_query_index().unwrap());
-        let left: i64 = raw(&f)
-            .query_row(
-                "SELECT COUNT(*) FROM status_data WHERE key = ?",
-                [QUERY_INDEX_FAILED_KEY],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(left, 0);
     }
 
     #[test]
@@ -2642,6 +2383,157 @@ mod query_index_tests {
     }
 
     #[test]
+    fn id_ordered_cursor_paging_keeps_time_bounds() {
+        let f = ready_fixture(300);
+        let (before, after) = (BASE + 1_200, BASE + 300);
+        for (b, a) in [
+            (Some(before), None),
+            (None, Some(after)),
+            (Some(before), Some(after)),
+        ] {
+            for desc in [true, false] {
+                let mut want: Vec<u64> = raw(&f)
+                    .prepare(
+                        "SELECT id FROM domain WHERE client = '10.0.0.1' \
+                        AND timestamp <= ?1 AND timestamp >= ?2 ORDER BY id",
+                    )
+                    .unwrap()
+                    .query_map(
+                        [b.map_or(i64::MAX, |v| v as i64), a.map_or(0, |v| v as i64)],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+                if desc {
+                    want.reverse();
+                }
+                let mut p = DomainListGetParam::new();
+                p.client = Some("10.0.0.1".to_string());
+                p.timestamp_before = b;
+                p.timestamp_after = a;
+                p.order = Some(if desc { "desc" } else { "asc" }.to_string());
+                p.page_size = 7;
+                assert_eq!(
+                    walk_cursor(&f, &p, want.len() as u64),
+                    want,
+                    "{:?} {:?} desc={}",
+                    b,
+                    a,
+                    desc
+                );
+                // Stepping back from the second page returns the first.
+                let first = f.db.get_domain_list(Some(&p)).unwrap();
+                let mut back = p.clone();
+                back.cursor = Some(DomainListGetParamCursor {
+                    id: Some(want[7]),
+                    total_count: want.len() as u64,
+                    direction: "prev".to_string(),
+                });
+                assert_eq!(
+                    ids(&f.db.get_domain_list(Some(&back)).unwrap()),
+                    ids(&first)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn client_cursor_paging_keeps_order_and_time_bounds() {
+        let f = ready_fixture(1);
+        let clients: Vec<ClientData> = (0..60u64)
+            .map(|i| ClientData {
+                id: 0,
+                hostname: String::new(),
+                client_ip: format!("10.1.0.{}", i),
+                mac: String::new(),
+                last_query_timestamp: BASE + (i * 7919) % 40 * 10,
+            })
+            .collect();
+        f.db.insert_client(&clients).unwrap();
+        let (before, after) = (BASE + 300, BASE + 80);
+        for (b, a) in [
+            (None, None),
+            (Some(before), None),
+            (None, Some(after)),
+            (Some(before), Some(after)),
+        ] {
+            for desc in [true, false] {
+                let mut want: Vec<u64> = raw(&f)
+                    .prepare(
+                        "SELECT id FROM client WHERE last_query_timestamp <= ?1 \
+                        AND last_query_timestamp >= ?2 ORDER BY id",
+                    )
+                    .unwrap()
+                    .query_map(
+                        [b.map_or(i64::MAX, |v| v as i64), a.map_or(0, |v| v as i64)],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+                if desc {
+                    want.reverse();
+                }
+                let ctx = format!("{:?} {:?} desc={}", b, a, desc);
+                let mut p = ClientListGetParam::new();
+                p.timestamp_before = b;
+                p.timestamp_after = a;
+                p.order = Some(if desc { "desc" } else { "asc" }.to_string());
+                p.page_size = 7;
+                let page = |p: &ClientListGetParam| -> Vec<u64> {
+                    f.db.get_client_list(Some(p))
+                        .unwrap()
+                        .client_list
+                        .iter()
+                        .map(|c| c.id as u64)
+                        .collect()
+                };
+                let first = page(&p);
+                let mut seen = first.clone();
+                let mut q = p.clone();
+                while let Some(&last) = seen.last() {
+                    q.cursor = Some(ClientListGetParamCursor {
+                        id: Some(last),
+                        total_count: want.len() as u64,
+                        direction: "next".to_string(),
+                    });
+                    let next = page(&q);
+                    if next.is_empty() {
+                        break;
+                    }
+                    seen.extend(next);
+                }
+                assert_eq!(seen, want, "{}", ctx);
+                q.cursor = Some(ClientListGetParamCursor {
+                    id: Some(want[7]),
+                    total_count: want.len() as u64,
+                    direction: "prev".to_string(),
+                });
+                assert_eq!(page(&q), first, "{}", ctx);
+            }
+        }
+    }
+
+    #[test]
+    fn suffix_and_prefix_filters_match_their_names() {
+        let f = ready_fixture(200);
+        for (mode, value, keep) in [
+            ("endswith", "example.com", "a.example.com"),
+            ("startswith", "cdn.", "cdn.example.net"),
+        ] {
+            let mut p = DomainListGetParam::new();
+            p.domain = Some(value.to_string());
+            p.domain_filter_mode = Some(mode.to_string());
+            p.page_size = 1000;
+            let got = f.db.get_domain_list(Some(&p)).unwrap();
+            let want = f.rows.iter().filter(|r| r.2 == keep).count();
+            assert_eq!(got.domain_list.len(), want, "{}", mode);
+            assert!(got.domain_list.iter().all(|d| d.domain == keep), "{}", mode);
+        }
+    }
+
+    #[test]
     fn missing_cursor_row_falls_back_to_id_paging() {
         let f = ready_fixture(200);
         let victim = f.rows[100].0;
@@ -2709,46 +2601,8 @@ mod query_index_tests {
         db.open(path.to_str().unwrap()).unwrap();
         let conn = Connection::open(&path).unwrap();
         assert!(DB::query_index_exists(&conn).unwrap());
-        assert!(db.prepare_query_index().unwrap());
+        db.prepare_query_index().unwrap();
         assert!(db.query_index_ready());
-    }
-
-    #[test]
-    fn space_rule_counts_shared_and_separate_devices() {
-        // Same device: index, WAL and sort spill all land on it.
-        assert!(DB::query_index_space_fits(100, (300, 1), (300, 1)));
-        assert!(!DB::query_index_space_fits(100, (299, 1), (299, 1)));
-        // Separate temp device: two estimates by the database, one in temp.
-        assert!(DB::query_index_space_fits(100, (200, 1), (100, 2)));
-        assert!(!DB::query_index_space_fits(100, (199, 1), (1000, 2)));
-        assert!(!DB::query_index_space_fits(100, (1000, 1), (99, 2)));
-    }
-
-    #[test]
-    fn busy_wal_truncation_is_retried_by_maintenance_without_waiting() {
-        let f = ready_fixture(50);
-        f.db.insert_domain(&vec![row(7)]).unwrap();
-        let reader = Connection::open(&f.path).unwrap();
-        reader.execute_batch("BEGIN").unwrap();
-        let _: i64 = reader
-            .query_row("SELECT COUNT(*) FROM domain", [], |r| r.get(0))
-            .unwrap();
-        f.db.insert_domain(&vec![row(8)]).unwrap();
-        let started = std::time::Instant::now();
-        {
-            let guard = f.db.conn.lock().unwrap();
-            f.db.truncate_wal(guard.as_ref().unwrap());
-        }
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-        assert!(f.db.wal_truncate_pending.load(Ordering::Acquire));
-        reader.execute_batch("COMMIT").unwrap();
-        drop(reader);
-        f.db.maintain_query_index().unwrap();
-        assert!(!f.db.wal_truncate_pending.load(Ordering::Acquire));
-        let wal = fs::metadata(format!("{}-wal", f.path))
-            .map(|m| m.len())
-            .unwrap_or(0);
-        assert_eq!(wal, 0);
     }
 
     #[test]

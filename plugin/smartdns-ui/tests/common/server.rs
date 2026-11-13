@@ -319,12 +319,6 @@ impl TestServer {
         self.ip.clone()
     }
 
-    /// Data directory holding the plugin database (`smartdns.db`).
-    #[allow(dead_code)]
-    pub fn get_workdir(&self) -> String {
-        self.workdir.clone()
-    }
-
     #[allow(dead_code)]
     pub fn get_www_root(&self) -> &String {
         &self.www_root
