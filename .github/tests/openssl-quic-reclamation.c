@@ -442,12 +442,12 @@ cleanup:
 }
 static int stream_credit(void)
 {
-    int variant;
+    int variant,ok=1;
     for(variant=0;variant<4;++variant)
         if(!stream_credit_variant(variant&1,variant>>1)){
-            fprintf(stderr,"stream credit variant uni=%d reject=%d\n",variant&1,variant>>1);return 0;
+            fprintf(stderr,"stream credit variant uni=%d reject=%d\n",variant&1,variant>>1);ok=0;
         }
-    return 1;
+    return ok;
 }
 
 /* Capture callbacks provided by the real TX packetiser, rather than replacing
