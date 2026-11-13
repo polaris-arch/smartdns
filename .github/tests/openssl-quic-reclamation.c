@@ -74,8 +74,8 @@ static int map_init(struct map_fixture *f)
     if (f->qparm == NULL
         || !ossl_quic_txfc_init(&f->tx_connection, NULL)
         || !ossl_quic_rxfc_init(&f->connection, NULL, 16, 16, now_cb, NULL)
-        || !ossl_quic_rxfc_init(&f->max_bidi, NULL, 32, 32, now_cb, NULL)
-        || !ossl_quic_rxfc_init(&f->max_uni, NULL, 32, 32, now_cb, NULL)
+        || !ossl_quic_rxfc_init_standalone(&f->max_bidi, 32, now_cb, NULL)
+        || !ossl_quic_rxfc_init_standalone(&f->max_uni, 32, now_cb, NULL)
         || !ossl_quic_stream_map_init(&f->map, NULL, NULL, &f->max_bidi, &f->max_uni, 0))
         return 0;
     f->initialized = 1;
@@ -92,6 +92,10 @@ static QUIC_STREAM *stream_new(struct map_fixture *f, uint64_t id, int type)
     QUIC_STREAM *s = ossl_quic_stream_map_alloc(&f->map, id, type);
     if (s == NULL) return NULL;
     watch(s);
+    /* Charge peer stream count as the real receive path does. */
+    if (!ossl_quic_stream_is_local_init(s)
+        && !ossl_quic_rxfc_on_rx_stream_frame(ossl_quic_stream_is_bidi(s) ? &f->max_bidi : &f->max_uni,
+            (id >> 2) + 1, 0)) return NULL;
     if (ossl_quic_stream_has_send(s)) {
         s->sstream = ossl_quic_sstream_new(256);
         if (s->sstream == NULL || !ossl_quic_txfc_init(&s->txfc, &f->tx_connection)) return NULL;
@@ -161,7 +165,7 @@ static int state_matrix(void)
         s->deleted = c[2]; s->acked_stop_sending = c[3];
         ossl_quic_stream_map_update_state(&f.map, s);
         if (!collect(&f.map) || (ossl_quic_stream_map_get_by_id(&f.map,id)==NULL) != (int)c[4]
-            || released-before != c[4]) {
+            || released-before != c[4] || ossl_quic_rxfc_get_rwm(&f.max_uni) != (id==3 && c[4])) {
             fprintf(stderr,"matrix case %zu send=%u receive=%u\n",i,c[0],c[1]);
             map_cleanup(&f); CHECK(0);
         }
@@ -259,12 +263,15 @@ struct receive_fixture {
     SSL_CTX *ctx;SSL *ssl;QUIC_CHANNEL *channel;QUIC_STREAM *stream;
     RXE *packets[4];QUIC_PKT_HDR headers[4];unsigned char wire[4][32];unsigned used;
 };
+static int receive_connection(struct receive_fixture *f) {
+    memset(f,0,sizeof(*f));
+    return (f->ctx=SSL_CTX_new(OSSL_QUIC_client_method()))&&(f->ssl=SSL_new(f->ctx))
+        &&SSL_set_default_stream_mode(f->ssl,SSL_DEFAULT_STREAM_MODE_NONE)
+        &&(f->channel=ossl_quic_conn_get_channel(f->ssl));
+}
 static int receive_init(struct receive_fixture *f) {
     QUIC_STREAM *s;
-    memset(f,0,sizeof(*f));
-    if(!(f->ctx=SSL_CTX_new(OSSL_QUIC_client_method()))||!(f->ssl=SSL_new(f->ctx))
-        ||!SSL_set_default_stream_mode(f->ssl,SSL_DEFAULT_STREAM_MODE_NONE)
-        ||!(f->channel=ossl_quic_conn_get_channel(f->ssl)))return 0;
+    if(!receive_connection(f))return 0;
     s=f->stream=ossl_quic_stream_map_alloc(&f->channel->qsm,0,0);if(!s)return 0;watch(s);
     s->sstream=ossl_quic_sstream_new(256);if(!s->sstream)return 0;
     if(!ossl_quic_txfc_init(&s->txfc,&f->channel->conn_txfc)
@@ -384,6 +391,64 @@ static int receive_partial_reset(void)
 cleanup:return receive_cleanup(&f)&&ok;
 }
 static int zero_fin_received(void){return receive_guards()&&receive_progress(0)&&receive_gap_completion();}
+
+/* Peer stream count stays charged while an accepted handle or an unknown final
+ * size keeps the stream alive; GC alone returns it, once. */
+static int stream_credit_variant(int is_uni,int reject)
+{
+    struct receive_fixture f;QUIC_RXFC *count;QUIC_STREAM *s;SSL *held[2]={NULL,NULL};
+    int ok=1;unsigned i;unsigned char id=is_uni?3:1;
+    const unsigned char opened[]={0x0a,id,0,0x0a,id+4,0},fin[]={0x0b,id,0},reset[]={4,id,0,0};
+    const unsigned char next[]={0x0b,id,0,0x0a,id+8,0},over_limit[]={0x0a,id+12,0};
+    const QUIC_TERMINATE_CAUSE *cause;
+    CHECK(receive_connection(&f));
+    count=is_uni?&f.channel->max_streams_uni_rxfc:&f.channel->max_streams_bidi_rxfc;
+    CHECK(ossl_quic_rxfc_init_standalone(count,2,count->now,count->now_arg));
+    CHECK(SSL_set_incoming_stream_policy(f.ssl,reject?SSL_INCOMING_STREAM_POLICY_REJECT
+        :SSL_INCOMING_STREAM_POLICY_ACCEPT,0));
+    CHECK(inject_frame(&f,opened,sizeof(opened)));
+    if(!reject) {
+        for(i=0;i<2;++i)CHECK(held[i]=SSL_accept_stream(f.ssl,SSL_ACCEPT_STREAM_NO_BLOCK));
+        CHECK(inject_frame(&f,fin,sizeof(fin)));
+        CHECK(collect(&f.channel->qsm));
+        CHECK(ossl_quic_rxfc_get_rwm(count)==0);
+        for(i=0;i<2;++i){SSL_free(held[i]);held[i]=NULL;}
+    }
+    for(i=0;i<2;++i) {
+        CHECK(s=ossl_quic_stream_map_get_by_id(&f.channel->qsm,id+4*i));
+        /* Controlled ACK state; packet ACK processing is covered by flight cases. */
+        s->acked_stop_sending=1;s->want_stop_sending=0;
+        if(!is_uni)CHECK(ossl_quic_stream_map_notify_reset_stream_acked(&f.channel->qsm,s));
+        ossl_quic_stream_map_update_state(&f.channel->qsm,s);
+    }
+    if(reject) {
+        CHECK(collect(&f.channel->qsm));
+        CHECK(ossl_quic_rxfc_get_rwm(count)==0);
+        CHECK(inject_frame(&f,reset,sizeof(reset)));
+    }
+    CHECK(collect(&f.channel->qsm));
+    CHECK(ossl_quic_stream_map_get_by_id(&f.channel->qsm,id)==NULL);
+    CHECK(ossl_quic_stream_map_get_by_id(&f.channel->qsm,id+4)!=NULL);
+    CHECK(ossl_quic_rxfc_get_rwm(count)==1);
+    CHECK(inject_frame(&f,next,sizeof(next)));
+    CHECK(ossl_quic_stream_map_get_by_id(&f.channel->qsm,id+8)!=NULL);
+    CHECK(collect(&f.channel->qsm));CHECK(ossl_quic_rxfc_get_rwm(count)==1);
+    CHECK(!inject_frame(&f,over_limit,sizeof(over_limit)));
+    CHECK((cause=ossl_quic_channel_get_terminate_cause(f.channel))!=NULL);
+    CHECK(cause->error_code==OSSL_QUIC_ERR_STREAM_LIMIT_ERROR);
+cleanup:
+    for(i=0;i<2;++i)SSL_free(held[i]);
+    return receive_cleanup(&f)&&ok;
+}
+static int stream_credit(void)
+{
+    int variant;
+    for(variant=0;variant<4;++variant)
+        if(!stream_credit_variant(variant&1,variant>>1)){
+            fprintf(stderr,"stream credit variant uni=%d reject=%d\n",variant&1,variant>>1);return 0;
+        }
+    return 1;
+}
 
 /* Capture callbacks provided by the real TX packetiser, rather than replacing
  * regeneration with a test implementation of want-bit state transitions. */
@@ -641,7 +706,8 @@ static const struct named_case cases[]={
     {"RetirementFailureRetainsStream",retirement_error},{"NullSendBufferControlLoss",lost_controls},
     {"ResetAckThenLateLoss",reset_late_loss},{"ResetQueuedLossThenAck",reset_pending_ack},
     {"ReceiveFinAfterStop",fin_after_stop},{"ReceiveZeroFinCompletes",zero_fin_received},
-    {"ResetFinalSizeRetiresUnreadGap",final_reset_credit},{"LateAckLossAfterGc",late_events_after_gc}
+    {"ResetFinalSizeRetiresUnreadGap",final_reset_credit},{"LateAckLossAfterGc",late_events_after_gc},
+    {"IncomingStreamCreditUntilGc",stream_credit}
 };
 int main(int argc,char **argv)
 {

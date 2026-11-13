@@ -11,8 +11,11 @@ The lifecycle patch requires an absent API/accept owner, completed send ACK
 obligations and an accounted receive final size before stream collection.
 It also repairs control-frame loss regeneration without a send buffer, prevents
 late loss from resurrecting an acknowledged reset, and returns unread byte
-credit once before the tick's transmit pass. Generic connection teardown and
-MAX_STREAMS accounting keep their separate ownership.
+credit and a peer stream's MAX_STREAMS credit once, at collection, before the
+tick's transmit pass. Accepting or rejecting a peer stream no longer returns
+that credit early: a retained handle keeps charging the peer's stream limit,
+so consumers must free peer stream handles they no longer use. Generic
+connection teardown keeps its separate ownership.
 
 The existing QUIC CI job builds two bounded variants: patched and pristine 3.5.9.
 Dependency regressions link their real static archives and exact private headers;

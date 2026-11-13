@@ -1,15 +1,41 @@
 --- a/include/internal/quic_stream_map.h
 +++ b/include/internal/quic_stream_map.h
-@@ -864,9 +864,10 @@
+@@ -833,23 +833,12 @@
+ QUIC_STREAM *ossl_quic_stream_map_peek_accept_queue(QUIC_STREAM_MAP *qsm);
+ 
+ /*
+- * Retires an incoming stream for the purposes of MAX_STREAMS RXFC, so that the
+- * peer is granted credit for another stream. rtt is the estimated connection
+- * RTT. Must be called at most once for a given stream.
+- */
+-void ossl_quic_stream_map_retire_stream_credit(QUIC_STREAM_MAP *qsm,
+-    QUIC_STREAM *s,
+-    OSSL_TIME rtt);
+-
+-/*
+- * Removes a stream from the accept queue. rtt is the estimated connection RTT.
+- * The stream is retired for the purposes of MAX_STREAMS RXFC.
++ * Removes a stream from the accept queue.
+  *
+  * Precondition: s is in the accept queue.
+  */
+ void ossl_quic_stream_map_remove_from_accept_queue(QUIC_STREAM_MAP *qsm,
+-    QUIC_STREAM *s,
+-    OSSL_TIME rtt);
++    QUIC_STREAM *s);
+ 
+ /* Returns the length of the accept queue for the given stream type. */
+ size_t ossl_quic_stream_map_get_accept_queue_len(QUIC_STREAM_MAP *qsm, int is_uni);
+@@ -864,9 +853,11 @@
  
  /*
   * Delete streams ready for GC. Pointers to those QUIC_STREAM objects become
 - * invalid.
-- */
--void ossl_quic_stream_map_gc(QUIC_STREAM_MAP *qsm);
-+ * invalid. Retire discarded receive bytes using the connection's smoothed RTT.
++ * invalid. Retire discarded receive bytes and incoming stream credit using the
++ * connection's smoothed RTT.
 + * Returns 0 on an internal flow-control error, retaining the failing stream.
-+ */
+  */
+-void ossl_quic_stream_map_gc(QUIC_STREAM_MAP *qsm);
 +int ossl_quic_stream_map_gc(QUIC_STREAM_MAP *qsm, OSSL_TIME rtt);
  
  /*
@@ -24,13 +50,10 @@
      int channel_only = (flags & QUIC_REACTOR_TICK_FLAG_CHANNEL_ONLY) != 0;
      int notify_other_threads = 0;
  
-@@ -2148,11 +2149,16 @@
+@@ -2148,11 +2149,13 @@
              ch_update_ping_deadline(ch);
          }
  
-+        /* No packetiser stream pointers are live here. Make retired byte
-+         * credit visible to this tick's MAX_DATA generation, even without
-+         * another application read or write. */
 +        ossl_statm_get_rtt_info(ossl_quic_channel_get_statm(ch), &rtt_info);
 +        if (!ossl_quic_stream_map_gc(&ch->qsm, rtt_info.smoothed_rtt))
 +            ossl_quic_channel_raise_protocol_error(ch,
@@ -44,9 +67,34 @@
      }
  
      /* Determine the time at which we should next be ticked. */
+@@ -3970,8 +3973,6 @@
+ 
+ void ossl_quic_channel_reject_stream(QUIC_CHANNEL *ch, QUIC_STREAM *qs)
+ {
+-    OSSL_RTT_INFO rtt_info;
+-
+     ossl_quic_stream_map_stop_sending_recv_part(&ch->qsm, qs,
+         ch->incoming_stream_auto_reject_aec);
+ 
+@@ -3979,15 +3980,6 @@
+         ch->incoming_stream_auto_reject_aec);
+     qs->deleted = 1;
+ 
+-    /*
+-     * A rejected stream is never placed on the accept queue, so it would
+-     * otherwise never be retired and would consume the peer's stream credit
+-     * for the lifetime of the connection.
+-     */
+-    ossl_statm_get_rtt_info(ossl_quic_channel_get_statm(ch), &rtt_info);
+-    ossl_quic_stream_map_retire_stream_credit(&ch->qsm, qs,
+-        rtt_info.smoothed_rtt);
+-
+     ossl_quic_stream_map_update_state(&ch->qsm, qs);
+ }
+ 
 --- a/ssl/quic/quic_fifd.c
 +++ b/ssl/quic/quic_fifd.c
-@@ -141,28 +141,23 @@
+@@ -141,28 +141,22 @@
          sstream = fifd->get_sstream_by_id(chunks[i].stream_id,
              pkt->ackm_pkt.pkt_space,
              fifd->get_sstream_by_id_arg);
@@ -54,7 +102,14 @@
 -            continue;
 -
          sstream_updated = 0;
--
++        if (sstream != NULL) {
++            if (chunks[i].end >= chunks[i].start) {
++                /* Reset streams have no send buffer or data to retransmit. */
++                ossl_quic_sstream_mark_lost(sstream,
++                    chunks[i].start, chunks[i].end);
++                sstream_updated = 1;
++            }
+ 
 -        if (chunks[i].end >= chunks[i].start) {
 -            /*
 -             * Note: If the stream is being reset, we do not need to retransmit
@@ -65,30 +120,61 @@
 -            ossl_quic_sstream_mark_lost(sstream,
 -                chunks[i].start, chunks[i].end);
 -            sstream_updated = 1;
-+        if (sstream != NULL) {
-+            if (chunks[i].end >= chunks[i].start) {
-+                /* Reset streams have no send buffer or data to retransmit. */
-+                ossl_quic_sstream_mark_lost(sstream,
-+                    chunks[i].start, chunks[i].end);
-+                sstream_updated = 1;
-+            }
-+
+-        }
+-
+-        if (chunks[i].has_fin && chunks[i].stream_id != UINT64_MAX) {
+-            ossl_quic_sstream_mark_lost_fin(sstream);
+-            sstream_updated = 1;
 +            if (chunks[i].has_fin && chunks[i].stream_id != UINT64_MAX) {
 +                ossl_quic_sstream_mark_lost_fin(sstream);
 +                sstream_updated = 1;
 +            }
-+
          }
  
--        if (chunks[i].has_fin && chunks[i].stream_id != UINT64_MAX) {
--            ossl_quic_sstream_mark_lost_fin(sstream);
--            sstream_updated = 1;
--        }
--
 +        /* Receive/control frame delivery does not depend on a send buffer. */
          if (chunks[i].has_stop_sending && chunks[i].stream_id != UINT64_MAX)
              fifd->regen_frame(OSSL_QUIC_FRAME_TYPE_STOP_SENDING,
                  chunks[i].stream_id, pkt,
+--- a/ssl/quic/quic_impl.c
++++ b/ssl/quic/quic_impl.c
+@@ -2133,7 +2133,6 @@
+     QUIC_STREAM *qs;
+     int res;
+     struct quic_wait_for_stream_args wargs;
+-    OSSL_RTT_INFO rtt_info;
+ 
+     /*
+      * If default stream functionality is disabled or we already detached
+@@ -2197,9 +2196,8 @@
+      * We now have qs != NULL. Remove it from the incoming stream queue so that
+      * it isn't also returned by any future SSL_accept_stream calls.
+      */
+-    ossl_statm_get_rtt_info(ossl_quic_channel_get_statm(qc->ch), &rtt_info);
+     ossl_quic_stream_map_remove_from_accept_queue(ossl_quic_channel_get_qsm(qc->ch),
+-        qs, rtt_info.smoothed_rtt);
++        qs);
+ 
+     /*
+      * Now make qs the default stream, creating the necessary XSO.
+@@ -3930,7 +3928,6 @@
+     QUIC_STREAM_MAP *qsm;
+     QUIC_STREAM *qs;
+     QUIC_XSO *xso;
+-    OSSL_RTT_INFO rtt_info;
+ 
+     if (!expect_quic_conn_only(s, &ctx))
+         return NULL;
+@@ -3972,9 +3969,7 @@
+     if (xso == NULL)
+         goto out;
+ 
+-    ossl_statm_get_rtt_info(ossl_quic_channel_get_statm(ctx.qc->ch), &rtt_info);
+-    ossl_quic_stream_map_remove_from_accept_queue(qsm, qs,
+-        rtt_info.smoothed_rtt);
++    ossl_quic_stream_map_remove_from_accept_queue(qsm, qs);
+     new_s = &xso->obj.ssl;
+ 
+     /* Calling this function inhibits default XSO autocreation. */
 --- a/ssl/quic/quic_rx_depack.c
 +++ b/ssl/quic/quic_rx_depack.c
 @@ -603,8 +603,11 @@
@@ -118,6 +204,15 @@
  
 --- a/ssl/quic/quic_stream_map.c
 +++ b/ssl/quic/quic_stream_map.c
+@@ -280,7 +280,7 @@
+     return (shdr.is_fin && shdr.len == 0) || shdr.offset < fc_limit;
+ }
+ 
+-static ossl_unused int qsm_send_part_permits_gc(const QUIC_STREAM *qs)
++static int qsm_send_part_permits_gc(const QUIC_STREAM *qs)
+ {
+     switch (qs->send_state) {
+     case QUIC_SSTREAM_STATE_NONE:
 @@ -294,7 +294,14 @@
  
  static int qsm_ready_for_gc(QUIC_STREAM_MAP *qsm, QUIC_STREAM *qs)
@@ -134,20 +229,24 @@
  
      /*
       * If sstream has no FIN, we auto-reset it at marked-for-deletion time, so
-@@ -306,9 +313,9 @@
+@@ -306,12 +313,10 @@
          || ossl_quic_stream_send_get_final_size(qs, NULL));
  
      return qs->deleted
 -        && (!ossl_quic_stream_has_recv(qs)
 -            || recv_stream_fully_drained
 -            || qs->acked_stop_sending)
+-        && (!ossl_quic_stream_has_send(qs)
+-            || qs->send_state == QUIC_SSTREAM_STATE_DATA_RECVD
+-            || qs->send_state == QUIC_SSTREAM_STATE_RESET_RECVD);
 +        && (recv_stream_fully_drained
 +            || (qs->recv_state == QUIC_RSTREAM_STATE_SIZE_KNOWN
 +                && qs->acked_stop_sending))
-         && (!ossl_quic_stream_has_send(qs)
-             || qs->send_state == QUIC_SSTREAM_STATE_DATA_RECVD
-             || qs->send_state == QUIC_SSTREAM_STATE_RESET_RECVD);
-@@ -530,10 +537,10 @@
++        && qsm_send_part_permits_gc(qs);
+ }
+ 
+ int ossl_quic_stream_map_is_local_allowed_by_stream_limit(QUIC_STREAM_MAP *qsm,
+@@ -530,10 +535,10 @@
  
      case QUIC_SSTREAM_STATE_RESET_SENT:
          qs->send_state = QUIC_SSTREAM_STATE_RESET_RECVD;
@@ -161,7 +260,36 @@
          return 1;
      }
  }
-@@ -794,13 +801,24 @@
+@@ -760,27 +765,14 @@
+         : qsm->max_streams_uni_rxfc;
+ }
+ 
+-void ossl_quic_stream_map_retire_stream_credit(QUIC_STREAM_MAP *qsm,
+-    QUIC_STREAM *s,
+-    OSSL_TIME rtt)
+-{
+-    QUIC_RXFC *max_streams_rxfc;
+-
+-    if ((max_streams_rxfc = qsm_get_max_streams_rxfc(qsm, s)) != NULL)
+-        (void)ossl_quic_rxfc_on_retire(max_streams_rxfc, 1, rtt);
+-}
+-
+ void ossl_quic_stream_map_remove_from_accept_queue(QUIC_STREAM_MAP *qsm,
+-    QUIC_STREAM *s,
+-    OSSL_TIME rtt)
++    QUIC_STREAM *s)
+ {
+     list_remove(&qsm->accept_list, &s->accept_node);
+     if (ossl_quic_stream_is_bidi(s))
+         --qsm->num_accept_bidi;
+     else
+         --qsm->num_accept_uni;
+-
+-    ossl_quic_stream_map_retire_stream_credit(qsm, s, rtt);
+ }
+ 
+ size_t ossl_quic_stream_map_get_accept_queue_len(QUIC_STREAM_MAP *qsm, int is_uni)
+@@ -794,13 +786,27 @@
          + ossl_quic_stream_map_get_accept_queue_len(qsm, /*is_uni=*/1);
  }
  
@@ -181,12 +309,26 @@
 +                    && !ossl_quic_rxfc_on_retire(&qs->rxfc, swm - rwm, rtt)))
 +                return 0;
 +        }
++        if (!ossl_quic_stream_is_local_init(qs)
++            && !ossl_quic_rxfc_on_retire(qsm_get_max_streams_rxfc(qsm, qs), 1, rtt))
++            return 0;
          ossl_quic_stream_map_release(qsm, qs);
      }
 +    return 1;
  }
  
  static int eligible_for_shutdown_flush(QUIC_STREAM *qs)
+--- a/ssl/quic/quic_tserver.c
++++ b/ssl/quic/quic_tserver.c
+@@ -489,7 +489,7 @@
+     if (qs == NULL)
+         return UINT64_MAX;
+ 
+-    ossl_quic_stream_map_remove_from_accept_queue(qsm, qs, ossl_time_zero());
++    ossl_quic_stream_map_remove_from_accept_queue(qsm, qs);
+ 
+     return qs->id;
+ }
 --- a/ssl/quic/quic_txp.c
 +++ b/ssl/quic/quic_txp.c
 @@ -1658,7 +1658,7 @@

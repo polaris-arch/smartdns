@@ -481,6 +481,7 @@ OPENSSL_QUIC_REQUIRED = {
     'ReceiveZeroFinCompletes': 'f.stream->ready_for_gc',
     'ResetFinalSizeRetiresUnreadGap': 'ossl_quic_stream_map_get_by_id(&f.map,0)==s',
     'LateAckLossAfterGc': 'released==before+1',
+    'IncomingStreamCreditUntilGc': 'ossl_quic_rxfc_get_rwm(count)==0',
 }
 
 
